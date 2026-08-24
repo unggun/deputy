@@ -107,9 +107,17 @@ class Store:
         return [dict(r) for r in rows]
 
     def active_count(self) -> int:
-        active = (AIState.IN_PROGRESS.value, AIState.PR_OPEN.value)
+        """States that occupy one of `max_active_tasks` slots.
+
+        `REVIEW` counts: the branch is pushed but the ticket will come back
+        through `IN_PROGRESS` if the reviewer asks for changes, so it is real
+        work in flight. `PLANNING` does not: it is read-only and pre-approval,
+        and gating it would stall triage throughput for no safety gain.
+        """
+        active = (AIState.IN_PROGRESS.value, AIState.REVIEW.value,
+                  AIState.PR_OPEN.value)
         row = self.conn.execute(
-            "SELECT COUNT(*) c FROM tasks WHERE state IN (?, ?)", active
+            "SELECT COUNT(*) c FROM tasks WHERE state IN (?, ?, ?)", active
         ).fetchone()
         return int(row["c"])
 

@@ -215,6 +215,41 @@ print(f"  {'PASS' if r1 else 'FAIL':<5} busy repo blocks a second agent")
 print(f"  {'PASS' if r2 else 'FAIL':<5} different repo is free")
 results += [r1, r2]
 
+# New states: planning is pre-approval, review is post-push.
+n1 = AIState.PLANNING in G.TRANSITIONS[AIState.NEW]
+n2 = AIState.AWAITING_PLAN_OK in G.TRANSITIONS[AIState.PLANNING]
+n3 = AIState.NEEDS_INPUT in G.TRANSITIONS[AIState.PLANNING]
+n4 = AIState.REVIEW in G.TRANSITIONS[AIState.IN_PROGRESS]
+n5 = AIState.PR_OPEN in G.TRANSITIONS[AIState.REVIEW]
+n6 = AIState.QUEUED in G.TRANSITIONS[AIState.REVIEW]
+n7 = AIState.PR_OPEN not in G.TRANSITIONS[AIState.IN_PROGRESS]
+n8 = not AIState.PLANNING.is_terminal and not AIState.REVIEW.is_terminal
+for label, ok in [("new -> planning exists", n1),
+                  ("planning -> plan-review exists", n2),
+                  ("planning -> needs-input exists", n3),
+                  ("in-progress -> review exists", n4),
+                  ("review -> pr-open exists", n5),
+                  ("review -> queued exists (request_changes)", n6),
+                  ("in-progress -> pr-open is gone", n7),
+                  ("new states are not terminal", n8)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# A task in review holds a slot but does not block its repo.
+rev_rows = [{"task_id": "s:B", "task_key": "B", "repo_key": "pulse-backend",
+             "state": AIState.REVIEW.value}]
+r3 = G.repo_is_free("pulse-backend", rev_rows).ok
+print(f"  {'PASS' if r3 else 'FAIL':<5} a task in review does not block its repo")
+results.append(r3)
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _st = Store(f"{_tmp}/a.db")
+    _st.upsert("s:R", state=AIState.REVIEW.value)
+    _st.upsert("s:P", state=AIState.PLANNING.value)
+    a1 = _st.active_count() == 1
+print(f"  {'PASS' if a1 else 'FAIL':<5} review counts as active, planning does not")
+results.append(a1)
+
 b1 = not G.blockers_clear([{"key": "DEV-1", "closed": False}]).ok
 b2 = G.blockers_clear([{"key": "DEV-1", "closed": True}]).ok
 print(f"  {'PASS' if b1 else 'FAIL':<5} open blocker defers the ticket")

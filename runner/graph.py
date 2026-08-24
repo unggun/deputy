@@ -32,7 +32,7 @@ TRANSITIONS: dict[AIState, dict[AIState, str]] = {
     AIState.NEW: {
         AIState.NEEDS_INPUT:      "triage: ambiguous",
         AIState.HUMAN_ONLY:       "triage: unsafe or needs a human",
-        AIState.AWAITING_PLAN_OK: "triage: executable, scope needs sign-off",
+        AIState.PLANNING:         "triage: executable, scope needs sign-off",
         AIState.QUEUED:           "triage: executable, below approval gate",
         AIState.BLOCKED:          "triage failed",
     },
@@ -45,14 +45,26 @@ TRANSITIONS: dict[AIState, dict[AIState, str]] = {
         AIState.NEW:              "plan rejected — re-triage",
         AIState.BLOCKED:          "orphaned or errored",
     },
+    AIState.PLANNING: {
+        AIState.AWAITING_PLAN_OK: "grounded plan posted",
+        AIState.NEEDS_INPUT:      "analyst read the code and found it ambiguous",
+        AIState.PLANNING:         "analyst run died — retry",
+        AIState.BLOCKED:          "analyst failed repeatedly",
+    },
     AIState.QUEUED: {
         AIState.IN_PROGRESS:      "slot free, in execute window",
         AIState.BLOCKED:          "no repo mapped",
     },
     AIState.IN_PROGRESS: {
-        AIState.PR_OPEN:          "draft PR opened",
+        AIState.REVIEW:           "branch pushed, awaiting review",
         AIState.QUEUED:           "run crashed — retry",
         AIState.BLOCKED:          "agent failed or produced nothing",
+    },
+    AIState.REVIEW: {
+        AIState.PR_OPEN:          "reviewer approved",
+        AIState.QUEUED:           "reviewer requested changes",
+        AIState.REVIEW:           "reviewer run died — retry",
+        AIState.BLOCKED:          "rejected, cycles exhausted, or reviewer failed",
     },
     AIState.PR_OPEN: {
         AIState.PR_OPEN:          "pushed fixes for CI or review",
