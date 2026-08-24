@@ -782,5 +782,128 @@ with tempfile.TemporaryDirectory() as tmp:
     print(f"  {'PASS' if e2 else 'FAIL':<5} triage failure creates no unnamespaced row")
     results += [e1, e2]
 
+# --- review station ---------------------------------------------------------
+print("\nreview station")
+
+def _review_flow(verdicts, *, cycles=2):
+    """Drive one ticket from queued through the review loop. Returns (store, prov, brain_dir)."""
+    tmp = tempfile.mkdtemp()
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b",
+                              mode="execute")
+    cfg.data["runner"]["limits"]["max_review_cycles"] = cycles
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T50", "Fix footer typo", "'Copyrigth' -> 'Copyright'")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+
+    replies = []
+    for v in verdicts:
+        replies.append("implemented it")           # the implementer run
+        replies.append(json.dumps(v))              # the reviewer run
+    agent = FakeAgent({"decision": "execute", "confidence": 0.95, "scope": "xs",
+                       "plan": ["fix typo"],
+                       "acceptance_criteria": ["footer reads Copyright"]},
+                      work_replies=replies)
+    pipe = Pipeline(cfg, src, prov, agent, store)
+
+    real = {n: getattr(vcs, n) for n in
+            ("ensure_worktree", "ensure_review_worktree", "commit_all", "push",
+             "create_pr", "diff_stat")}
+    made = []
+    vcs.ensure_worktree = lambda *a, **k: Path(tmp)
+    vcs.ensure_review_worktree = lambda *a, **k: Path(tmp)
+    vcs.commit_all = lambda *a, **k: True
+    vcs.push = lambda *a, **k: None
+    vcs.diff_stat = lambda *a, **k: "1 file changed"
+    vcs.create_pr = lambda *a, **k: (made.append(1), (7, "http://pr/7"))[1]
+    try:
+        when = dt.datetime(2026, 8, 10, 7, 0)
+        for _ in range(10):
+            pipe.tick(when)
+    finally:
+        for n, f in real.items():
+            setattr(vcs, n, f)
+    return store.get("mycorp:T50"), prov, Path(f"{tmp}/b"), len(made)
+
+_approve_v = {"verdict": "approve",
+              "criteria_results": [{"criterion": "footer reads Copyright",
+                                    "pass": True, "evidence": "diff shows it"}],
+              "blocking_findings": [], "suggestions": [], "summary": "fine",
+              "brain_notes": ["Footer copy lives in templates/base.html."]}
+_changes_v = {"verdict": "request_changes",
+              "blocking_findings": ["the test is missing"],
+              "summary": "nearly", "brain_notes": []}
+_reject_v = {"verdict": "reject", "blocking_findings": ["wrong file entirely"],
+             "summary": "no", "brain_notes": []}
+
+_r_ok, _p_ok, _b_ok, _n_ok = _review_flow([_approve_v])
+c1 = _r_ok["state"] == AIState.PR_OPEN.value
+c2 = _n_ok == 1
+c3 = "Footer copy lives in" in B.read(B.brain_path(_b_ok, "mycorp", "pulse-backend"))
+
+_r_cy, _, _, _n_cy = _review_flow([_changes_v, _approve_v])
+c4 = _r_cy["state"] == AIState.PR_OPEN.value and _n_cy == 1
+
+_r_cap, _, _b_cap, _n_cap = _review_flow([_changes_v, _changes_v, _changes_v], cycles=2)
+c5 = _r_cap["state"] == AIState.BLOCKED.value and _n_cap == 0
+c6 = B.read(B.brain_path(_b_cap, "mycorp", "pulse-backend")) == ""
+
+_r_rej, _, _, _n_rej = _review_flow([_reject_v])
+c7 = _r_rej["state"] == AIState.BLOCKED.value and _n_rej == 0
+
+for label, ok in [("approve opens the PR", c1),
+                  ("the PR is opened exactly once", c2),
+                  ("brain notes are written on approve", c3),
+                  ("request_changes then approve still ships one PR", c4),
+                  ("exhausted review cycles block, with no PR", c5),
+                  ("no brain notes are kept when nothing is approved", c6),
+                  ("reject blocks without a PR", c7)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# A dead reviewer or analyst process must be recovered by `attempts`, and must
+# not silently consume a review cycle.
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b",
+                              mode="execute")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T55", "Fix footer typo", "x")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, FakeAgent({}), store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    # A row abandoned mid-review: state REVIEW, lease long expired.
+    store.upsert("mycorp:T55", source="mycorp", provider_task_id="T55",
+                 task_key="T55", repo_key="pulse-backend", branch="ai/t55",
+                 state=AIState.REVIEW.value, attempts=0,
+                 meta={"review_cycle": 0, "acceptance_criteria": []})
+    store.conn.execute(
+        "UPDATE tasks SET lease_owner='dead', lease_until=1 WHERE task_id=?",
+        ("mycorp:T55",))
+    store.conn.commit()
+
+    real_rw = vcs.ensure_review_worktree
+    vcs.ensure_review_worktree = lambda *a, **k: Path(tmp)
+    try:
+        pipe.tick(when)
+    except Exception:
+        pass                      # the fake agent returns no JSON; that is fine
+    finally:
+        vcs.ensure_review_worktree = real_rw
+
+    _crashed = store.get("mycorp:T55")
+    c8 = int(_crashed["attempts"]) == 1
+    c9 = json.loads(_crashed["meta"] or "{}").get("review_cycle", 0) == 0
+
+for label, ok in [("an expired review lease increments attempts", c8),
+                  ("crash recovery does not consume a review cycle", c9)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

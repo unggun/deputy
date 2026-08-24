@@ -24,6 +24,9 @@ runner:
     max_active_tasks: 3      # across ALL sources — this caps load on this laptop
     max_new_triage_per_run: 10
     max_fix_attempts: 3
+    max_review_cycles: 2     # implementer <-> reviewer round trips before we
+                             # give up and ask a human. Separate from
+                             # max_fix_attempts, which covers crashes and CI.
     agent_timeout_minutes: 45
     daily_budget_usd: 15
     brain_max_bytes: 8000    # per-repo note file cap; at the cap appends are

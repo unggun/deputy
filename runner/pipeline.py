@@ -11,7 +11,7 @@ from typing import Any
 from . import analyst, brain, graph, review, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
-from .models import AIState, AnalysisResult, Task, TriageResult
+from .models import AIState, AnalysisResult, ReviewResult, Task, TriageResult
 from .providers.base import TaskProvider
 from .state import Store
 from .triage import triage
@@ -266,6 +266,31 @@ class Pipeline:
                 self.store.set_state(task_id, AIState.QUEUED, attempts=attempts)
             return
 
+        if state == AIState.REVIEW:
+            if not _in_window(now, windows.get("execute", [])):
+                return
+            if row["lease_until"] and row["lease_until"] > time.time():
+                return
+            # Reaching here with the row still in REVIEW means the previous
+            # attempt failed: a success transitions away. So count it
+            # unconditionally, exactly as the IN_PROGRESS arm does. Guarding on
+            # `row["lease_until"]` would miss every ordinary exception, because
+            # `release_lease` in the finally below zeroes it.
+            attempts = int(row["attempts"]) + 1
+            if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                self._escalate(task_id, "Reviewer crashed repeatedly; needs a human.")
+                return
+            self.store.upsert(task_id, attempts=attempts)
+            if not self.store.acquire_lease(
+                    task_id, self.runner_id,
+                    int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
+                return
+            try:
+                self._review(row)
+            finally:
+                self.store.release_lease(task_id)
+            return
+
         if state == AIState.PR_OPEN:
             self._poll_pr(row, now, windows)
 
@@ -322,17 +347,24 @@ class Pipeline:
         env = self._env_for(repo)
 
         branch = row["branch"] or vcs.branch_name(task.key, task.title)
+        meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
+        revision = meta.get("revision")
+
         self.store.set_state(rid, AIState.IN_PROGRESS, branch=branch)
         self.provider.set_ai_state(task.id, AIState.IN_PROGRESS)
         self.provider.set_status(task.id, self._status("in_progress_status", "in progress"))
-        self._comment(rid, f"start-{branch}", f"Starting work on branch `{branch}`.")
+        if not revision:
+            self._comment(rid, f"start-{branch}", f"Starting work on branch `{branch}`.")
 
         wt = vcs.ensure_worktree(repo, branch, self.work_root, env=env)
         if repo.get("setup"):
             vcs.run(["bash", "-lc", repo["setup"]], cwd=wt, check=False, env=env)
 
-        plan = (self.store.get(rid) or {}).get("meta") or "{}"
-        prompt = _work_prompt(task, repo, plan)
+        brain_block = self._brain_block(repo["key"])
+        if revision:
+            prompt = _revision_prompt(task, repo, meta, revision, brain_block)
+        else:
+            prompt = _work_prompt(task, repo, meta, brain_block)
         res = self.agent.work(prompt, wt,
                               log_path=self.log_root / f"{task.key}-implement.log")
         self.store.record("implement", rid, res.error or "ok", res.cost_usd)
@@ -344,17 +376,85 @@ class Pipeline:
             self._escalate(rid, "Agent produced no code changes. Ticket may be unclear.")
             return
 
-        base = repo.get("base_branch", "main")
         vcs.push(wt, branch, env=env)
+        meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
+        cycle = int((meta.get("revision") or {}).get("cycle", 0))
+        meta.pop("revision", None)          # the reviewer judges a clean row
+        meta["impl_summary"] = res.text[:4000]
+        meta["review_cycle"] = cycle
+        self.store.upsert(rid, meta=meta)
+        self._set(rid, AIState.REVIEW)
+        self._comment(rid, f"pushed-{branch}-{cycle}",
+                      f"Pushed `{branch}`. Running review before opening a PR.")
+
+    def _review(self, row: dict[str, Any]) -> None:
+        """The reviewer station: judge the pushed branch before a human sees it."""
+        rid = row["task_id"]
+        task = self.provider.get_task(row["provider_task_id"])
+        repo = self.source.repo_by_key(row["repo_key"] or "")
+        if not repo:
+            self._escalate(rid, "No repository mapped; cannot review.")
+            return
+
+        env = self._env_for(repo)
+        base = repo.get("base_branch", "main")
+        branch = row["branch"]
+        meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
+
+        wt = vcs.ensure_review_worktree(repo, branch, self.work_root, env=env)
+        result, cost = review.review(
+            self.agent, task.key, meta.get("acceptance_criteria", []),
+            base, branch, meta.get("impl_summary", ""),
+            self._brain_block(repo["key"]),
+            cwd=wt,
+            model=self.acfg.get("reviewer_model") or self.acfg.get("model"),
+            tools=review.tools_for(repo, self.acfg.get("reviewer_tools")),
+            log_path=self.log_root / f"{task.key}-review.log",
+        )
+        self.store.record("review", rid, result.verdict, cost)
+        cycle = int(meta.get("review_cycle", 0))
+
+        if result.verdict == "reject":
+            self._comment(rid, f"review-reject-{cycle}", _fmt_review(result))
+            self._escalate(rid, f"Reviewer rejected the approach: {result.summary}")
+            return
+
+        if result.verdict == "request_changes":
+            if cycle + 1 > int(self.limits.get("max_review_cycles", 2)):
+                self._comment(rid, f"review-giveup-{cycle}", _fmt_review(result))
+                self._escalate(
+                    rid, f"Still failing review after {cycle} revision(s). "
+                         f"Unresolved: {'; '.join(result.blocking_findings)[:600]}")
+                return
+            meta["revision"] = {"cycle": cycle + 1,
+                                "findings": result.blocking_findings,
+                                "summary": result.summary}
+            self.store.upsert(rid, meta=meta)
+            self._comment(rid, f"review-changes-{cycle}", _fmt_review(result))
+            self._set(rid, AIState.QUEUED)
+            return
+
+        # approve
+        written = brain.append(
+            self._brain_file(repo["key"]), result.brain_notes,
+            max_bytes=int(self.limits.get("brain_max_bytes", brain.DEFAULT_MAX_BYTES)))
+        if written:
+            log.info("[%s] recorded %d brain note(s)", task.key, len(written))
+
+        impl_wt = self.work_root / repo["key"] / vcs.slug(branch, 60)
+        if not impl_wt.exists():
+            impl_wt = vcs.ensure_worktree(repo, branch, self.work_root, env=env)
         number, url = vcs.create_pr(
-            wt, title=f"{task.key}: {task.title}",
-            body=_pr_body(task, res.text, vcs.diff_stat(wt, base)),
+            impl_wt, title=f"{task.key}: {task.title}",
+            body=_pr_body(task, meta, result, vcs.diff_stat(impl_wt, base)),
             base=base, draft=bool(self.cfg.get("vcs.draft_prs", True)), env=env,
         )
-        self.store.set_state(rid, AIState.PR_OPEN, pr_number=number, pr_url=url, attempts=0)
+        self.store.set_state(rid, AIState.PR_OPEN, pr_number=number,
+                             pr_url=url, attempts=0)
         self.provider.set_ai_state(task.id, AIState.PR_OPEN)
         self._comment(rid, f"pr-{number}",
-                      f"Opened draft PR: {url}\n\n**What changed**\n{res.text[:1500]}")
+                      f"Review passed. Opened draft PR: {url}\n\n{result.summary}")
+        vcs.remove_worktree(repo, wt, env=env)
 
     # --- PR polling ---------------------------------------------------
     def _poll_pr(self, row: dict[str, Any], now: dt.datetime,
@@ -506,23 +606,34 @@ def _fmt_analysis(r: AnalysisResult, shadow: bool) -> str:
             f"**Files I expect to touch**\n{files}\n\n**Risks**\n{risks}{tail}")
 
 
-def _work_prompt(task: Task, repo: dict[str, Any], plan_json: str) -> str:
-    return f"""You are implementing a single ticket in an existing repository.
-You are on a fresh branch in an isolated worktree. Work only within this directory.
+def _work_prompt(task: Task, repo: dict[str, Any], meta: dict[str, Any],
+                 brain_block: str) -> str:
+    steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(meta.get("plan", [])))
+    criteria = "\n".join(f"- {c}" for c in meta.get("acceptance_criteria", []))
+    return f"""You are on a fresh branch in an isolated worktree. Work only within this directory.
 
 {task.as_prompt_block()}
-Agreed plan (JSON): {plan_json}
+{brain_block}
+=== AGREED PLAN ===
+{meta.get('approach', '')}
+
+{steps or '(no steps recorded)'}
+
+=== ACCEPTANCE CRITERIA ===
+These are what a reviewer will check your diff against, one by one.
+{criteria or '- (none recorded)'}
 
 Rules:
 - Follow the conventions already present in this codebase; read before you write.
 - Make the smallest change that satisfies the ticket. No refactors, no drive-by fixes.
 - Add or update tests. Run the test command: {repo.get('test', '(none configured)')}
-- Do NOT modify CI config, dependencies lockfiles, secrets, or .env files unless the ticket explicitly asks.
+- Do NOT modify CI config, dependency lockfiles, secrets, or .env files unless the ticket explicitly asks.
 - Do NOT commit, push, or open a PR — the runner handles that.
 - If the ticket turns out to be ambiguous or unsafe, make no changes and explain why.
 
 Finish by printing a short summary: what you changed, which files, how you verified it,
-and anything the reviewer should look at closely."""
+and any point where you deviated from the plan.
+"""
 
 
 def _fix_prompt(task_key: str, st: dict[str, Any], feedback: list[str], logs: str) -> str:
@@ -541,8 +652,51 @@ possible change, no unrelated edits, do not commit or push. If a piece of feedba
 requires a product decision you cannot make, leave it and say so explicitly."""
 
 
-def _pr_body(task: Task, summary: str, diffstat: str) -> str:
+def _pr_body(task: Task, meta: dict[str, Any], r: ReviewResult,
+             diffstat: str) -> str:
+    checks = "\n".join(
+        f"- [{'x' if c.get('pass') else ' '}] {c.get('criterion', '')}"
+        f"{chr(10) + '      ' + str(c.get('evidence', '')) if c.get('evidence') else ''}"
+        for c in r.criteria_results) or "- (no criteria were recorded)"
+    notes = "\n".join(f"- {s}" for s in r.suggestions)
     return (f"Implements [{task.key}]({task.url}) — {task.title}\n\n"
-            f"## What changed\n{summary[:4000]}\n\n"
-            f"## Diffstat\n```\n{diffstat}\n```\n\n"
-            f"---\nGenerated by ai-task-runner. Review carefully before merging.")
+            f"## Problem\n{meta.get('problem') or task.title}\n\n"
+            f"## Approach\n{meta.get('approach', '(not recorded)')}\n\n"
+            f"## What changed\n{meta.get('impl_summary', '')[:4000]}\n\n"
+            f"## Acceptance criteria\n{checks}\n\n"
+            + (f"## Reviewer suggestions (non-blocking)\n{notes}\n\n" if notes else "")
+            + f"## Diffstat\n```\n{diffstat}\n```\n\n"
+            f"---\nReviewed by an independent agent pass before this PR was opened. "
+            f"Verdict: `{r.verdict}`. Review carefully before merging.")
+
+def _fmt_review(r: ReviewResult) -> str:
+    rows = "\n".join(
+        f"- {'PASS' if c.get('pass') else 'FAIL'} — {c.get('criterion', '')}"
+        f"{chr(10) + '  ' + str(c.get('evidence', '')) if c.get('evidence') else ''}"
+        for c in r.criteria_results) or "- (no criteria were recorded)"
+    blockers = "\n".join(f"- {f}" for f in r.blocking_findings) or "- (none)"
+    notes = "\n".join(f"- {s}" for s in r.suggestions) or "- (none)"
+    return (f"**Review: `{r.verdict}`**\n\n{r.summary}\n\n"
+            f"**Acceptance criteria**\n{rows}\n\n"
+            f"**Blocking**\n{blockers}\n\n**Suggestions**\n{notes}")
+
+
+def _revision_prompt(task: Task, repo: dict[str, Any], meta: dict[str, Any],
+                     revision: dict[str, Any], brain_block: str) -> str:
+    findings = "\n".join(f"- {f}" for f in revision.get("findings", [])) or "(none)"
+    criteria = "\n".join(f"- {c}" for c in meta.get("acceptance_criteria", [])) or "(none)"
+    return (
+        f"A reviewer looked at your branch and asked for changes. You are in the "
+        f"same worktree, on the same branch.\n\n"
+        f"{task.as_prompt_block()}\n{brain_block}\n"
+        f"=== ACCEPTANCE CRITERIA ===\n{criteria}\n\n"
+        f"=== REVIEWER SUMMARY ===\n{revision.get('summary', '')}\n\n"
+        f"=== BLOCKING FINDINGS ===\n{findings}\n\n"
+        f"Address every blocking finding. Same rules as before: smallest possible "
+        f"change, no unrelated edits, no refactors, do not commit or push. "
+        f"Run the test command: {repo.get('test', '(none configured)')}\n\n"
+        f"If a finding is wrong, say so plainly in your summary and explain why "
+        f"rather than changing code to satisfy it.\n\n"
+        f"Finish by printing a short summary of what you changed and how you "
+        f"verified it."
+    )
