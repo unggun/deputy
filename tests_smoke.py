@@ -497,5 +497,69 @@ for label, ok in [("missing brain reads as empty", b_missing),
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- analyst station --------------------------------------------------------
+print("\nanalyst station")
+from runner import analyst as AN
+
+class _ScriptedAgent:
+    """Returns canned text per work() call, in order. Records the argv-ish kwargs."""
+    def __init__(self, replies): self.replies, self.calls = list(replies), []
+    def reason(self, prompt, *, max_turns=1):
+        return AgentResult(ok=True, text=self.replies.pop(0), cost_usd=0.01)
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        self.calls.append({"prompt": prompt, "model": model,
+                           "allowed_tools": allowed_tools})
+        return AgentResult(ok=True, text=self.replies.pop(0), cost_usd=0.2)
+
+_ready = json.dumps({
+    "verdict": "ready", "problem": "CSV export is missing",
+    "approach": "add a serializer and a route",
+    "plan": ["add serializer", "wire route", "test"],
+    "acceptance_criteria": ["GET /reports.csv returns text/csv"],
+    "risks": ["large exports may time out"],
+    "files_of_interest": ["api/reports.py — the route lives here"],
+})
+_ag = _ScriptedAgent([_ready])
+_res, _cost = AN.analyse(
+    _ag, mk("T20", "Add CSV export", "button downloads a CSV"), [],
+    {"key": "pulse-backend", "test": "pytest"},
+    "=== REPO NOTES ===\nTests need PGHOST.\n", ["csv downloads"],
+    model="opus", cwd=Path("."))
+
+a1 = _res.verdict == "ready"
+a2 = _res.acceptance_criteria == ["GET /reports.csv returns text/csv"]
+a3 = _cost == 0.2
+a4 = _ag.calls[0]["model"] == "opus"
+a5 = _ag.calls[0]["allowed_tools"] == AN.PLANNER_TOOLS
+a6 = "Write" not in AN.PLANNER_TOOLS and "Edit" not in AN.PLANNER_TOOLS
+a7 = "Tests need PGHOST." in _ag.calls[0]["prompt"]
+a8 = "csv downloads" in _ag.calls[0]["prompt"]
+
+_amb = _ScriptedAgent([json.dumps({"verdict": "needs_input",
+                                   "questions": ["Which columns?"]})])
+_res2, _ = AN.analyse(_amb, mk("T21", "Export", "x"), [],
+                      {"key": "pulse-backend"}, "", [], cwd=Path("."))
+a9 = _res2.verdict == "needs_input" and _res2.questions == ["Which columns?"]
+
+_bad = _ScriptedAgent(["I could not do it", "still no json"])
+try:
+    AN.analyse(_bad, mk("T22", "x", "y"), [], {"key": "r"}, "", [], cwd=Path("."))
+    a10 = False
+except ValueError:
+    a10 = len(_bad.calls) == 2   # retried once before giving up
+
+for label, ok in [("analyst returns a ready verdict", a1),
+                  ("analyst criteria are parsed", a2),
+                  ("analyst cost is reported", a3),
+                  ("analyst honours the model override", a4),
+                  ("analyst runs with read-only tools", a5),
+                  ("planner tools grant no write capability", a6),
+                  ("brain is injected into the prompt", a7),
+                  ("triage criteria are injected into the prompt", a8),
+                  ("analyst can ask for clarification", a9),
+                  ("unparseable output is retried once then raises", a10)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

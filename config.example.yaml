@@ -56,6 +56,10 @@ agent:
   allowed_tools:
     [Read, Write, Edit, Glob, Grep, Agent, "Bash(git:*)", "Bash(pnpm:*)",
      "Bash(npm:*)", "Bash(go:*)", "Bash(pytest:*)"]
+  # The analyst station reads the repo to write the plan. Read-only by
+  # construction — this is what makes planning safe in shadow mode. Adding a
+  # write tool here silently breaks that promise.
+  planner_tools: [Read, Glob, Grep, "Bash(git log:*)", "Bash(git diff:*)"]
 
 # --- GitHub / git identities ----------------------------------------------
 # One entry per GitHub account. Repos reference these by name.
