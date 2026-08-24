@@ -736,8 +736,17 @@ with tempfile.TemporaryDirectory() as tmp:
     _real_ensure_worktree2 = _vcs2.ensure_worktree
     _vcs2.ensure_worktree = lambda *a, **k: _checkout
     try:
-        pipe.tick(when)   # triage: routes into planning
-        pipe.tick(when)   # planning attempt 1: analyst raises
+        pipe.tick(when)   # triage: routes into planning (sets plan_pending)
+        pipe.tick(when)   # planning, fresh entry: analyst raises. This is the
+                          # first attempt, not a retry, so it must not count
+                          # against `attempts` (R6 fix).
+
+        row0 = store.get("mycorp:T50")
+        c0 = row0["state"] == AIState.PLANNING.value and int(row0["attempts"]) == 0
+        print(f"  {'PASS' if c0 else 'FAIL':<5} a crash on the first planning attempt does not count against attempts")
+        results.append(c0)
+
+        pipe.tick(when)   # planning attempt 1 (retry): analyst raises
 
         row1 = store.get("mycorp:T50")
         c1 = row1["state"] == AIState.PLANNING.value and int(row1["attempts"]) == 1
@@ -785,7 +794,7 @@ with tempfile.TemporaryDirectory() as tmp:
 # --- review station ---------------------------------------------------------
 print("\nreview station")
 
-def _review_flow(verdicts, *, cycles=2):
+def _review_flow(verdicts, *, cycles=2, ticks=10):
     """Drive one ticket from queued through the review loop. Returns (store, prov, brain_dir)."""
     tmp = tempfile.mkdtemp()
     cfg = Config.load("config.example.yaml")
@@ -810,7 +819,7 @@ def _review_flow(verdicts, *, cycles=2):
 
     real = {n: getattr(vcs, n) for n in
             ("ensure_worktree", "ensure_review_worktree", "commit_all", "push",
-             "create_pr", "diff_stat")}
+             "create_pr", "diff_stat", "remove_worktree")}
     made = []
     vcs.ensure_worktree = lambda *a, **k: Path(tmp)
     vcs.ensure_review_worktree = lambda *a, **k: Path(tmp)
@@ -818,9 +827,10 @@ def _review_flow(verdicts, *, cycles=2):
     vcs.push = lambda *a, **k: None
     vcs.diff_stat = lambda *a, **k: "1 file changed"
     vcs.create_pr = lambda *a, **k: (made.append(1), (7, "http://pr/7"))[1]
+    vcs.remove_worktree = lambda *a, **k: None
     try:
         when = dt.datetime(2026, 8, 10, 7, 0)
-        for _ in range(10):
+        for _ in range(ticks):
             pipe.tick(when)
     finally:
         for n, f in real.items():
@@ -904,6 +914,67 @@ for label, ok in [("an expired review lease increments attempts", c8),
                   ("crash recovery does not consume a review cycle", c9)]:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
+
+# R6 fix: `max_review_cycles` must be authoritative even when it exceeds
+# `max_fix_attempts`. With cap=5 and default max_fix_attempts=3, six
+# non-crashing request_changes verdicts must NOT trip the crash-recovery
+# escalation at review-arm entry #3 (attempts never gets there, because a
+# healthy entry consumes the `review_pending` marker instead of counting).
+# The row only blocks once the review-cycle cap itself is exceeded, and the
+# escalation message must say so, not "crashed".
+_r_capfix, _, _, _n_capfix = _review_flow([_changes_v] * 6, cycles=5, ticks=20)
+c10 = _r_capfix["state"] == AIState.BLOCKED.value
+c11 = int(_r_capfix["attempts"]) == 0
+_capfix_err = (_r_capfix["last_error"] or "").lower()
+c12 = "revision" in _capfix_err and "crashed" not in _capfix_err
+c13 = _n_capfix == 0
+
+for label, ok in [("max_review_cycles=5 outlives max_fix_attempts=3", c10),
+                  ("a healthy review loop never touches attempts", c11),
+                  ("the escalation names cycle exhaustion, not a crash", c12),
+                  ("no PR opens once cycles are exhausted", c13)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# A healthy (non-crashing) review run leaves `attempts` untouched.
+c14 = int(_r_ok["attempts"]) == 0
+print(f"  {'PASS' if c14 else 'FAIL':<5} a healthy review run leaves attempts at 0")
+results.append(c14)
+
+# A healthy (non-crashing) planning run must leave `attempts` at 0 too — the
+# same R6 defect, and the same fix shape, applied to PLANNING.
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T57", "Add CSV export to reports", "button downloads a CSV")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = FakeAgent(
+        {"decision": "execute", "confidence": 0.9, "scope": "m",
+         "plan": ["a", "b"], "acceptance_criteria": ["csv downloads"]},
+        work_replies=[json.dumps({"verdict": "ready", "plan": ["a", "b"],
+                                  "acceptance_criteria": ["csv downloads"]})])
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ew = vcs.ensure_worktree
+    vcs.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage: routes into planning
+        pipe.tick(when)   # planning: analyst grounds the plan (healthy run)
+    finally:
+        vcs.ensure_worktree = _real_ew
+
+    _healthy_plan = store.get("mycorp:T57")
+    c15 = (_healthy_plan["state"] == AIState.AWAITING_PLAN_OK.value
+          and int(_healthy_plan["attempts"]) == 0)
+
+print(f"  {'PASS' if c15 else 'FAIL':<5} a healthy planning run leaves attempts at 0")
+results.append(c15)
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

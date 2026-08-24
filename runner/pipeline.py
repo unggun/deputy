@@ -169,16 +169,19 @@ class Pipeline:
             return
 
         # execute
-        self.store.upsert(rid, repo_key=result.repo_key,
-                          meta={"plan": result.plan,
-                                "acceptance_criteria": result.acceptance_criteria})
+        meta = {"plan": result.plan, "acceptance_criteria": result.acceptance_criteria}
         gate = str(self.policy.get("require_plan_approval_from_scope", "m"))
         order = {"xs": 0, "s": 1, "m": 2, "l": 3}
         if self.mode == "shadow" or order.get(result.scope, 2) >= order.get(gate, 2):
+            # Mark this as a fresh entry into PLANNING so the arm below does
+            # not mistake a healthy first run for a crash recovery.
+            meta["plan_pending"] = True
+            self.store.upsert(rid, repo_key=result.repo_key, meta=meta)
             # A human is going to read this plan, so ground it in the code
             # first. The plan comment is posted by _plan, not here.
             self._set(rid, AIState.PLANNING)
         else:
+            self.store.upsert(rid, repo_key=result.repo_key, meta=meta)
             self._comment(rid, "plan", _fmt_plan(result, shadow=False))
             self._set(rid, AIState.QUEUED)
 
@@ -197,16 +200,21 @@ class Pipeline:
                 return
             if row["lease_until"] and row["lease_until"] > time.time():
                 return
-            # Reaching here with the row still in PLANNING means the previous
-            # attempt failed: a success transitions away. So count it
-            # unconditionally, exactly as the IN_PROGRESS arm does. Guarding on
-            # `row["lease_until"]` would miss every ordinary exception, because
-            # `release_lease` in the finally below zeroes it.
-            attempts = int(row["attempts"]) + 1
-            if attempts > int(self.limits.get("max_fix_attempts", 3)):
-                self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
-                return
-            self.store.upsert(task_id, attempts=attempts)
+            meta = json.loads(row["meta"] or "{}")
+            if meta.pop("plan_pending", False):
+                # A fresh route into planning: this is the first analyst run
+                # for this plan, not a retry. `_plan` is invoked from this
+                # arm, so unlike the IN_PROGRESS arm, reaching here does not
+                # by itself imply the previous attempt failed.
+                self.store.upsert(task_id, meta=meta)
+            else:
+                # No pending marker means the previous `_plan` died before it
+                # could transition the row. Only that counts against attempts.
+                attempts = int(row["attempts"]) + 1
+                if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                    self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
+                    return
+                self.store.upsert(task_id, attempts=attempts)
             if not self.store.acquire_lease(
                     task_id, self.runner_id,
                     int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
@@ -271,16 +279,22 @@ class Pipeline:
                 return
             if row["lease_until"] and row["lease_until"] > time.time():
                 return
-            # Reaching here with the row still in REVIEW means the previous
-            # attempt failed: a success transitions away. So count it
-            # unconditionally, exactly as the IN_PROGRESS arm does. Guarding on
-            # `row["lease_until"]` would miss every ordinary exception, because
-            # `release_lease` in the finally below zeroes it.
-            attempts = int(row["attempts"]) + 1
-            if attempts > int(self.limits.get("max_fix_attempts", 3)):
-                self._escalate(task_id, "Reviewer crashed repeatedly; needs a human.")
-                return
-            self.store.upsert(task_id, attempts=attempts)
+            meta = json.loads(row["meta"] or "{}")
+            if meta.pop("review_pending", False):
+                # A fresh push: this is the first review of this branch state,
+                # not a retry. `_review` is invoked from this arm, so unlike
+                # the IN_PROGRESS arm, reaching here does not by itself imply
+                # the previous attempt failed.
+                self.store.upsert(task_id, meta=meta)
+            else:
+                # No pending marker means the previous `_review` died before
+                # it could transition the row. Only that counts against
+                # attempts.
+                attempts = int(row["attempts"]) + 1
+                if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                    self._escalate(task_id, "Reviewer crashed repeatedly; needs a human.")
+                    return
+                self.store.upsert(task_id, attempts=attempts)
             if not self.store.acquire_lease(
                     task_id, self.runner_id,
                     int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
@@ -382,6 +396,7 @@ class Pipeline:
         meta.pop("revision", None)          # the reviewer judges a clean row
         meta["impl_summary"] = res.text[:4000]
         meta["review_cycle"] = cycle
+        meta["review_pending"] = True       # fresh entry into REVIEW, not a retry
         self.store.upsert(rid, meta=meta)
         self._set(rid, AIState.REVIEW)
         self._comment(rid, f"pushed-{branch}-{cycle}",
@@ -454,7 +469,14 @@ class Pipeline:
         self.provider.set_ai_state(task.id, AIState.PR_OPEN)
         self._comment(rid, f"pr-{number}",
                       f"Review passed. Opened draft PR: {url}\n\n{result.summary}")
-        vcs.remove_worktree(repo, wt, env=env)
+        # The row is already fully committed (state, PR, comment) — a failure
+        # tidying up the review checkout must not surface as this task's
+        # error.
+        try:
+            vcs.remove_worktree(repo, wt, env=env)
+        except Exception:  # noqa: BLE001
+            log.warning("[%s] could not remove review worktree %s", task.key, wt,
+                       exc_info=True)
 
     # --- PR polling ---------------------------------------------------
     def _poll_pr(self, row: dict[str, Any], now: dt.datetime,
@@ -668,6 +690,7 @@ def _pr_body(task: Task, meta: dict[str, Any], r: ReviewResult,
             + f"## Diffstat\n```\n{diffstat}\n```\n\n"
             f"---\nReviewed by an independent agent pass before this PR was opened. "
             f"Verdict: `{r.verdict}`. Review carefully before merging.")
+
 
 def _fmt_review(r: ReviewResult) -> str:
     rows = "\n".join(
