@@ -17,3 +17,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# SDD scratch — ledger, briefs, review packages
+.superpowers/
