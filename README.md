@@ -50,9 +50,9 @@ stateDiagram-v2
     PR_OPEN --> BLOCKED: PR closed, or out of fix attempts
     DONE --> [*]
     note right of NEEDS_INPUT: waiting on a human
-    note right of BLOCKED: waiting on a human
-    note right of HUMAN_ONLY: waiting on a human
     note right of AWAITING_PLAN_OK: waiting on a human
+    note right of HUMAN_ONLY: waiting on a human
+    note right of BLOCKED: waiting on a human
 ```
 
 | State | Meaning |

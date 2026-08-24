@@ -113,8 +113,8 @@ def validate_graph() -> list[str]:
 
 def to_mermaid() -> str:
     """Render the live transition table. Paste into ClickUp docs or Confluence."""
-    waits = {AIState.NEEDS_INPUT, AIState.HUMAN_ONLY,
-             AIState.AWAITING_PLAN_OK, AIState.BLOCKED}
+    waits = (AIState.NEEDS_INPUT, AIState.AWAITING_PLAN_OK,
+             AIState.HUMAN_ONLY, AIState.BLOCKED)
     lines = ["stateDiagram-v2", "    [*] --> new: TO DO + assigned to me"]
     for src, edges in TRANSITIONS.items():
         for dst, label in edges.items():

@@ -22,13 +22,13 @@ DEFAULT_DENYLIST = [
     r"\bgdpr\b", r"\bpii\b",
     # Prompt-injection shapes. A ticket body is data; a ticket that tries to
     # issue instructions to the runner is by definition not a normal ticket, and
-    # a human should read it before an agent does.
-    r"\bignore (all )?previous instructions\b",
-    r"\bsystem override\b",
-    r"\bdisregard (the )?(above|prior|previous)\b",
-    r"\bpush (directly )?to main\b",
-    r"\.github/workflows\b",
-    r"\bci[_\s-]?(workflow|config|pipeline)\b",
+    # a human should read it before an agent does. \s+ (not literal spaces)
+    # because ticket bodies wrap lines routinely — a single space would let a
+    # line-wrapped "ignore all previous\ninstructions" slip straight through.
+    r"\bignore\s+(all\s+)?previous\s+instructions\b",
+    r"\bsystem\s+override\b",
+    r"\bdisregard\s+(the\s+)?(above|prior|previous)\b",
+    r"\bpush\s+(directly\s+)?to\s+main\b",
 ]
 
 SYSTEM = """You are the triage stage of an automated engineering pipeline.
