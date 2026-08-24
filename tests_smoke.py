@@ -338,5 +338,28 @@ for label, ok in checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- json extraction --------------------------------------------------------
+print("\njson extraction")
+from runner.jsonio import parse_json_object
+
+_j_checks = []
+_j_checks.append(("bare object", parse_json_object('{"a": 1}') == {"a": 1}))
+_j_checks.append(("fenced object",
+                  parse_json_object('```json\n{"a": 1}\n```') == {"a": 1}))
+_j_checks.append(("prose before and after",
+                  parse_json_object('Sure!\n{"a": 1}\nHope that helps.') == {"a": 1}))
+_j_checks.append(("nested braces survive",
+                  parse_json_object('{"a": {"b": 2}}') == {"a": {"b": 2}}))
+
+try:
+    parse_json_object("no object here")
+    _j_checks.append(("missing object raises ValueError", False))
+except ValueError:
+    _j_checks.append(("missing object raises ValueError", True))
+
+for label, ok in _j_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

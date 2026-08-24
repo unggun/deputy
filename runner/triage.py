@@ -1,13 +1,13 @@
 """Triage: hard policy rules first, LLM classification second."""
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
 
 from .agents.base import CodingAgent
-from .models import AgentResult, Comment, Task, TriageResult
+from .jsonio import parse_json_object
+from .models import Comment, Task, TriageResult
 
 log = logging.getLogger(__name__)
 
@@ -71,15 +71,6 @@ def _build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any] | No
     )
 
 
-def _parse(res: AgentResult) -> dict[str, Any]:
-    text = res.text.strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError(f"no JSON object in triage output: {text[:300]}")
-    return json.loads(text[start:end + 1])
-
-
 def hard_rule_violation(task: Task, patterns: list[str]) -> str | None:
     blob = f"{task.title}\n{task.description}".lower()
     for pat in patterns:
@@ -103,7 +94,7 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
     res = agent.reason(_build_prompt(task, comments, repo))
     if not res.ok:
         raise RuntimeError(f"triage agent failed: {res.error}")
-    data = _parse(res)
+    data = parse_json_object(res.text)
 
     out = TriageResult(
         decision=str(data.get("decision", "clarify")),
