@@ -276,13 +276,17 @@ class ReviewResult:
 
 - [ ] **Step 4: Add the edges to `runner/graph.py`**
 
-In `TRANSITIONS`, change the `NEW` block to add the planning edge:
+In `TRANSITIONS`, change the `NEW` block to **add** the planning edge, keeping `AWAITING_PLAN_OK` for now:
 
 ```python
     AIState.NEW: {
         AIState.NEEDS_INPUT:      "triage: ambiguous",
         AIState.HUMAN_ONLY:       "triage: unsafe or needs a human",
         AIState.PLANNING:         "triage: executable, scope needs sign-off",
+        # Retired in Task 8, when _do_triage stops routing here directly.
+        # Removing it now would break _do_triage, which still calls
+        # _set(rid, AWAITING_PLAN_OK) and therefore goes through graph.check.
+        AIState.AWAITING_PLAN_OK: "triage: executable, scope needs sign-off (pre-analyst)",
         AIState.QUEUED:           "triage: executable, below approval gate",
         AIState.BLOCKED:          "triage failed",
     },
@@ -1474,6 +1478,23 @@ with:
             self._set(rid, AIState.QUEUED)
 ```
 
+Now that nothing routes `NEW -> AWAITING_PLAN_OK`, retire that edge. In `runner/graph.py`, delete this line and its two-line comment from the `AIState.NEW` block:
+
+```python
+        # Retired in Task 8, when _do_triage stops routing here directly.
+        # Removing it now would break _do_triage, which still calls
+        # _set(rid, AWAITING_PLAN_OK) and therefore goes through graph.check.
+        AIState.AWAITING_PLAN_OK: "triage: executable, scope needs sign-off (pre-analyst)",
+```
+
+Then add this assertion to the `# --- graph structure ---` section of `tests_smoke.py`, next to the `n7` check:
+
+```python
+n9 = AIState.AWAITING_PLAN_OK not in G.TRANSITIONS[AIState.NEW]
+print(f"  {'PASS' if n9 else 'FAIL':<5} new -> plan-review is retired (planning owns the gate)")
+results.append(n9)
+```
+
 - [ ] **Step 5: Add the `PLANNING` arm to `_advance`**
 
 Insert immediately after the `NEEDS_INPUT`/`AWAITING_PLAN_OK` arm:
@@ -2097,12 +2118,12 @@ p1 = "footer reads Copyright" in _wp
 p2 = "Footer lives in base.html." in _wp
 p3 = "pytest -q" in _wp
 
-_body = PL._pr_body(mk("T60", "Fix typo", "x"), _meta,
-                    RV.ReviewResult(verdict="approve",
-                                    criteria_results=[{"criterion": "footer reads Copyright",
-                                                       "pass": True,
-                                                       "evidence": "diff line 3"}],
-                                    summary="fine"),
+_review_result = _RR(
+    verdict="approve",
+    criteria_results=[{"criterion": "footer reads Copyright",
+                       "pass": True, "evidence": "diff line 3"}],
+    summary="fine")
+_body = PL._pr_body(mk("T60", "Fix typo", "x"), _meta, _review_result,
                     "1 file changed")
 p4 = "- [x] footer reads Copyright" in _body
 p5 = "diff line 3" in _body
@@ -2128,7 +2149,9 @@ for label, ok in [("acceptance criteria reach the implementer", p1),
 
 The `_work_prompt` and `_pr_body` cases already pass — Task 9 built both — and stay here as regression cover. The two `_fix_prompt` cases are the ones that fail.
 
-Add `from runner.models import ReviewResult` to the reviewer-station section imports, or reference it as `RV.ReviewResult` (it is re-exported through `review.py`'s import). Use the explicit form: add `from runner.models import ReviewResult as _RR` near the top of this section and use `_RR(...)`.
+Add `from runner.models import ReviewResult as _RR` at the top of this test section, next to `import runner.pipeline as PL`. Import the dataclass directly rather than reaching for it through `review.py`.
+
+This section must be appended **after** the reviewer-station section from Task 7, since sections accumulate in task order above the final tally.
 
 - [ ] **Step 2: Run test to verify it fails**
 
