@@ -1173,7 +1173,34 @@ for label, ok in [("reviewer returns an approve verdict", v1),
 Run: `python3 tests_smoke.py`
 Expected: `ImportError: cannot import name 'review' from 'runner'`
 
-- [ ] **Step 3: Create `runner/review.py`**
+- [ ] **Step 3: Move `_str_list` into `runner/jsonio.py`**
+
+Task 6 added `_str_list` to `runner/analyst.py` (ruling R4: a model returning prose where an array was asked for must not be iterated character by character). This task is its second caller, so move it to where both can import it. Cut the function out of `analyst.py` into `runner/jsonio.py`, drop the leading underscore since it is now a public helper of that module, and import it in both places:
+
+```python
+# runner/jsonio.py
+def str_list(value: Any) -> list[str]:
+    """Coerce a model's list field into a list of strings.
+
+    A model that returns prose where an array was asked for is common enough
+    to handle deliberately: iterating a bare string yields one entry per
+    character, and a non-empty list of single letters silently defeats the
+    emptiness guards the stations rely on.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value]
+    return [str(value)]
+```
+
+In `analyst.py`, replace the local definition with `from .jsonio import parse_json_object, str_list` and rename the five call sites from `_str_list(...)` to `str_list(...)`. The analyst's existing tests must still pass unchanged — they assert behaviour, not the helper's location.
+
+Below, `review.py` refers to it as `_str_list`; use `str_list` imported from `jsonio` instead.
+
+- [ ] **Step 4: Create `runner/review.py`**
 
 ```python
 """The reviewer station: an independent verdict on the pushed branch.
@@ -1320,10 +1347,10 @@ def review(agent: CodingAgent, task_key: str, criteria: list[str], base: str,
         verdict=verdict,
         criteria_results=[dict(x) for x in data.get("criteria_results", [])
                           if isinstance(x, dict)],
-        blocking_findings=[str(x) for x in data.get("blocking_findings", [])],
-        suggestions=[str(x) for x in data.get("suggestions", [])],
+        blocking_findings=_str_list(data.get("blocking_findings")),
+        suggestions=_str_list(data.get("suggestions")),
         summary=str(data.get("summary", "")),
-        brain_notes=[str(x) for x in data.get("brain_notes", [])],
+        brain_notes=_str_list(data.get("brain_notes")),
     )
 
     # "Change something, I won't say what" cannot be actioned and would burn a
