@@ -13,7 +13,7 @@ for k in ["CLICKUP_TOKEN", "CLICKUP_TOKEN_SIDE", "JIRA_EMAIL", "JIRA_TOKEN", "GH
 sys.path.insert(0, str(Path(__file__).parent))
 
 from runner.config import Config
-from runner.models import AgentResult, AIState, Comment, Task
+from runner.models import AgentResult, AIState, Comment, ReviewResult, Task
 from runner.pipeline import Pipeline
 from runner.providers.base import TaskProvider
 from runner.state import Store
@@ -975,6 +975,48 @@ with tempfile.TemporaryDirectory() as tmp:
 
 print(f"  {'PASS' if c15 else 'FAIL':<5} a healthy planning run leaves attempts at 0")
 results.append(c15)
+
+# --- prompts and PR body ----------------------------------------------------
+print("\nprompts and PR body")
+import runner.pipeline as PL
+from runner.models import ReviewResult as _RR
+
+_meta = {"plan": ["a"], "acceptance_criteria": ["footer reads Copyright"],
+         "approach": "one-line template edit"}
+_wp = PL._work_prompt(mk("T60", "Fix typo", "x"),
+                      {"key": "r", "test": "pytest -q"}, _meta,
+                      "=== REPO NOTES ===\nFooter lives in base.html.\n")
+p1 = "footer reads Copyright" in _wp
+p2 = "Footer lives in base.html." in _wp
+p3 = "pytest -q" in _wp
+
+_review_result = _RR(
+    verdict="approve",
+    criteria_results=[{"criterion": "footer reads Copyright",
+                       "pass": True, "evidence": "diff line 3"}],
+    summary="fine")
+_body = PL._pr_body(mk("T60", "Fix typo", "x"), _meta, _review_result,
+                    "1 file changed")
+p4 = "- [x] footer reads Copyright" in _body
+p5 = "diff line 3" in _body
+p6 = "1 file changed" in _body
+
+_fp = PL._fix_prompt("T60", {"failed_checks": ["unit"], "url": "http://pr/1"},
+                     ["please add a test"], "E   assert False",
+                     "=== REPO NOTES ===\nFooter lives in base.html.\n")
+p7 = "Footer lives in base.html." in _fp
+p8 = "please add a test" in _fp and "assert False" in _fp
+
+for label, ok in [("acceptance criteria reach the implementer", p1),
+                  ("the brain reaches the implementer", p2),
+                  ("the test command reaches the implementer", p3),
+                  ("PR body renders criteria as a checklist", p4),
+                  ("PR body carries the reviewer's evidence", p5),
+                  ("PR body keeps the diffstat", p6),
+                  ("the brain reaches the CI/review fix pass", p7),
+                  ("fix prompt still carries feedback and logs", p8)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(bool(ok))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

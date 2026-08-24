@@ -525,7 +525,8 @@ class Pipeline:
             return
 
         logs = vcs.failing_check_logs(wt, number, env=env) if st["ci"] == "failing" else ""
-        prompt = _fix_prompt(row["task_key"], st, feedback, logs)
+        prompt = _fix_prompt(row["task_key"], st, feedback, logs,
+                             self._brain_block(repo["key"]))
         res = self.agent.work(prompt, wt,
                               log_path=self.log_root / f"{row['task_key']}-fix-{attempts}.log")
         self.store.record("fix", rid, res.error or "ok", res.cost_usd)
@@ -658,11 +659,13 @@ and any point where you deviated from the plan.
 """
 
 
-def _fix_prompt(task_key: str, st: dict[str, Any], feedback: list[str], logs: str) -> str:
+def _fix_prompt(task_key: str, st: dict[str, Any], feedback: list[str], logs: str,
+                brain_block: str) -> str:
     fb = "\n".join(f"- {f}" for f in feedback) or "(none)"
     return f"""You opened PR {st['url']} for {task_key}. It needs another pass.
 
 Failing checks: {', '.join(st['failed_checks']) or 'none'}
+{brain_block}
 Reviewer feedback:
 {fb}
 
