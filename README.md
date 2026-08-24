@@ -24,7 +24,7 @@ stateDiagram-v2
     [*] --> new: TO DO + assigned to me
     NEW --> NEEDS_INPUT: triage: ambiguous
     NEW --> HUMAN_ONLY: triage: unsafe or needs a human
-    NEW --> AWAITING_PLAN_OK: triage: executable, scope needs sign-off
+    NEW --> PLANNING: triage: executable, scope needs sign-off
     NEW --> QUEUED: triage: executable, below approval gate
     NEW --> BLOCKED: triage failed
     NEEDS_INPUT --> NEW: human answered — re-triage
@@ -32,20 +32,47 @@ stateDiagram-v2
     AWAITING_PLAN_OK --> QUEUED: plan approved
     AWAITING_PLAN_OK --> NEW: plan rejected — re-triage
     AWAITING_PLAN_OK --> BLOCKED: orphaned or errored
+    PLANNING --> AWAITING_PLAN_OK: grounded plan posted
+    PLANNING --> NEEDS_INPUT: analyst read the code and found it ambiguous
+    PLANNING --> PLANNING: analyst run died — retry
+    PLANNING --> BLOCKED: analyst failed repeatedly
     QUEUED --> IN_PROGRESS: slot free, in execute window
     QUEUED --> BLOCKED: no repo mapped
-    IN_PROGRESS --> PR_OPEN: draft PR opened
+    IN_PROGRESS --> REVIEW: branch pushed, awaiting review
     IN_PROGRESS --> QUEUED: run crashed — retry
     IN_PROGRESS --> BLOCKED: agent failed or produced nothing
+    REVIEW --> PR_OPEN: reviewer approved
+    REVIEW --> QUEUED: reviewer requested changes
+    REVIEW --> REVIEW: reviewer run died — retry
+    REVIEW --> BLOCKED: rejected, cycles exhausted, or reviewer failed
     PR_OPEN --> PR_OPEN: pushed fixes for CI or review
     PR_OPEN --> DONE: PR merged
     PR_OPEN --> BLOCKED: PR closed, or out of fix attempts
     DONE --> [*]
+    note right of NEEDS_INPUT: waiting on a human
     note right of BLOCKED: waiting on a human
     note right of HUMAN_ONLY: waiting on a human
-    note right of NEEDS_INPUT: waiting on a human
     note right of AWAITING_PLAN_OK: waiting on a human
 ```
+
+| State | Meaning |
+|---|---|
+| `new` | never triaged |
+| `needs-input` | questions posted, waiting on a human answer |
+| `human-only` | off-limits for the agent; a human does this one |
+| `planning` | the analyst is reading the repo to ground a plan |
+| `plan-review` | plan posted, waiting for a human OK |
+| `queued` | approved, waiting for a free execution slot |
+| `in-progress` | the agent is (or was) actively working in a worktree |
+| `review` | branch pushed, an independent reviewer pass is judging it |
+| `pr-open` | PR exists, polling CI and human review |
+| `blocked` | escalated; needs a human |
+| `done` | PR merged |
+
+`planning` and `review` are the two stations added on top of the original
+triage → execute → PR loop: `planning` runs a read-only analyst against the
+repo before a human signs off on the plan, and `review` runs an independent
+pass over the pushed branch before a PR ever opens.
 
 ### Scheduling constraints
 
@@ -56,6 +83,33 @@ stateDiagram-v2
 * **Blockers are honoured.** ClickUp task dependencies and Jira "is blocked by"
   links are read natively; a ticket with open upstream work is deferred with a
   comment rather than started.
+
+## Repo brain
+
+Every repo gets a durable notes file — plain markdown at
+`{runner.brain_dir}/{source}__{repo}.md` — holding the things a run learns
+that would otherwise be relearned every tick: which env var the tests need,
+which review finding keeps recurring. It is injected into the planner,
+implementer and reviewer prompts as background context.
+
+It is human-editable by design: open it, correct it, delete it. Nothing
+treats it as anything other than a file. It is appended to only when the
+independent review pass **approves** the change, before the PR is even
+opened — a rejected, changes-requested, or crashed run writes nothing — and
+appends are capped at `limits.brain_max_bytes`. At the cap, appends are
+refused and logged rather than silently evicting older notes; prune it by
+hand when that happens.
+
+## Config keys added by the station release
+
+| Key | Meaning |
+|---|---|
+| `runner.brain_dir` | where per-repo brain files live (see above) |
+| `limits.brain_max_bytes` | per-repo brain file size cap |
+| `limits.max_review_cycles` | implementer ↔ reviewer round trips before giving up and asking a human; separate from `max_fix_attempts`, which covers crashes and CI |
+| `agent.reviewer_model` | model for the independent review pass; falls back to `agent.model` |
+| `agent.planner_tools` | tools available to the analyst station; read-only by construction, which is what makes planning safe in `mode: shadow` |
+| `agent.reviewer_tools` | tools available to the reviewer station; the repo's own `test` command is appended at call time |
 
 ## Multiple workspaces, providers and GitHub accounts
 
@@ -143,6 +197,27 @@ ai-task-runner daemon --interval 900
 ## Kill switch
 
 Set `runner.mode: shadow`, or add the `no-ai` tag to any individual ticket.
+
+## Upgrading
+
+The station release (analyst + reviewer) added two `AIState` values, `planning`
+and `review`. Auditing the ClickUp mapping for them also turned up a third,
+pre-existing gap: `new` was never in `state_field_options:` either, even
+though a rejected plan sends a ticket back to `new` via `set_ai_state`. On the
+`custom_field` backend, `set_ai_state` raises the moment a ticket reaches a
+state with no mapped dropdown option, so all three are hard failures, not
+cosmetic gaps.
+
+Before upgrading a ClickUp source on `custom_field`:
+
+1. Create ClickUp dropdown options for `new`, `planning` and `review` on the
+   AI State custom field.
+2. Add all three to that source's `state_field_options:` in `config.yaml`.
+3. Run `ai-task-runner doctor` and confirm no `RuntimeError` surfaces from
+   the ClickUp provider.
+
+Jira is unaffected — state lives in an issue entity property that accepts
+any value, and only the four human-actionable states are mirrored to labels.
 
 ## Adding a provider or agent
 

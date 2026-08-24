@@ -14,6 +14,7 @@ PR through CI/review until merge.
 ```
 runner/
   __init__.py  cli.py  config.py  graph.py  models.py  pipeline.py  state.py  triage.py  vcs.py
+  analyst.py  review.py  brain.py  jsonio.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
   providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
 tests_smoke.py  README.md  config.example.yaml
@@ -67,8 +68,8 @@ no LLM) → triage new tickets (LLM, capped per run).
 diagram cannot drift. Add states by editing `TRANSITIONS` and `AIState` — never by
 adding `if` branches in `pipeline.py`.
 
-States: `new → needs-input | human-only | plan-review (AWAITING_PLAN_OK) | queued | blocked`,
-then `queued → in-progress → pr-open → done`. `human-only`, `blocked`, `done` are terminal.
+States: `new → needs-input | human-only | planning → plan-review (AWAITING_PLAN_OK) | queued | blocked`,
+then `queued → in-progress → review → pr-open → done`. `human-only`, `blocked`, `done` are terminal.
 
 ### Layered indirection
 
@@ -112,16 +113,29 @@ comment and stops. The branch, worktree and PR live elsewhere.
   Human-reply detection depends on this, so never post via a raw provider call.
 - **Budget** — daily spend is checked against `limits.daily_budget_usd` before any work;
   every LLM step records cost via `store.record(...)`.
+- **`REVIEW` counts toward `max_active_tasks` but does not hold its repo**, matching
+  `PR_OPEN`. The repo lock exists to stop two agents branching off the same base; a
+  ticket already in review or already PR'd is no longer racing anyone for that base.
 
-### Two model seams
+### Four model seams
 
-`CodingAgent` has two methods and they are tuned separately:
+`CodingAgent` has two methods, `reason` and `work`, but `work()` takes `model` and
+`allowed_tools` overrides — so the analyst and reviewer stations reuse it with their
+own model and tool set instead of adding new methods. That gives four effectively
+independent seams:
 
 - `reason(prompt, *, max_turns=1)` — triage. Runs `claude -p` with `--allowedTools ""`
   and one turn, so **triage never reads the repo**; it judges `scope` from ticket text
   plus the `notes:` string in config. Uses `agent.triage_model`.
 - `work(prompt, cwd, *, log_path=None)` — implementation and fix passes. 60 turns, full
   allowlist, cwd is the worktree. Uses `agent.model`.
+- `work(prompt, cwd, model=agent.model, allowed_tools=agent.planner_tools)` — the
+  analyst station. `planner_tools` grants no write capability (`Read`, `Glob`,
+  `Grep`, read-only `Bash(git log:*)`/`Bash(git diff:*)`), which is what makes planning
+  safe to run even in `mode: shadow`.
+- `work(prompt, cwd, model=agent.reviewer_model, allowed_tools=agent.reviewer_tools)`
+  — the review station. `reviewer_model` falls back to `agent.model`; `reviewer_tools`
+  is read-only plus the repo's own `test` command, appended at call time.
 
 `triage_model` falls back to `model` when unset. `allowed_tools` includes `Agent`, which
 is what permits `work()` to dispatch subagents — the tool is named `Agent`, not `Task`.
@@ -153,6 +167,18 @@ the triage `scope` (`xs < s < m < l`); shadow mode always gates.
 secrets, infra go to `human-only` regardless of what the LLM decided. Keep it that way;
 a smoke test asserts it.
 
+### Brain
+
+`brain.py` holds durable per-repo notes at `runner.brain_dir`, one markdown file per
+`{source}__{repo}`. It is appended to **only on an approving review**, before the PR is
+even opened — a rejected plan, a rejected/changes-requested review, or a crashed run
+writes nothing, so the brain only accumulates notes from changes an independent review
+actually approved. It refuses to grow past `limits.brain_max_bytes`: at the
+cap it logs and skips the append rather than evicting older notes, because a brain that
+quietly forgets is worse than one that tells you to prune it. It is plain markdown in a
+known directory — editing or deleting it by hand is a supported operation, not
+corruption.
+
 ## Provider gotchas worth preserving
 
 - **Jira state** lives in an issue *entity property* (`ai-runner-state`), not a custom
@@ -167,7 +193,10 @@ a smoke test asserts it.
 - **ClickUp dependencies**: the API returns mirror rows for both directions. Disambiguate
   by `dep["task_id"] == this task` (meaning it waits on `depends_on`), not by `type`.
 - **ClickUp state backend** is configurable: `custom_field` (atomic, filterable —
-  recommended) or `tag` (global namespace).
+  recommended) or `tag` (global namespace). On `custom_field`, `set_ai_state` raises
+  `RuntimeError` for any `AIState` with no entry in `state_field_options:` — new states
+  (e.g. `planning`, `review`) need a ClickUp dropdown migration and a config update
+  *before* they ship, not after; see the "Upgrading" section in `README.md`.
 - `blocked_by()` failures must never stop work — `_advance` catches and treats the read
   as clear.
 

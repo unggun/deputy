@@ -118,12 +118,21 @@ sources:
       skip_tags: ["no-ai", "spike"]
       state_backend: custom_field    # custom_field | tag
       state_field_id: "00000000-0000-0000-0000-000000000000"
+      # REQUIRED: every AIState value needs an option here, or set_ai_state raises
+      # the moment a ticket reaches it. `new`, `planning` and `review` are not
+      # optional either — `new` is a pre-existing gap (a rejected plan sends a
+      # ticket back to NEW) and `planning`/`review` were added in the station
+      # release. Create all three options in the ClickUp dropdown first, then
+      # paste their ids here.
       state_field_options:           # state value -> ClickUp dropdown option id
+        new:         "opt-uuid-0"
         needs-input: "opt-uuid-1"
         human-only:  "opt-uuid-2"
         plan-review: "opt-uuid-3"
+        planning:    "opt-uuid-9"
         queued:      "opt-uuid-4"
         in-progress: "opt-uuid-5"
+        review:      "opt-uuid-10"
         pr-open:     "opt-uuid-6"
         blocked:     "opt-uuid-7"
         done:        "opt-uuid-8"

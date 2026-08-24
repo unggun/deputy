@@ -4,11 +4,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
-from . import graph, providers, vcs
+from . import brain, graph, providers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .pipeline import Pipeline
@@ -75,6 +76,23 @@ def _doctor(cfg: Config) -> int:
             log.info("  repo %-18s profile=%-12s %s (%s)",
                      repo["key"], profile["name"], path,
                      "present" if path.exists() else "will clone")
+        for repo in src.repos:
+            bp = brain.brain_path(cfg.path("runner.brain_dir", "~/.ai-runner/brain"),
+                                  src.key, repo["key"])
+            cap = int((cfg.get("runner.limits", {}) or {})
+                      .get("brain_max_bytes", brain.DEFAULT_MAX_BYTES))
+            size = bp.stat().st_size if bp.exists() else 0
+            log.info("  brain %-17s %d/%d bytes%s", repo["key"], size, cap,
+                     "  (at cap — prune it)" if size >= cap else "")
+
+    # Every ticket now costs a review run, and scope-gated ones a planning run
+    # too. On subscription auth that spend is invisible to daily_budget_usd.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        log.warning(
+            "running on Claude subscription auth: the runner spends your own "
+            "5-hourly quota and limits.daily_budget_usd cannot see it. Set "
+            "ANTHROPIC_API_KEY (and CLAUDE_CODE_SIMPLE=1) in the cron "
+            "environment to bill this to pay-as-you-go credits instead.")
 
     if problems:
         for p in problems:

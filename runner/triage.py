@@ -20,6 +20,15 @@ DEFAULT_DENYLIST = [
     r"\bauth(entication|orization)\b", r"\brbac\b", r"\bpermission model\b",
     r"\bdns\b", r"\bssl\b", r"\bcertificate\b", r"\bfirewall\b", r"\bterraform\b",
     r"\bgdpr\b", r"\bpii\b",
+    # Prompt-injection shapes. A ticket body is data; a ticket that tries to
+    # issue instructions to the runner is by definition not a normal ticket, and
+    # a human should read it before an agent does.
+    r"\bignore (all )?previous instructions\b",
+    r"\bsystem override\b",
+    r"\bdisregard (the )?(above|prior|previous)\b",
+    r"\bpush (directly )?to main\b",
+    r"\.github/workflows\b",
+    r"\bci[_\s-]?(workflow|config|pipeline)\b",
 ]
 
 SYSTEM = """You are the triage stage of an automated engineering pipeline.
