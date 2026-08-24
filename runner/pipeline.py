@@ -126,7 +126,7 @@ class Pipeline:
                 self._do_triage(task)
             except Exception as exc:  # noqa: BLE001
                 log.exception("triage failed for %s", task.key)
-                self.store.upsert(task.id, last_error=str(exc)[:1000])
+                self.store.upsert(row_id, last_error=str(exc)[:1000])
 
     def _orphan(self, task: Task) -> None:
         """A ticket mid-flight on a machine that has no local state for it.
@@ -197,12 +197,16 @@ class Pipeline:
                 return
             if row["lease_until"] and row["lease_until"] > time.time():
                 return
-            if row["lease_until"]:   # expired lease: the analyst run died
-                attempts = int(row["attempts"]) + 1
-                if attempts > int(self.limits.get("max_fix_attempts", 3)):
-                    self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
-                    return
-                self.store.upsert(task_id, attempts=attempts)
+            # Reaching here with the row still in PLANNING means the previous
+            # attempt failed: a success transitions away. So count it
+            # unconditionally, exactly as the IN_PROGRESS arm does. Guarding on
+            # `row["lease_until"]` would miss every ordinary exception, because
+            # `release_lease` in the finally below zeroes it.
+            attempts = int(row["attempts"]) + 1
+            if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
+                return
+            self.store.upsert(task_id, attempts=attempts)
             if not self.store.acquire_lease(
                     task_id, self.runner_id,
                     int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):

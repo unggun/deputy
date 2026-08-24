@@ -131,24 +131,6 @@ with tempfile.TemporaryDirectory() as tmp:
     cfg = Config.load("config.example.yaml")
     cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w", log_dir=f"{tmp}/l",
                               brain_dir=f"{tmp}/b")
-
-    # _plan now checks out a real worktree for the analyst to read. Point
-    # pulse-backend at a local bare repo instead of the real (inaccessible)
-    # GitHub remote, so the planning tick doesn't need network access.
-    _git_env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-    _origin = Path(tmp) / "origin.git"
-    _seed = Path(tmp) / "seed"
-    _vcs.run(["git", "init", "--bare", "-b", "main", str(_origin)])
-    _vcs.run(["git", "clone", str(_origin), str(_seed)], env=_git_env)
-    (_seed / "f.txt").write_text("hello")
-    _vcs.run(["git", "add", "-A"], cwd=_seed, env=_git_env)
-    _vcs.run(["git", "commit", "-m", "init"], cwd=_seed, env=_git_env)
-    _vcs.run(["git", "push", "-u", "origin", "main"], cwd=_seed, env=_git_env)
-    _repo_cfg = next(r for r in cfg.data["sources"][0]["repos"] if r["key"] == "pulse-backend")
-    _repo_cfg["path"] = f"{tmp}/checkout"
-    _repo_cfg["remote"] = str(_origin)
-
     src = cfg.sources(only=["mycorp"])[0]
     task = mk("T7", "Add CSV export", "button downloads a CSV")
     prov = FakeProvider([task])
@@ -161,27 +143,38 @@ with tempfile.TemporaryDirectory() as tmp:
     pipe = Pipeline(cfg, src, prov, agent, store)
     when = dt.datetime(2026, 8, 10, 7, 0)
 
-    pipe.tick(when)   # triage: routes into planning
-    pipe.tick(when)   # planning: analyst grounds the plan
-    assert prov.states["T7"] == AIState.AWAITING_PLAN_OK
-    n1 = len(prov.comments["T7"])
+    # _plan checks out a real worktree for the analyst to read. This suite is
+    # offline (fake provider, fake agent) — stub the checkout instead of
+    # touching git. The worktree machinery itself is covered by the dedicated
+    # "worktree re-creation" section below.
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ensure_worktree = _vcs.ensure_worktree
+    _vcs.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage: routes into planning
+        pipe.tick(when)   # planning: analyst grounds the plan
+        assert prov.states["T7"] == AIState.AWAITING_PLAN_OK
+        n1 = len(prov.comments["T7"])
 
-    pipe.tick(when)   # re-run: must not duplicate the plan comment
-    dup_ok = len(prov.comments["T7"]) == n1
-    print(f"  {'PASS' if dup_ok else 'FAIL':<5} re-run posts no duplicate comment")
-    results.append(dup_ok)
+        pipe.tick(when)   # re-run: must not duplicate the plan comment
+        dup_ok = len(prov.comments["T7"]) == n1
+        print(f"  {'PASS' if dup_ok else 'FAIL':<5} re-run posts no duplicate comment")
+        results.append(dup_ok)
 
-    prov.human_reply("T7", "approved, go ahead")
-    pipe.tick(when)
-    q_ok = store.get("mycorp:T7")["state"] == AIState.QUEUED.value
-    print(f"  {'PASS' if q_ok else 'FAIL':<5} 'approved' moves plan-review -> queued")
-    results.append(q_ok)
+        prov.human_reply("T7", "approved, go ahead")
+        pipe.tick(when)
+        q_ok = store.get("mycorp:T7")["state"] == AIState.QUEUED.value
+        print(f"  {'PASS' if q_ok else 'FAIL':<5} 'approved' moves plan-review -> queued")
+        results.append(q_ok)
 
-    # shadow mode must never execute
-    pipe.tick(when)
-    ex_ok = store.get("mycorp:T7")["state"] == AIState.QUEUED.value
-    print(f"  {'PASS' if ex_ok else 'FAIL':<5} shadow mode never executes")
-    results.append(ex_ok)
+        # shadow mode must never execute
+        pipe.tick(when)
+        ex_ok = store.get("mycorp:T7")["state"] == AIState.QUEUED.value
+        print(f"  {'PASS' if ex_ok else 'FAIL':<5} shadow mode never executes")
+        results.append(ex_ok)
+    finally:
+        _vcs.ensure_worktree = _real_ensure_worktree
 
 # --- orphan detection -------------------------------------------------------
 print("\nreassignment / orphan handling")
@@ -279,6 +272,20 @@ with tempfile.TemporaryDirectory() as _tmp:
     a1 = _st.active_count() == 1
 print(f"  {'PASS' if a1 else 'FAIL':<5} review counts as active, planning does not")
 results.append(a1)
+
+# A partial upsert (no explicit state=) must never resurrect or reset state —
+# this is what silently broke the PLANNING -> AWAITING_PLAN_OK path before it
+# was fixed: fields.setdefault("state", ...) ran even on updates.
+with tempfile.TemporaryDirectory() as _tmp:
+    _st2 = Store(f"{_tmp}/b.db")
+    _st2.upsert("s:X", state=AIState.PR_OPEN.value)
+    _st2.upsert("s:X", attempts=1)   # partial update: no state= passed
+    u1 = _st2.get("s:X")["state"] == AIState.PR_OPEN.value
+    _st2.upsert("s:Y", attempts=0)   # first-ever insert: no state= passed
+    u2 = _st2.get("s:Y")["state"] == AIState.NEW.value
+print(f"  {'PASS' if u1 else 'FAIL':<5} a partial upsert on an existing row leaves state untouched")
+print(f"  {'PASS' if u2 else 'FAIL':<5} a first insert with no state still defaults to new")
+results += [u1, u2]
 
 b1 = not G.blockers_clear([{"key": "DEV-1", "closed": False}]).ok
 b2 = G.blockers_clear([{"key": "DEV-1", "closed": True}]).ok
@@ -694,6 +701,86 @@ _plan_case("shadow enters planning", "xs", "shadow", AIState.PLANNING)
 _meta_ok = "csv downloads" in (_row_m["meta"] or "")
 print(f"  {'PASS' if _meta_ok else 'FAIL':<5} triage acceptance criteria are stored")
 results.append(_meta_ok)
+
+# --- planning crash recovery -------------------------------------------------
+print("\nplanning crash recovery")
+
+class _CrashingAgent:
+    """reason() triages fine; work() always dies, as if the analyst crashed."""
+    def __init__(self, decision): self.decision = decision
+    def reason(self, prompt, *, max_turns=1):
+        return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(self.decision))
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        raise RuntimeError("analyst crashed")
+
+with tempfile.TemporaryDirectory() as tmp:
+    from runner import vcs as _vcs2
+
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    cfg.data["runner"]["limits"]["max_fix_attempts"] = 2
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T50", "Add CSV export to reports", "button downloads a CSV")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = _CrashingAgent({"decision": "execute", "confidence": 0.9, "scope": "m",
+                            "plan": ["a"], "acceptance_criteria": ["csv downloads"]})
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    # Offline suite: stub the worktree checkout so the crash under test is
+    # the analyst's, not git's. See "approval round trip" above.
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ensure_worktree2 = _vcs2.ensure_worktree
+    _vcs2.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage: routes into planning
+        pipe.tick(when)   # planning attempt 1: analyst raises
+
+        row1 = store.get("mycorp:T50")
+        c1 = row1["state"] == AIState.PLANNING.value and int(row1["attempts"]) == 1
+        print(f"  {'PASS' if c1 else 'FAIL':<5} an ordinary exception in planning increments attempts")
+        results.append(c1)
+
+        pipe.tick(when)   # planning attempt 2: analyst raises again
+        pipe.tick(when)   # planning attempt 3: exceeds max_fix_attempts -> escalate
+
+        row2 = store.get("mycorp:T50")
+        c2 = row2["state"] == AIState.BLOCKED.value
+        print(f"  {'PASS' if c2 else 'FAIL':<5} exceeding max_fix_attempts escalates planning to blocked")
+        results.append(c2)
+    finally:
+        _vcs2.ensure_worktree = _real_ensure_worktree2
+
+# --- triage error handling ---------------------------------------------------
+print("\ntriage error handling")
+
+class _BadReasonAgent:
+    """reason() returns unparseable text, so triage() raises inside _do_triage."""
+    def reason(self, prompt, *, max_turns=1):
+        return AgentResult(ok=True, cost_usd=0.0, text="not json at all")
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        return AgentResult(ok=True, text="did the thing", cost_usd=0.0)
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T51", "Broken triage", "x")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, _BadReasonAgent(), store)
+    pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+
+    row = store.get("mycorp:T51")
+    e1 = row is not None and bool(row.get("last_error"))
+    e2 = store.get("T51") is None   # no unnamespaced row created
+    print(f"  {'PASS' if e1 else 'FAIL':<5} triage failure records last_error on the namespaced row")
+    print(f"  {'PASS' if e2 else 'FAIL':<5} triage failure creates no unnamespaced row")
+    results += [e1, e2]
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
