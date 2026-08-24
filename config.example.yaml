@@ -1,0 +1,169 @@
+# ===========================================================================
+# ai-task-runner — per-developer laptop config
+# Copy to config.yaml. Secrets come from env vars, never inline.
+#
+# Structure:
+#   sources      one task-manager workspace each, with its own repos
+#   vcs_profiles named git/GitHub identities, referenced by repos
+# ===========================================================================
+
+runner:
+  id: my-laptop            # unique per machine; used for lease ownership
+  mode: shadow               # shadow = triage + comment only | execute = full loop
+  db_path: ~/.ai-runner/state.db
+  work_dir: ~/.ai-runner/work    # isolated git worktrees live here
+  log_dir: ~/.ai-runner/logs
+  bot_marker: "<!-- ai-runner -->"
+  days: [mon, tue, wed, thu, fri]
+  windows:                   # local time; the OS scheduler fires every 15 min
+    advance: ["07:00-20:00"] # PR/CI polling — cheap, no LLM
+    triage:  ["06:30-08:30", "11:00-12:00", "14:00-15:30"]
+    execute: ["06:30-16:00"] # hard stop so every PR gets same-day review time
+  limits:
+    max_active_tasks: 3      # across ALL sources — this caps load on this laptop
+    max_new_triage_per_run: 10
+    max_fix_attempts: 3
+    agent_timeout_minutes: 45
+    daily_budget_usd: 15
+
+agent:
+  type: claude_code
+  binary: claude             # uses THIS developer's own Claude login
+  model: sonnet              # work() — the 60-turn implementation run
+  # reason() — one-turn, tool-less triage classification. Falls back to
+  # `model` if unset. NOTE: on a Claude subscription (not an API key) every
+  # call spends your 5-hourly/weekly quota, and opus draws on it far harder
+  # than sonnet. Set this to opus only if the runner has its own
+  # ANTHROPIC_API_KEY, or if you accept the quota cost.
+  triage_model: sonnet
+  max_turns: 60
+  permission_mode: dontAsk
+  timeout_minutes: 45
+  max_budget_usd: 2.0
+  # `Agent` lets work() dispatch subagents. Subagent definitions come from
+  # .claude/agents/*.md in the target repo, since work() runs with the
+  # worktree as its cwd. Remove it to forbid subagents entirely.
+  allowed_tools:
+    [Read, Write, Edit, Glob, Grep, Agent, "Bash(git:*)", "Bash(pnpm:*)",
+     "Bash(npm:*)", "Bash(go:*)", "Bash(pytest:*)"]
+
+# --- GitHub / git identities ----------------------------------------------
+# One entry per GitHub account. Repos reference these by name.
+# Prefer token_env (simplest, parallel-safe). gh_config_dir works too.
+# NEVER rely on `gh auth switch` — it mutates global state and races.
+vcs_profiles:
+  work:
+    host: github.com
+    token_env: GH_TOKEN_WORK          # a PAT for the MyCorp account
+    ssh_key: ~/.ssh/id_ed25519_work
+    git_user_name: "Your Name (AI Runner)"
+    git_user_email: you@mycorp.example
+    reviewer_allowlist: [your-github-user, tech-lead-1, senior-dev-2]
+
+  client-acme:
+    host: github.com
+    gh_config_dir: ~/.config/gh-acme  # separate `gh` tree: GH_CONFIG_DIR=... gh auth login
+    ssh_key: ~/.ssh/id_ed25519_acme
+    git_user_name: "AI Runner"
+    git_user_email: dev@acme-client.com
+    reviewer_allowlist: [acme-lead]
+
+vcs:
+  default_profile: work
+  draft_prs: true
+
+policy:
+  min_execute_confidence: 0.75
+  block_large_scope: true
+  require_plan_approval_from_scope: m   # xs/s go straight through; m/l need a human OK
+  approval_keywords: ["approved", "go ahead", "lgtm", "proceed"]
+  rejection_keywords: ["no", "stop", "hold", "wait", "don't"]
+  # denylist_patterns: [...]  # omit to use the built-in defaults in triage.py
+
+# --- Sources ---------------------------------------------------------------
+sources:
+  # A ClickUp personal API token covers every workspace you belong to, so the
+  # same ${CLICKUP_TOKEN} can appear under several sources with different team_ids.
+  - key: mycorp
+    provider:
+      type: clickup
+      token: ${CLICKUP_TOKEN}
+      team_id: "9012345678"
+      lists: ["901100000001", "901100000002"]
+      ready_status: "to do"          # + assignee filter, applied automatically
+      in_progress_status: "in progress"
+      review_status: "code review"
+      done_status: "done"
+      skip_tags: ["no-ai", "spike"]
+      state_backend: custom_field    # custom_field | tag
+      state_field_id: "00000000-0000-0000-0000-000000000000"
+      state_field_options:           # state value -> ClickUp dropdown option id
+        needs-input: "opt-uuid-1"
+        human-only:  "opt-uuid-2"
+        plan-review: "opt-uuid-3"
+        queued:      "opt-uuid-4"
+        in-progress: "opt-uuid-5"
+        pr-open:     "opt-uuid-6"
+        blocked:     "opt-uuid-7"
+        done:        "opt-uuid-8"
+    repos:
+      - key: pulse-backend
+        containers: ["901100000001"]     # ClickUp list ids that map here
+        vcs_profile: work
+        path: ~/code/pulse-backend
+        remote: git@github.com:mycorp/pulse-backend.git
+        base_branch: main
+        language: "NestJS / TypeScript / Postgres"
+        setup: "pnpm install --frozen-lockfile"
+        test: "pnpm test"
+        notes: "Domain modules under src/modules. Every endpoint needs an e2e test."
+      - key: pulse-frontend
+        containers: ["901100000002"]
+        vcs_profile: work
+        path: ~/code/pulse-frontend
+        remote: git@github.com:mycorp/pulse-frontend.git
+        base_branch: main
+        language: "Next.js / TypeScript"
+        setup: "pnpm install --frozen-lockfile"
+        test: "pnpm test && pnpm lint"
+
+  # A second ClickUp workspace — different team_id, different repos, own token.
+  - key: sideproject
+    enabled: false
+    provider:
+      type: clickup
+      token: ${CLICKUP_TOKEN_SIDE}
+      team_id: "9087654321"
+      ready_status: "to do"
+    repos:
+      - key: sideproject-app
+        vcs_profile: work        # single repo in this source: no `containers` needed
+        path: ~/code/sideproject-app
+        remote: git@github.com:your-github-user/sideproject-app.git
+        base_branch: main
+        test: "npm test"
+
+  # A Jira client. State lives in an issue entity property (no Jira admin
+  # required); only needs-input / human-only / plan-review / blocked get a label.
+  - key: acme
+    provider:
+      type: jira
+      site: acme.atlassian.net
+      email: ${JIRA_EMAIL}
+      token: ${JIRA_TOKEN}           # Atlassian API token
+      projects: ["ACME"]
+      ready_status: "To Do"
+      in_progress_status: "In Progress"
+      review_status: "In Review"
+      done_status: "Done"
+      skip_labels: ["no-ai"]
+    repos:
+      - key: acme-api
+        containers: ["ACME"]           # Jira project keys
+        vcs_profile: client-acme
+        path: ~/code/acme-api
+        remote: git@github.com:acme-client/api.git
+        base_branch: develop
+        language: "Go"
+        setup: "go mod download"
+        test: "go test ./..."
