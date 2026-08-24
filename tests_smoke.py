@@ -548,6 +548,18 @@ try:
 except ValueError:
     a10 = len(_bad.calls) == 2   # retried once before giving up
 
+_str_plan = _ScriptedAgent([json.dumps({
+    "verdict": "ready", "plan": "do the thing",
+})])
+_res11, _ = AN.analyse(_str_plan, mk("T23", "x", "y"), [],
+                       {"key": "r"}, "", [], cwd=Path("."))
+a11 = _res11.plan == ["do the thing"] and _res11.verdict == "ready"
+
+_no_plan = _ScriptedAgent([json.dumps({"verdict": "ready"})])
+_res12, _ = AN.analyse(_no_plan, mk("T24", "x", "y"), [],
+                       {"key": "r"}, "", [], cwd=Path("."))
+a12 = _res12.verdict == "needs_input" and len(_res12.questions) == 1
+
 for label, ok in [("analyst returns a ready verdict", a1),
                   ("analyst criteria are parsed", a2),
                   ("analyst cost is reported", a3),
@@ -557,7 +569,9 @@ for label, ok in [("analyst returns a ready verdict", a1),
                   ("brain is injected into the prompt", a7),
                   ("triage criteria are injected into the prompt", a8),
                   ("analyst can ask for clarification", a9),
-                  ("unparseable output is retried once then raises", a10)]:
+                  ("unparseable output is retried once then raises", a10),
+                  ("a string plan is coerced, not iterated char-by-char", a11),
+                  ("a missing plan still triggers the empty-plan downgrade", a12)]:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 

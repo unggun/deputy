@@ -59,6 +59,23 @@ _RETRY_SUFFIX = (
 )
 
 
+def _str_list(value: Any) -> list[str]:
+    """Coerce a model's list field into a list of strings.
+
+    A model that returns prose where an array was asked for is common enough
+    to handle deliberately: iterating a bare string would yield one entry per
+    character, and a non-empty list of single letters defeats the empty-plan
+    guard below.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value]
+    return [str(value)]
+
+
 def build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any],
                  brain_block: str, criteria: list[str]) -> str:
     thread = "\n".join(
@@ -109,11 +126,11 @@ def analyse(agent: CodingAgent, task: Task, comments: list[Comment],
         verdict=verdict if verdict in ("ready", "needs_input") else "needs_input",
         problem=str(data.get("problem", "")),
         approach=str(data.get("approach", "")),
-        plan=[str(x) for x in data.get("plan", [])],
-        acceptance_criteria=[str(x) for x in data.get("acceptance_criteria", [])],
-        risks=[str(x) for x in data.get("risks", [])],
-        files_of_interest=[str(x) for x in data.get("files_of_interest", [])],
-        questions=[str(x) for x in data.get("questions", [])],
+        plan=_str_list(data.get("plan")),
+        acceptance_criteria=_str_list(data.get("acceptance_criteria")),
+        risks=_str_list(data.get("risks")),
+        files_of_interest=_str_list(data.get("files_of_interest")),
+        questions=_str_list(data.get("questions")),
     )
 
     # A "ready" verdict with no plan is not ready, whatever the model says.
