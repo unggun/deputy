@@ -413,5 +413,48 @@ for label, ok in _j_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- brain ------------------------------------------------------------------
+print("\nrepo brain")
+import datetime as _dt
+from runner import brain as B
+
+with tempfile.TemporaryDirectory() as tmp:
+    bp = B.brain_path(Path(tmp), "mycorp", "pulse-backend")
+    day = _dt.date(2026, 8, 24)
+
+    b_missing = B.read(bp) == "" and B.as_prompt_block(bp) == ""
+
+    w1 = B.append(bp, ["Tests need PGHOST=localhost."], today=day)
+    b_write = w1 == ["Tests need PGHOST=localhost."] and bp.exists()
+    b_dated = bp.read_text().startswith("- 2026-08-24: Tests need PGHOST")
+
+    # Same note, different whitespace and case: still a duplicate.
+    w2 = B.append(bp, ["tests   need  PGHOST=localhost."], today=day)
+    b_dedupe = w2 == [] and bp.read_text().count("PGHOST") == 1
+
+    w3 = B.append(bp, ["The lint step needs node 20."], today=day)
+    b_second = w3 == ["The lint step needs node 20."]
+
+    # At the cap: refuse, do not evict.
+    before = bp.read_text()
+    w4 = B.append(bp, ["x" * 200], max_bytes=len(before.encode()) + 10, today=day)
+    b_cap = w4 == [] and bp.read_text() == before
+
+    b_block = "=== REPO NOTES" in B.as_prompt_block(bp)
+
+    # Two sources mapping the same repo key must not share a file.
+    b_ns = B.brain_path(Path(tmp), "acme", "pulse-backend") != bp
+
+for label, ok in [("missing brain reads as empty", b_missing),
+                  ("append writes the note", b_write),
+                  ("notes are dated", b_dated),
+                  ("dedupe ignores case and whitespace", b_dedupe),
+                  ("a genuinely new note is appended", b_second),
+                  ("at the cap it refuses rather than evicting", b_cap),
+                  ("as_prompt_block wraps the notes", b_block),
+                  ("sources are namespaced apart", b_ns)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

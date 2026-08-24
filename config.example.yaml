@@ -13,6 +13,7 @@ runner:
   db_path: ~/.ai-runner/state.db
   work_dir: ~/.ai-runner/work    # isolated git worktrees live here
   log_dir: ~/.ai-runner/logs
+  brain_dir: ~/.ai-runner/brain  # durable per-repo notes, one .md per repo
   bot_marker: "<!-- ai-runner -->"
   days: [mon, tue, wed, thu, fri]
   windows:                   # local time; the OS scheduler fires every 15 min
@@ -25,6 +26,8 @@ runner:
     max_fix_attempts: 3
     agent_timeout_minutes: 45
     daily_budget_usd: 15
+    brain_max_bytes: 8000    # per-repo note file cap; at the cap appends are
+                             # refused and logged, never silently evicted
 
 agent:
   type: claude_code
