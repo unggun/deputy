@@ -60,6 +60,10 @@ agent:
   # construction — this is what makes planning safe in shadow mode. Adding a
   # write tool here silently breaks that promise.
   planner_tools: [Read, Glob, Grep, "Bash(git log:*)", "Bash(git diff:*)"]
+  # The reviewer station reads the pushed diff and re-runs cheap checks. The
+  # repo's own `test` command is appended to this list at call time, so the
+  # reviewer can verify the implementer's claims instead of trusting them.
+  reviewer_tools: [Read, Glob, Grep, "Bash(git log:*)", "Bash(git diff:*)"]
 
 # --- GitHub / git identities ----------------------------------------------
 # One entry per GitHub account. Repos reference these by name.

@@ -575,5 +575,59 @@ for label, ok in [("analyst returns a ready verdict", a1),
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+
+# --- reviewer station -------------------------------------------------------
+print("\nreviewer station")
+from runner import review as RV
+
+_approve = json.dumps({
+    "verdict": "approve",
+    "criteria_results": [{"criterion": "GET /reports.csv returns text/csv",
+                          "pass": True, "evidence": "route added, test passes"}],
+    "blocking_findings": [], "suggestions": ["consider streaming"],
+    "summary": "Small, correct, tested.",
+    "brain_notes": ["Reports tests need PGHOST=localhost."],
+})
+_rg = _ScriptedAgent([_approve])
+_rr, _rc = RV.review(
+    _rg, "T30", ["GET /reports.csv returns text/csv"], "main",
+    "ai/t30-add-csv", "added a serializer and a route", "",
+    cwd=Path("."), model="opus",
+    tools=RV.tools_for({"key": "r", "test": "pytest -q"}))
+
+v1 = _rr.verdict == "approve"
+v2 = _rr.brain_notes == ["Reports tests need PGHOST=localhost."]
+v3 = _rr.criteria_results[0]["pass"] is True
+v4 = _rc == 0.2 and _rg.calls[0]["model"] == "opus"
+v5 = "Bash(pytest -q:*)" in _rg.calls[0]["allowed_tools"]
+v6 = "Write" not in RV.REVIEWER_TOOLS and "Edit" not in RV.REVIEWER_TOOLS
+v7 = "ai/t30-add-csv" in _rg.calls[0]["prompt"]
+v8 = RV.tools_for({"key": "r"}) == RV.REVIEWER_TOOLS  # no test cmd -> no Bash add
+
+_rc2 = _ScriptedAgent([json.dumps({"verdict": "request_changes",
+                                   "blocking_findings": ["no test for the empty case"],
+                                   "summary": "close"})])
+_rr2, _ = RV.review(_rc2, "T31", [], "main", "b", "s", "", cwd=Path("."))
+v9 = _rr2.verdict == "request_changes" and bool(_rr2.blocking_findings)
+
+# A request_changes with no findings is unactionable; treat it as approve.
+_rc3 = _ScriptedAgent([json.dumps({"verdict": "request_changes",
+                                   "blocking_findings": [], "summary": "eh"})])
+_rr3, _ = RV.review(_rc3, "T32", [], "main", "b", "s", "", cwd=Path("."))
+v10 = _rr3.verdict == "approve"
+
+for label, ok in [("reviewer returns an approve verdict", v1),
+                  ("reviewer brain notes are parsed", v2),
+                  ("per-criterion results are parsed", v3),
+                  ("reviewer honours model override and reports cost", v4),
+                  ("repo test command is added to the tool surface", v5),
+                  ("reviewer tools grant no write capability", v6),
+                  ("branch under review is named in the prompt", v7),
+                  ("a repo with no test command adds no Bash tool", v8),
+                  ("request_changes carries findings", v9),
+                  ("request_changes with no findings downgrades to approve", v10)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

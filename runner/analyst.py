@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents.base import CodingAgent
-from .jsonio import parse_json_object
+from .jsonio import parse_json_object, str_list
 from .models import AnalysisResult, Comment, Task
 
 log = logging.getLogger(__name__)
@@ -57,23 +57,6 @@ _RETRY_SUFFIX = (
     "\n\nYour previous reply was not a single JSON object. Reply with the JSON "
     "object only: no prose before it, no code fence around it."
 )
-
-
-def _str_list(value: Any) -> list[str]:
-    """Coerce a model's list field into a list of strings.
-
-    A model that returns prose where an array was asked for is common enough
-    to handle deliberately: iterating a bare string would yield one entry per
-    character, and a non-empty list of single letters defeats the empty-plan
-    guard below.
-    """
-    if value is None or value == "":
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple)):
-        return [str(x) for x in value]
-    return [str(value)]
 
 
 def build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any],
@@ -126,11 +109,11 @@ def analyse(agent: CodingAgent, task: Task, comments: list[Comment],
         verdict=verdict if verdict in ("ready", "needs_input") else "needs_input",
         problem=str(data.get("problem", "")),
         approach=str(data.get("approach", "")),
-        plan=_str_list(data.get("plan")),
-        acceptance_criteria=_str_list(data.get("acceptance_criteria")),
-        risks=_str_list(data.get("risks")),
-        files_of_interest=_str_list(data.get("files_of_interest")),
-        questions=_str_list(data.get("questions")),
+        plan=str_list(data.get("plan")),
+        acceptance_criteria=str_list(data.get("acceptance_criteria")),
+        risks=str_list(data.get("risks")),
+        files_of_interest=str_list(data.get("files_of_interest")),
+        questions=str_list(data.get("questions")),
     )
 
     # A "ready" verdict with no plan is not ready, whatever the model says.
