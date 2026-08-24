@@ -244,7 +244,7 @@ class Pipeline:
             return
         env = self._env_for(repo)
 
-        branch = row["branch"] or f"ai/{vcs.slug(task.key, 20)}-{vcs.slug(task.title, 40)}"
+        branch = row["branch"] or vcs.branch_name(task.key, task.title)
         self.store.set_state(rid, AIState.IN_PROGRESS, branch=branch)
         self.provider.set_ai_state(task.id, AIState.IN_PROGRESS)
         self.provider.set_status(task.id, self._status("in_progress_status", "in progress"))

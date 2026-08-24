@@ -322,6 +322,27 @@ else:
             print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
             results.append(ok)
 
+        # The reviewer gets its own detached checkout of the pushed branch.
+        vcs.push(wt2, "ai/test-branch", env=env)
+        rv = vcs.ensure_review_worktree(repo, "ai/test-branch", work, env=env)
+        rv_sha = vcs.run(["git", "rev-parse", "HEAD"], cwd=rv).stdout.strip()
+        rv_head = vcs.run(["git", "symbolic-ref", "-q", "HEAD"],
+                          cwd=rv, check=False).returncode != 0
+        rv_apart = rv.resolve() != wt2.resolve()
+        rv_again = vcs.ensure_review_worktree(repo, "ai/test-branch", work,
+                                              env=env).resolve() == rv.resolve()
+
+        bn = vcs.branch_name("DEV-12", "Add CSV export to reports")
+        bn_ok = bn.startswith("ai/dev-12-") and " " not in bn
+
+        for label, ok in [("review worktree holds the pushed commit", rv_sha == sha),
+                          ("review worktree is detached", rv_head),
+                          ("review worktree is separate from the impl worktree", rv_apart),
+                          ("re-running review checkout is idempotent", rv_again),
+                          ("branch_name slugs key and title", bn_ok)]:
+            print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+            results.append(ok)
+
 # --- agent: the two seams build different command lines --------------------
 print("\nagent seams")
 import runner.agents.claude_code as CC

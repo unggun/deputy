@@ -123,6 +123,44 @@ def ensure_worktree(repo: dict[str, Any], branch: str, work_root: Path,
     return wt
 
 
+def branch_name(key: str, title: str) -> str:
+    """The branch a ticket gets.
+
+    Lives here rather than inline in the pipeline because two call sites need
+    it: the planning station computes it up front so the implementer inherits a
+    warm checkout, and the execute path computes it when planning was skipped.
+    """
+    return f"ai/{slug(key, 20)}-{slug(title, 40)}"
+
+
+def ensure_review_worktree(repo: dict[str, Any], branch: str, work_root: Path,
+                           env: dict[str, str] | None = None) -> Path:
+    """A detached checkout of `origin/<branch>` for the reviewer.
+
+    Detached for two reasons. Git refuses to check the same branch out in two
+    worktrees, and the implementer's worktree already holds it. And it is
+    honest: the reviewer judges a commit, it does not own a branch.
+
+    Kept separate from the implementation worktree on purpose. The reviewer
+    should see exactly what was pushed, with none of the implementer's stray
+    untracked files.
+    """
+    main = Path(str(repo["path"])).expanduser()
+    run(["git", "fetch", "origin", branch], cwd=main, env=env)
+
+    wt = work_root / repo["key"] / "review" / slug(branch, 60)
+    if wt.exists():
+        # Re-point an existing review checkout at the latest push, which is
+        # what a second review cycle needs.
+        run(["git", "checkout", "--detach", f"origin/{branch}"], cwd=wt, env=env)
+        return wt
+
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", "--detach", str(wt), f"origin/{branch}"],
+        cwd=main, env=env)
+    return wt
+
+
 def branch_exists(main: Path, branch: str, env: dict[str, str] | None = None) -> bool:
     return run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
                cwd=main, check=False, env=env).returncode == 0
