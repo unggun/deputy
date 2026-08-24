@@ -36,6 +36,13 @@ agent:
   # than sonnet. Set this to opus only if the runner has its own
   # ANTHROPIC_API_KEY, or if you accept the quota cost.
   triage_model: sonnet
+  # reviewer() — the independent review pass over the pushed branch. Falls back
+  # to `model` when unset. Claude Code is Claude-only, so this cannot give you
+  # Foreman's cross-vendor independence; a different tier plus a fresh session
+  # and a diff-only prompt is what we get. Prefer a *stronger* model here than
+  # the implementer if you can afford it: catching a bad change is worth more
+  # than writing one slightly faster.
+  reviewer_model: sonnet
   max_turns: 60
   permission_mode: dontAsk
   timeout_minutes: 45

@@ -54,7 +54,7 @@ class FakeAgent:
     def reason(self, prompt, *, max_turns=1):
         import json
         return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(self.decision))
-    def work(self, prompt, cwd, *, log_path=None):
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
         return AgentResult(ok=True, text="did the thing", cost_usd=0.5)
 
 
@@ -332,7 +332,7 @@ class _Proc:
     stdout = json.dumps({"result": "{}", "total_cost_usd": 0.0,
                          "num_turns": 1, "duration_ms": 1})
 
-def _capture(cfg):
+def _capture(cfg, **work_kwargs):
     """Run reason() and work() with subprocess stubbed; return both argv lists."""
     seen = []
     agent = CC.ClaudeCodeAgent({"binary": sys.executable, **cfg})
@@ -340,7 +340,7 @@ def _capture(cfg):
     CC.subprocess.run = lambda cmd, **kw: (seen.append(cmd), _Proc())[1]
     try:
         agent.reason("classify this")
-        agent.work("implement this", Path("."))
+        agent.work("implement this", Path("."), **work_kwargs)
     finally:
         CC.subprocess.run = real
     return seen[0], seen[1]
@@ -368,6 +368,23 @@ checks.append(("no model configured -> no --model flag",
 r4, w4 = _capture({"model": "sonnet", "allowed_tools": ["Read", "Edit"]})
 checks.append(("explicit allowed_tools is not overridden",
                _flag(w4, "--allowedTools") == "Read,Edit"))
+
+_, w5 = _capture({"model": "sonnet"}, model="opus")
+checks.append(("work(model=...) overrides the configured model",
+               _flag(w5, "--model") == "opus"))
+
+_, w6 = _capture({"model": "sonnet", "allowed_tools": ["Read", "Edit"]},
+                 allowed_tools=["Read", "Grep"])
+checks.append(("work(allowed_tools=...) overrides the configured tools",
+               _flag(w6, "--allowedTools") == "Read,Grep"))
+
+_, w7 = _capture({"model": "sonnet", "allowed_tools": ["Read", "Edit"]})
+checks.append(("no override leaves configured tools alone",
+               _flag(w7, "--allowedTools") == "Read,Edit"))
+
+_, w8 = _capture({"model": "sonnet"}, allowed_tools=[])
+checks.append(("empty allowed_tools means no tools, not 'unset'",
+               _flag(w8, "--allowedTools") == ""))
 
 for label, ok in checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")

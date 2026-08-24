@@ -33,6 +33,7 @@ class ClaudeCodeAgent(CodingAgent):
         # judgement call versus a 60-turn agentic run. Let them differ, and
         # fall back to the single `model` when only one is configured.
         self.triage_model = cfg.get("triage_model") or self.model
+        self.reviewer_model = cfg.get("reviewer_model") or self.model
         self.max_turns = int(cfg.get("max_turns", 60))
         self.permission_mode = cfg.get("permission_mode", "dontAsk")
         self.allowed_tools = cfg.get("allowed_tools", DEFAULT_TOOLS)
@@ -53,14 +54,19 @@ class ClaudeCodeAgent(CodingAgent):
             cmd += ["--model", self.triage_model]
         return self._run(cmd, cwd=None, timeout=300)
 
-    def work(self, prompt: str, cwd: Path, *, log_path: Path | None = None) -> AgentResult:
+    def work(self, prompt: str, cwd: Path, *,
+             log_path: Path | None = None,
+             model: str | None = None,
+             allowed_tools: list[str] | None = None) -> AgentResult:
+        tools = self.allowed_tools if allowed_tools is None else allowed_tools
+        chosen = model or self.model
         cmd = [self.binary, "-p", prompt,
                "--output-format", "json",
                "--max-turns", str(self.max_turns),
                "--permission-mode", self.permission_mode,
-               "--allowedTools", ",".join(self.allowed_tools)]
-        if self.model:
-            cmd += ["--model", self.model]
+               "--allowedTools", ",".join(tools)]
+        if chosen:
+            cmd += ["--model", chosen]
         if self.max_budget_usd:
             cmd += ["--max-budget-usd", str(self.max_budget_usd)]
         return self._run(cmd, cwd=cwd, timeout=self.timeout, log_path=log_path)
