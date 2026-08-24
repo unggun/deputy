@@ -343,6 +343,26 @@ else:
             print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
             results.append(ok)
 
+        # A second review cycle must see the newly pushed commits, not just
+        # reuse the old checkout path - prove the re-point, not just reuse.
+        (wt2 / "h.txt").write_text("second agent commit")
+        vcs.commit_all(wt2, "second agent commit", env=env)
+        sha2 = vcs.run(["git", "rev-parse", "HEAD"], cwd=wt2).stdout.strip()
+        vcs.push(wt2, "ai/test-branch", env=env)
+
+        rv2 = vcs.ensure_review_worktree(repo, "ai/test-branch", work, env=env)
+        rv2_sha = vcs.run(["git", "rev-parse", "HEAD"], cwd=rv2).stdout.strip()
+        rv2_head = vcs.run(["git", "symbolic-ref", "-q", "HEAD"],
+                           cwd=rv2, check=False).returncode != 0
+        rv2_apart = rv2.resolve() == rv.resolve()
+
+        for label, ok in [("review worktree re-points to the newly pushed commit",
+                           rv2_sha == sha2 and sha2 != sha),
+                          ("re-pointed review worktree is still detached", rv2_head),
+                          ("re-pointed review worktree is still the same path", rv2_apart)]:
+            print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+            results.append(ok)
+
 # --- agent: the two seams build different command lines --------------------
 print("\nagent seams")
 import runner.agents.claude_code as CC
