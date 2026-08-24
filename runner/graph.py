@@ -33,10 +33,6 @@ TRANSITIONS: dict[AIState, dict[AIState, str]] = {
         AIState.NEEDS_INPUT:      "triage: ambiguous",
         AIState.HUMAN_ONLY:       "triage: unsafe or needs a human",
         AIState.PLANNING:         "triage: executable, scope needs sign-off",
-        # Retired in Task 8, when _do_triage stops routing here directly.
-        # Removing it now would break _do_triage, which still calls
-        # _set(rid, AWAITING_PLAN_OK) and therefore goes through graph.check.
-        AIState.AWAITING_PLAN_OK: "triage: executable, scope needs sign-off (pre-analyst)",
         AIState.QUEUED:           "triage: executable, below approval gate",
         AIState.BLOCKED:          "triage failed",
     },

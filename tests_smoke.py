@@ -50,12 +50,15 @@ class FakeProvider(TaskProvider):
 
 
 class FakeAgent:
-    def __init__(self, decision): self.decision = decision
+    def __init__(self, decision, work_replies=None):
+        self.decision = decision
+        self.work_replies = list(work_replies or [])
     def reason(self, prompt, *, max_turns=1):
         import json
         return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(self.decision))
     def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
-        return AgentResult(ok=True, text="did the thing", cost_usd=0.5)
+        text = self.work_replies.pop(0) if self.work_replies else "did the thing"
+        return AgentResult(ok=True, text=text, cost_usd=0.5)
 
 
 def mk(tid, title, desc, list_id="901100000001"):
@@ -112,29 +115,54 @@ results.append(run_case(
     "medium scope -> plan approval gate",
     mk("T5", "Add CSV export to reports", "button downloads a CSV of the current filter"),
     {"decision": "execute", "confidence": 0.9, "scope": "m", "plan": ["a", "b"]},
-    AIState.AWAITING_PLAN_OK)[0])
+    AIState.PLANNING)[0])
 
 results.append(run_case(
     "small scope, shadow mode still gates",
     mk("T6", "Fix typo in footer", "'Copyrigth' -> 'Copyright'"),
     {"decision": "execute", "confidence": 0.95, "scope": "xs", "plan": ["fix typo"]},
-    AIState.AWAITING_PLAN_OK)[0])
+    AIState.PLANNING)[0])
 
 # --- approval round trip + idempotency -------------------------------------
 print("\napproval round trip")
 with tempfile.TemporaryDirectory() as tmp:
+    from runner import vcs as _vcs
+
     cfg = Config.load("config.example.yaml")
-    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w", log_dir=f"{tmp}/l")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w", log_dir=f"{tmp}/l",
+                              brain_dir=f"{tmp}/b")
+
+    # _plan now checks out a real worktree for the analyst to read. Point
+    # pulse-backend at a local bare repo instead of the real (inaccessible)
+    # GitHub remote, so the planning tick doesn't need network access.
+    _git_env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    _origin = Path(tmp) / "origin.git"
+    _seed = Path(tmp) / "seed"
+    _vcs.run(["git", "init", "--bare", "-b", "main", str(_origin)])
+    _vcs.run(["git", "clone", str(_origin), str(_seed)], env=_git_env)
+    (_seed / "f.txt").write_text("hello")
+    _vcs.run(["git", "add", "-A"], cwd=_seed, env=_git_env)
+    _vcs.run(["git", "commit", "-m", "init"], cwd=_seed, env=_git_env)
+    _vcs.run(["git", "push", "-u", "origin", "main"], cwd=_seed, env=_git_env)
+    _repo_cfg = next(r for r in cfg.data["sources"][0]["repos"] if r["key"] == "pulse-backend")
+    _repo_cfg["path"] = f"{tmp}/checkout"
+    _repo_cfg["remote"] = str(_origin)
+
     src = cfg.sources(only=["mycorp"])[0]
     task = mk("T7", "Add CSV export", "button downloads a CSV")
     prov = FakeProvider([task])
     store = Store(f"{tmp}/s.db")
-    agent = FakeAgent({"decision": "execute", "confidence": 0.9, "scope": "m",
-                       "plan": ["a", "b"], "acceptance_criteria": ["csv downloads"]})
+    agent = FakeAgent(
+        {"decision": "execute", "confidence": 0.9, "scope": "m",
+         "plan": ["a", "b"], "acceptance_criteria": ["csv downloads"]},
+        work_replies=[json.dumps({"verdict": "ready", "plan": ["a", "b"],
+                                  "acceptance_criteria": ["csv downloads"]})])
     pipe = Pipeline(cfg, src, prov, agent, store)
     when = dt.datetime(2026, 8, 10, 7, 0)
 
-    pipe.tick(when)
+    pipe.tick(when)   # triage: routes into planning
+    pipe.tick(when)   # planning: analyst grounds the plan
     assert prov.states["T7"] == AIState.AWAITING_PLAN_OK
     n1 = len(prov.comments["T7"])
 
@@ -224,6 +252,7 @@ n5 = AIState.PR_OPEN in G.TRANSITIONS[AIState.REVIEW]
 n6 = AIState.QUEUED in G.TRANSITIONS[AIState.REVIEW]
 n7 = AIState.PR_OPEN not in G.TRANSITIONS[AIState.IN_PROGRESS]
 n8 = not AIState.PLANNING.is_terminal and not AIState.REVIEW.is_terminal
+n9 = AIState.AWAITING_PLAN_OK not in G.TRANSITIONS[AIState.NEW]
 for label, ok in [("new -> planning exists", n1),
                   ("planning -> plan-review exists", n2),
                   ("planning -> needs-input exists", n3),
@@ -231,7 +260,8 @@ for label, ok in [("new -> planning exists", n1),
                   ("review -> pr-open exists", n5),
                   ("review -> queued exists (request_changes)", n6),
                   ("in-progress -> pr-open is gone", n7),
-                  ("new states are not terminal", n8)]:
+                  ("new states are not terminal", n8),
+                  ("new -> plan-review is retired (planning owns the gate)", n9)]:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
@@ -628,6 +658,42 @@ for label, ok in [("reviewer returns an approve verdict", v1),
                   ("request_changes with no findings downgrades to approve", v10)]:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
+
+# --- planning station -------------------------------------------------------
+print("\nplanning station")
+
+def _plan_case(name, scope, mode, expect_state):
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config.load("config.example.yaml")
+        cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                                  log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b",
+                                  mode=mode)
+        src = cfg.sources(only=["mycorp"])[0]
+        task = mk("T40", "Add CSV export to reports", "button downloads a CSV")
+        prov = FakeProvider([task])
+        store = Store(f"{tmp}/s.db")
+        agent = FakeAgent({"decision": "execute", "confidence": 0.9,
+                           "scope": scope, "plan": ["a"],
+                           "acceptance_criteria": ["csv downloads"]})
+        pipe = Pipeline(cfg, src, prov, agent, store)
+        pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        got = store.get("mycorp:T40")
+        ok = got["state"] == expect_state.value
+        print(f"  {'PASS' if ok else 'FAIL':<5} {name:<44} -> {got['state']}")
+        results.append(ok)
+        return got
+
+# xs is below the gate: straight to queued, no planning run.
+_plan_case("xs skips planning", "xs", "execute", AIState.QUEUED)
+# m is at the gate: planning first.
+_row_m = _plan_case("m enters planning", "m", "execute", AIState.PLANNING)
+# shadow always gates, and planning is read-only so it still runs.
+_plan_case("shadow enters planning", "xs", "shadow", AIState.PLANNING)
+
+# Triage criteria are persisted, not just commented.
+_meta_ok = "csv downloads" in (_row_m["meta"] or "")
+print(f"  {'PASS' if _meta_ok else 'FAIL':<5} triage acceptance criteria are stored")
+results.append(_meta_ok)
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

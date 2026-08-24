@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import time
 from pathlib import Path
 from typing import Any
 
-from . import graph, vcs
+from . import analyst, brain, graph, review, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
-from .models import AIState, Task, TriageResult
+from .models import AIState, AnalysisResult, Task, TriageResult
 from .providers.base import TaskProvider
 from .state import Store
 from .triage import triage
@@ -47,6 +48,8 @@ class Pipeline:
         self.log_root = cfg.path("runner.log_dir", "~/.ai-runner/logs")
         self.limits = cfg.get("runner.limits", {}) or {}
         self.policy = cfg.get("policy", {}) or {}
+        self.acfg = cfg.get("agent", {}) or {}
+        self.brain_root = cfg.path("runner.brain_dir", "~/.ai-runner/brain")
         self.pcfg = source.provider
 
     # --- source-scoped helpers ----------------------------------------
@@ -56,6 +59,12 @@ class Pipeline:
 
     def _env_for(self, repo: dict[str, Any]) -> dict[str, str]:
         return vcs.profile_env(self.cfg.profile_for_repo(repo))
+
+    def _brain_file(self, repo_key: str) -> Path:
+        return brain.brain_path(self.brain_root, self.source.key, repo_key)
+
+    def _brain_block(self, repo_key: str) -> str:
+        return brain.as_prompt_block(self._brain_file(repo_key))
 
     def _status(self, name: str, default: str) -> str:
         return str(self.pcfg.get(name, default))
@@ -160,14 +169,15 @@ class Pipeline:
             return
 
         # execute
-        self.store.upsert(rid, repo_key=result.repo_key, meta={"plan": result.plan})
+        self.store.upsert(rid, repo_key=result.repo_key,
+                          meta={"plan": result.plan,
+                                "acceptance_criteria": result.acceptance_criteria})
         gate = str(self.policy.get("require_plan_approval_from_scope", "m"))
         order = {"xs": 0, "s": 1, "m": 2, "l": 3}
         if self.mode == "shadow" or order.get(result.scope, 2) >= order.get(gate, 2):
-            self._comment(rid, "plan", _fmt_plan(result, shadow=self.mode == "shadow"))
-            last = comments[-1].id if comments else ""
-            self.store.upsert(rid, last_seen_comment_id=last)
-            self._set(rid, AIState.AWAITING_PLAN_OK)
+            # A human is going to read this plan, so ground it in the code
+            # first. The plan comment is posted by _plan, not here.
+            self._set(rid, AIState.PLANNING)
         else:
             self._comment(rid, "plan", _fmt_plan(result, shadow=False))
             self._set(rid, AIState.QUEUED)
@@ -180,6 +190,27 @@ class Pipeline:
 
         if state in (AIState.NEEDS_INPUT, AIState.AWAITING_PLAN_OK):
             self._check_for_human_reply(row, state)
+            return
+
+        if state == AIState.PLANNING:
+            if not _in_window(now, windows.get("execute", [])):
+                return
+            if row["lease_until"] and row["lease_until"] > time.time():
+                return
+            if row["lease_until"]:   # expired lease: the analyst run died
+                attempts = int(row["attempts"]) + 1
+                if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                    self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
+                    return
+                self.store.upsert(task_id, attempts=attempts)
+            if not self.store.acquire_lease(
+                    task_id, self.runner_id,
+                    int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
+                return
+            try:
+                self._plan(row)
+            finally:
+                self.store.release_lease(task_id)
             return
 
         if state == AIState.QUEUED:
@@ -233,6 +264,48 @@ class Pipeline:
 
         if state == AIState.PR_OPEN:
             self._poll_pr(row, now, windows)
+
+    def _plan(self, row: dict[str, Any]) -> None:
+        """The analyst station: turn a repo-blind triage plan into a real one."""
+        rid = row["task_id"]
+        task = self.provider.get_task(row["provider_task_id"])
+        repo = self.source.repo_by_key(row["repo_key"] or "")
+        if not repo:
+            self._escalate(rid, "No repository mapped; cannot plan.")
+            return
+
+        env = self._env_for(repo)
+        branch = row["branch"] or vcs.branch_name(task.key, task.title)
+        wt = vcs.ensure_worktree(repo, branch, self.work_root, env=env)
+        self.store.upsert(rid, branch=branch)
+
+        meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
+        result, cost = analyst.analyse(
+            self.agent, task, self.provider.list_comments(task.id), repo,
+            self._brain_block(repo["key"]), meta.get("acceptance_criteria", []),
+            cwd=wt,
+            model=self.acfg.get("model"),
+            tools=self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS,
+            log_path=self.log_root / f"{task.key}-plan.log",
+        )
+        self.store.record("plan", rid, result.verdict, cost)
+
+        if result.verdict == "needs_input":
+            self._comment(rid, "plan-questions", _fmt_analyst_questions(result))
+            comments = self.provider.list_comments(task.id)
+            self.store.upsert(rid, last_seen_comment_id=comments[-1].id if comments else "")
+            self._set(rid, AIState.NEEDS_INPUT)
+            return
+
+        meta.update(plan=result.plan,
+                    acceptance_criteria=result.acceptance_criteria,
+                    problem=result.problem, approach=result.approach,
+                    files_of_interest=result.files_of_interest)
+        self.store.upsert(rid, meta=meta)
+        self._comment(rid, "plan", _fmt_analysis(result, shadow=self.mode == "shadow"))
+        comments = self.provider.list_comments(task.id)
+        self.store.upsert(rid, last_seen_comment_id=comments[-1].id if comments else "")
+        self._set(rid, AIState.AWAITING_PLAN_OK)
 
     # --- execution ----------------------------------------------------
     def _execute(self, row: dict[str, Any]) -> None:
@@ -407,6 +480,26 @@ def _fmt_plan(r: TriageResult, shadow: bool) -> str:
             "\n\n_Reply `approved` to let me start, or correct the plan and I'll re-read it._")
     return (f"**Plan** (scope `{r.scope}`, confidence {r.confidence:.0%})\n\n{steps}\n\n"
             f"**Acceptance criteria I inferred**\n{ac}{tail}")
+
+
+def _fmt_analyst_questions(r: AnalysisResult) -> str:
+    qs = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(r.questions))
+    return (f"**I read the code and hit something the ticket doesn't settle.**\n\n"
+            f"{r.problem}\n\n{qs}\n\n"
+            f"_Reply in this thread and I'll re-read the ticket on the next run._")
+
+
+def _fmt_analysis(r: AnalysisResult, shadow: bool) -> str:
+    steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(r.plan))
+    ac = "\n".join(f"- {a}" for a in r.acceptance_criteria) or "- (none)"
+    risks = "\n".join(f"- {x}" for x in r.risks) or "- (none flagged)"
+    files = "\n".join(f"- `{f}`" for f in r.files_of_interest) or "- (none listed)"
+    tail = ("\n\n_Shadow mode: no code will be written._" if shadow else
+            "\n\n_Reply `approved` to let me start, or correct the plan and I'll re-read it._")
+    return (f"**Plan** (written after reading the repository)\n\n"
+            f"{r.problem}\n\n**Approach**\n{r.approach}\n\n"
+            f"**Steps**\n{steps}\n\n**Acceptance criteria**\n{ac}\n\n"
+            f"**Files I expect to touch**\n{files}\n\n**Risks**\n{risks}{tail}")
 
 
 def _work_prompt(task: Task, repo: dict[str, Any], plan_json: str) -> str:

@@ -74,10 +74,10 @@ class Store:
         return dict(row) if row else None
 
     def upsert(self, task_id: str, **fields: Any) -> None:
-        fields.setdefault("state", AIState.NEW.value)
         fields["updated_at"] = _now()
         existing = self.get(task_id)
         if existing is None:
+            fields.setdefault("state", AIState.NEW.value)
             cols = ["task_id", *fields.keys()]
             vals = [task_id, *[_coerce(v) for v in fields.values()]]
             ph = ",".join("?" * len(cols))
