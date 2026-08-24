@@ -12,6 +12,7 @@ from pathlib import Path
 from . import brain, graph, providers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
+from .models import AIState
 from .pipeline import Pipeline
 from .state import Store
 
@@ -44,12 +45,42 @@ def _pipelines(cfg: Config, dry_run: bool, only: list[str] | None) -> list[Pipel
     return out
 
 
+def _clickup_state_gaps(cfg: Config) -> list[str]:
+    """Every AIState value needs a `state_field_options` entry on a ClickUp
+    source using the `custom_field` backend, or `set_ai_state` raises the
+    moment a ticket reaches an unmapped state (see clickup.py:103 and the
+    README 'Upgrading' section). `doctor` is what operators are told to run
+    to confirm the mapping is complete after adding new states — this is the
+    check that actually does that; without it, `doctor` exits clean and the
+    gap only surfaces mid-flight on the next affected ticket.
+
+    Sources on the `tag` backend and Jira sources are exempt: `tag` has no
+    fixed option set, and Jira state lives in an issue entity property that
+    accepts any value.
+    """
+    problems: list[str] = []
+    for src in cfg.sources():
+        if src.provider_type != "clickup":
+            continue
+        backend = str(src.provider.get("state_backend", "custom_field"))
+        if backend != "custom_field":
+            continue
+        options = src.provider.get("state_field_options", {}) or {}
+        missing = [s.value for s in AIState if s.value not in options]
+        if missing:
+            problems.append(
+                f"source {src.key}: state_field_options is missing "
+                f"{', '.join(missing)} for the custom_field backend")
+    return problems
+
+
 def _doctor(cfg: Config) -> int:
     log = logging.getLogger("doctor")
     problems: list[str] = []
 
     problems += [f"workflow graph: {p}" for p in graph.validate_graph()]
     problems += vcs.preflight(cfg.get("vcs_profiles", {}) or {})
+    problems += _clickup_state_gaps(cfg)
 
     try:
         agent = ClaudeCodeAgent(cfg.get("agent", {}) or {})

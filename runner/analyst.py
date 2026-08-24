@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents.base import CodingAgent
-from .jsonio import parse_json_object, str_list
+from .jsonio import StationError, parse_json_object, str_list
 from .models import AnalysisResult, Comment, Task
 
 log = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ def analyse(agent: CodingAgent, task: Task, comments: list[Comment],
                          allowed_tools=allowed)
         cost += res.cost_usd
         if not res.ok:
-            raise RuntimeError(f"analyst agent failed: {res.error}")
+            raise StationError(f"analyst agent failed: {res.error}", cost)
         try:
             data = parse_json_object(res.text)
             break

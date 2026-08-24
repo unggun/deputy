@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 from . import analyst, brain, graph, review, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
+from .jsonio import StationError
 from .models import AIState, AnalysisResult, ReviewResult, Task, TriageResult
 from .providers.base import TaskProvider
 from .state import Store
@@ -152,7 +154,15 @@ class Pipeline:
         rid = self._row_id(task.id)
         comments = self.provider.list_comments(task.id)
         repo = self.source.repo_for_container(task.list_id, task.list_name)
-        result, cost = triage(self.agent, task, comments, repo, self.policy)
+        try:
+            result, cost = triage(self.agent, task, comments, repo, self.policy)
+        except StationError as exc:
+            # The agent run itself failed (not just an unparseable reply).
+            # Record what it cost before this propagates to the generic
+            # per-row handler in tick() — otherwise a failing triage run
+            # spends money `daily_budget_usd` never finds out about.
+            self.store.record("triage", rid, f"failed: {exc}", exc.cost_usd)
+            raise
         self.store.record("triage", rid, f"{result.decision} ({result.scope})", cost)
         log.info("[%s] triage -> %s (conf %.2f)", task.key, result.decision, result.confidence)
 
@@ -200,26 +210,34 @@ class Pipeline:
                 return
             if row["lease_until"] and row["lease_until"] > time.time():
                 return
-            meta = json.loads(row["meta"] or "{}")
-            if meta.pop("plan_pending", False):
-                # A fresh route into planning: this is the first analyst run
-                # for this plan, not a retry. `_plan` is invoked from this
-                # arm, so unlike the IN_PROGRESS arm, reaching here does not
-                # by itself imply the previous attempt failed.
-                self.store.upsert(task_id, meta=meta)
-            else:
-                # No pending marker means the previous `_plan` died before it
-                # could transition the row. Only that counts against attempts.
-                attempts = int(row["attempts"]) + 1
-                if attempts > int(self.limits.get("max_fix_attempts", 3)):
-                    self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
-                    return
-                self.store.upsert(task_id, attempts=attempts)
+            if not self._budget_available(now):
+                return
+            # Acquire the lease BEFORE consuming the `plan_pending` marker or
+            # counting an attempt. If another runner wins the lease between
+            # our stale `in_flight()` snapshot and this call, we must not
+            # have already written off this round as a crash — that would
+            # misclassify a healthy run happening elsewhere as our failure.
             if not self.store.acquire_lease(
                     task_id, self.runner_id,
                     int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
                 return
             try:
+                meta = json.loads(row["meta"] or "{}")
+                if meta.pop("plan_pending", False):
+                    # A fresh route into planning: this is the first analyst
+                    # run for this plan, not a retry. `_plan` is invoked from
+                    # this arm, so unlike the IN_PROGRESS arm, reaching here
+                    # does not by itself imply the previous attempt failed.
+                    self.store.upsert(task_id, meta=meta)
+                else:
+                    # No pending marker means the previous `_plan` died
+                    # before it could transition the row. Only that counts
+                    # against attempts.
+                    attempts = int(row["attempts"]) + 1
+                    if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                        self._escalate(task_id, "Analyst crashed repeatedly; needs a human.")
+                        return
+                    self.store.upsert(task_id, attempts=attempts)
                 self._plan(row)
             finally:
                 self.store.release_lease(task_id)
@@ -254,6 +272,8 @@ class Pipeline:
                               f"I'll pick this up once they're done.")
                 log.info("[%s] deferred: %s", row["task_key"], clear.reason)
                 return
+            if not self._budget_available(now):
+                return
             if not self.store.acquire_lease(task_id, self.runner_id,
                                             int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
                 return
@@ -279,27 +299,32 @@ class Pipeline:
                 return
             if row["lease_until"] and row["lease_until"] > time.time():
                 return
-            meta = json.loads(row["meta"] or "{}")
-            if meta.pop("review_pending", False):
-                # A fresh push: this is the first review of this branch state,
-                # not a retry. `_review` is invoked from this arm, so unlike
-                # the IN_PROGRESS arm, reaching here does not by itself imply
-                # the previous attempt failed.
-                self.store.upsert(task_id, meta=meta)
-            else:
-                # No pending marker means the previous `_review` died before
-                # it could transition the row. Only that counts against
-                # attempts.
-                attempts = int(row["attempts"]) + 1
-                if attempts > int(self.limits.get("max_fix_attempts", 3)):
-                    self._escalate(task_id, "Reviewer crashed repeatedly; needs a human.")
-                    return
-                self.store.upsert(task_id, attempts=attempts)
+            if not self._budget_available(now):
+                return
+            # Same ordering fix as the PLANNING arm above: acquire the lease
+            # before touching `review_pending` or `attempts`, so a lost race
+            # for the lease leaves both untouched for whoever holds it.
             if not self.store.acquire_lease(
                     task_id, self.runner_id,
                     int(self.limits.get("agent_timeout_minutes", 45)) * 60 + 300):
                 return
             try:
+                meta = json.loads(row["meta"] or "{}")
+                if meta.pop("review_pending", False):
+                    # A fresh push: this is the first review of this branch
+                    # state, not a retry. `_review` is invoked from this arm,
+                    # so unlike the IN_PROGRESS arm, reaching here does not
+                    # by itself imply the previous attempt failed.
+                    self.store.upsert(task_id, meta=meta)
+                else:
+                    # No pending marker means the previous `_review` died
+                    # before it could transition the row. Only that counts
+                    # against attempts.
+                    attempts = int(row["attempts"]) + 1
+                    if attempts > int(self.limits.get("max_fix_attempts", 3)):
+                        self._escalate(task_id, "Reviewer crashed repeatedly; needs a human.")
+                        return
+                    self.store.upsert(task_id, attempts=attempts)
                 self._review(row)
             finally:
                 self.store.release_lease(task_id)
@@ -323,18 +348,36 @@ class Pipeline:
         self.store.upsert(rid, branch=branch)
 
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
-        result, cost = analyst.analyse(
-            self.agent, task, self.provider.list_comments(task.id), repo,
-            self._brain_block(repo["key"]), meta.get("acceptance_criteria", []),
-            cwd=wt,
-            model=self.acfg.get("model"),
-            tools=self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS,
-            log_path=self.log_root / f"{task.key}-plan.log",
-        )
+        comments = self.provider.list_comments(task.id)
+        # Cycle-scope the plan comment key on the comment count observed
+        # *before* this round posts anything. On a plan rejection
+        # (plan-review -> new -> planning -> plan-review) the human's
+        # rejection reply is itself a new comment, so this count always
+        # differs between rounds — the same trick `_do_triage` uses for
+        # `clarify-{len(comments)}`. A rerun of the exact same tick
+        # recomputes the same count before anything new is posted, so the
+        # idempotency claim in `_comment` still suppresses the duplicate.
+        round_key = len(comments)
+        try:
+            result, cost = analyst.analyse(
+                self.agent, task, comments, repo,
+                self._brain_block(repo["key"]), meta.get("acceptance_criteria", []),
+                cwd=wt,
+                model=self.acfg.get("model"),
+                tools=self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS,
+                log_path=self.log_root / f"{task.key}-plan.log",
+            )
+        except StationError as exc:
+            self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd)
+            raise
         self.store.record("plan", rid, result.verdict, cost)
+        # The analyst produced output without crashing: this station's own
+        # crash budget resets so the next station starts with a clean slate
+        # instead of inheriting attempts spent recovering earlier crashes.
+        self.store.upsert(rid, attempts=0)
 
         if result.verdict == "needs_input":
-            self._comment(rid, "plan-questions", _fmt_analyst_questions(result))
+            self._comment(rid, f"plan-questions-{round_key}", _fmt_analyst_questions(result))
             comments = self.provider.list_comments(task.id)
             self.store.upsert(rid, last_seen_comment_id=comments[-1].id if comments else "")
             self._set(rid, AIState.NEEDS_INPUT)
@@ -345,7 +388,7 @@ class Pipeline:
                     problem=result.problem, approach=result.approach,
                     files_of_interest=result.files_of_interest)
         self.store.upsert(rid, meta=meta)
-        self._comment(rid, "plan", _fmt_analysis(result, shadow=self.mode == "shadow"))
+        self._comment(rid, f"plan-{round_key}", _fmt_analysis(result, shadow=self.mode == "shadow"))
         comments = self.provider.list_comments(task.id)
         self.store.upsert(rid, last_seen_comment_id=comments[-1].id if comments else "")
         self._set(rid, AIState.AWAITING_PLAN_OK)
@@ -397,7 +440,11 @@ class Pipeline:
         meta["impl_summary"] = res.text[:4000]
         meta["review_cycle"] = cycle
         meta["review_pending"] = True       # fresh entry into REVIEW, not a retry
-        self.store.upsert(rid, meta=meta)
+        # The implementer station just completed successfully and is handing
+        # off to REVIEW — reset the shared `attempts` counter so the reviewer
+        # gets its own full crash budget instead of inheriting whatever the
+        # implementer spent recovering earlier crashes.
+        self.store.upsert(rid, meta=meta, attempts=0)
         self._set(rid, AIState.REVIEW)
         self._comment(rid, f"pushed-{branch}-{cycle}",
                       f"Pushed `{branch}`. Running review before opening a PR.")
@@ -417,26 +464,32 @@ class Pipeline:
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
 
         wt = vcs.ensure_review_worktree(repo, branch, self.work_root, env=env)
-        result, cost = review.review(
-            self.agent, task.key, meta.get("acceptance_criteria", []),
-            base, branch, meta.get("impl_summary", ""),
-            self._brain_block(repo["key"]),
-            cwd=wt,
-            model=self.acfg.get("reviewer_model") or self.acfg.get("model"),
-            tools=review.tools_for(repo, self.acfg.get("reviewer_tools")),
-            log_path=self.log_root / f"{task.key}-review.log",
-        )
+        try:
+            result, cost = review.review(
+                self.agent, task.key, meta.get("acceptance_criteria", []),
+                base, branch, meta.get("impl_summary", ""),
+                self._brain_block(repo["key"]),
+                cwd=wt,
+                model=self.acfg.get("reviewer_model") or self.acfg.get("model"),
+                tools=review.tools_for(repo, self.acfg.get("reviewer_tools")),
+                log_path=self.log_root / f"{task.key}-review.log",
+            )
+        except StationError as exc:
+            self.store.record("review", rid, f"failed: {exc}", exc.cost_usd)
+            raise
         self.store.record("review", rid, result.verdict, cost)
         cycle = int(meta.get("review_cycle", 0))
 
         if result.verdict == "reject":
             self._comment(rid, f"review-reject-{cycle}", _fmt_review(result))
+            self._remove_review_worktree(repo, wt, env, task.key)
             self._escalate(rid, f"Reviewer rejected the approach: {result.summary}")
             return
 
         if result.verdict == "request_changes":
             if cycle + 1 > int(self.limits.get("max_review_cycles", 2)):
                 self._comment(rid, f"review-giveup-{cycle}", _fmt_review(result))
+                self._remove_review_worktree(repo, wt, env, task.key)
                 self._escalate(
                     rid, f"Still failing review after {cycle} revision(s). "
                          f"Unresolved: {'; '.join(result.blocking_findings)[:600]}")
@@ -444,7 +497,13 @@ class Pipeline:
             meta["revision"] = {"cycle": cycle + 1,
                                 "findings": result.blocking_findings,
                                 "summary": result.summary}
-            self.store.upsert(rid, meta=meta)
+            # The reviewer station just completed successfully (a verdict,
+            # not a crash) and is handing back to QUEUED for another
+            # implementation pass — reset `attempts` so that pass gets its
+            # own crash budget. `meta["review_cycle"]` (bumped separately by
+            # `_execute`, from `revision.cycle` above) is a different counter
+            # entirely and is untouched here.
+            self.store.upsert(rid, meta=meta, attempts=0)
             self._comment(rid, f"review-changes-{cycle}", _fmt_review(result))
             self._set(rid, AIState.QUEUED)
             return
@@ -472,10 +531,22 @@ class Pipeline:
         # The row is already fully committed (state, PR, comment) — a failure
         # tidying up the review checkout must not surface as this task's
         # error.
+        self._remove_review_worktree(repo, wt, env, task.key)
+
+    def _remove_review_worktree(self, repo: dict[str, Any], wt: Path,
+                                env: dict[str, str], task_key: str) -> None:
+        """Best-effort cleanup of the reviewer's detached checkout.
+
+        Called on every path out of REVIEW — approve, reject, and giving up
+        on cycle exhaustion — so a rejected or exhausted ticket does not leak
+        one worktree per attempt. Only the `request_changes`-and-continue
+        path skips this: that row is coming straight back through REVIEW, so
+        the checkout is about to be reused rather than abandoned.
+        """
         try:
             vcs.remove_worktree(repo, wt, env=env)
         except Exception:  # noqa: BLE001
-            log.warning("[%s] could not remove review worktree %s", task.key, wt,
+            log.warning("[%s] could not remove review worktree %s", task_key, wt,
                        exc_info=True)
 
     # --- PR polling ---------------------------------------------------
@@ -523,6 +594,8 @@ class Pipeline:
             return
         if not _in_window(now, windows.get("execute", [])):
             return
+        if not self._budget_available(now):
+            return
 
         logs = vcs.failing_check_logs(wt, number, env=env) if st["ci"] == "failing" else ""
         prompt = _fix_prompt(row["task_key"], st, feedback, logs,
@@ -553,16 +626,59 @@ class Pipeline:
             body = " ".join(c.text.lower() for c in fresh)
             approve = self.policy.get("approval_keywords", ["approved", "go ahead", "lgtm", "proceed"])
             reject = self.policy.get("rejection_keywords", ["no", "stop", "hold", "don't"])
-            if any(k in body for k in approve) and not any(k in body for k in reject):
+            if _matches_any(body, approve) and not _matches_any(body, reject):
                 self._set(rid, AIState.QUEUED)
                 self._comment(rid, f"approved-{fresh[-1].id}", "Plan approved — queued for execution.")
             else:
+                # Rejected: `_plan` always leaves a worktree behind for this
+                # branch. The row is going back to `new`, and nothing else
+                # will ever revisit this exact branch to clean it up, so do
+                # it here before re-triage starts a fresh round.
+                self._remove_planning_worktree(row)
                 self._set(rid, AIState.NEW)  # re-triage with the new context
             return
 
         self._set(rid, AIState.NEW)  # re-triage now that questions were answered
 
+    def _remove_planning_worktree(self, row: dict[str, Any]) -> None:
+        """Best-effort cleanup of the analyst's worktree on plan rejection.
+
+        `_plan` creates this worktree unconditionally the moment planning
+        starts. If the human rejects the resulting plan, the row goes back to
+        `new` and nothing else in the pipeline will revisit this exact branch
+        again on its own — leaving one worktree behind per rejected round.
+        """
+        repo = self.source.repo_by_key(row["repo_key"] or "")
+        branch = row["branch"]
+        if not repo or not branch:
+            return
+        wt = self.work_root / repo["key"] / vcs.slug(branch, 60)
+        try:
+            vcs.remove_worktree(repo, wt, env=self._env_for(repo))
+        except Exception:  # noqa: BLE001
+            log.warning("[%s] could not remove planning worktree %s",
+                       row.get("task_key"), wt, exc_info=True)
+
     # --- helpers -------------------------------------------------------
+    def _budget_available(self, now: dt.datetime) -> bool:
+        """Re-checked immediately before every agent run (analyst, implementer,
+        reviewer, CI fix).
+
+        `tick()` checks `daily_budget_usd` once, before any work starts. But
+        one tick can run several of those agent passes across several rows —
+        without a re-check here, spend recorded by an earlier row in the same
+        tick is invisible until the *next* tick's top-of-tick gate, by which
+        point the budget may already be blown well past the configured cap.
+        """
+        budget = float(self.limits.get("daily_budget_usd", 20))
+        spent = self.store.spend_since(_midnight_epoch(now))
+        if spent >= budget:
+            log.warning("[%s] daily budget exhausted mid-tick (%.2f / %.2f USD); "
+                       "deferring further agent runs to the next tick",
+                       self.source.key, spent, budget)
+            return False
+        return True
+
     def _pid(self, rid: str) -> str:
         row = self.store.get(rid) or {}
         return str(row.get("provider_task_id") or rid.split(":", 1)[-1])
@@ -584,6 +700,18 @@ class Pipeline:
         pid = self._pid(rid)
         self.provider.set_ai_state(pid, AIState.BLOCKED)
         self.provider.add_comment(pid, f"**Escalated to a human.**\n\n{reason}")
+
+
+def _matches_any(body: str, keywords: list[str]) -> bool:
+    """Whole word/phrase match against `body` (already lowercased).
+
+    A plain substring test reads "no" out of "now" — "approved, go ahead
+    now" would then look rejected because of the `reject` keyword list's
+    "no", flipping a clean approval into a rejection. `\\b` anchors each
+    keyword (including multi-word ones like "go ahead") to a real word
+    boundary so this can't happen.
+    """
+    return any(re.search(rf"\b{re.escape(k)}\b", body) for k in keywords)
 
 
 # --- message formatting -------------------------------------------------

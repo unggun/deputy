@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents.base import CodingAgent
-from .jsonio import parse_json_object, str_list
+from .jsonio import StationError, parse_json_object, str_list
 from .models import ReviewResult
 
 log = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ def review(agent: CodingAgent, task_key: str, criteria: list[str], base: str,
                          allowed_tools=allowed)
         cost += res.cost_usd
         if not res.ok:
-            raise RuntimeError(f"reviewer agent failed: {res.error}")
+            raise StationError(f"reviewer agent failed: {res.error}", cost)
         try:
             data = parse_json_object(res.text)
             break

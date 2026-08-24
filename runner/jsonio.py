@@ -30,6 +30,22 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return json.loads(cleaned[start:end + 1])
 
 
+class StationError(RuntimeError):
+    """Raised when a station's underlying agent run itself failed (`res.ok`
+    is False) rather than merely returning unparseable text.
+
+    Carries the cost already spent on that run. Without this, `raise
+    RuntimeError(...)` discarded `res.cost_usd` on the way out — the caller
+    never saw it, so `store.record(...)` never ran, and a failed run's spend
+    was invisible to `daily_budget_usd` forever even though the provider had
+    already billed it.
+    """
+
+    def __init__(self, message: str, cost_usd: float = 0.0) -> None:
+        super().__init__(message)
+        self.cost_usd = cost_usd
+
+
 def str_list(value: Any) -> list[str]:
     """Coerce a model's list field into a list of strings.
 

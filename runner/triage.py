@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from .agents.base import CodingAgent
-from .jsonio import parse_json_object
+from .jsonio import StationError, parse_json_object
 from .models import Comment, Task, TriageResult
 
 log = logging.getLogger(__name__)
@@ -80,8 +80,21 @@ def _build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any] | No
     )
 
 
-def hard_rule_violation(task: Task, patterns: list[str]) -> str | None:
-    blob = f"{task.title}\n{task.description}".lower()
+def hard_rule_violation(task: Task, patterns: list[str],
+                        comments: list[Comment] | None = None) -> str | None:
+    """Scan ticket text and human comment text against the denylist.
+
+    Comment text reaches the model (it's in the prompt via `_build_prompt`)
+    but never the hard rule that overrides the model — a denylist phrase
+    slipped into a reply could route straight to "execute". Bot comments are
+    excluded: they're the runner's own plan/question posts, which legitimately
+    quote the ticket back (including any denylist phrase already caught when
+    the ticket itself was scanned), and scanning them would just be scanning
+    our own output.
+    """
+    parts = [task.title, task.description]
+    parts += [c.text for c in (comments or []) if not c.is_bot]
+    blob = "\n".join(parts).lower()
     for pat in patterns:
         if re.search(pat, blob):
             return pat
@@ -91,7 +104,7 @@ def hard_rule_violation(task: Task, patterns: list[str]) -> str | None:
 def triage(agent: CodingAgent, task: Task, comments: list[Comment],
            repo: dict[str, Any] | None, policy: dict[str, Any]) -> tuple[TriageResult, float]:
     patterns = policy.get("denylist_patterns") or DEFAULT_DENYLIST
-    hit = hard_rule_violation(task, patterns)
+    hit = hard_rule_violation(task, patterns, comments)
     if hit:
         return TriageResult(
             decision="human_only", confidence=1.0, scope="?",
@@ -102,7 +115,7 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
 
     res = agent.reason(_build_prompt(task, comments, repo))
     if not res.ok:
-        raise RuntimeError(f"triage agent failed: {res.error}")
+        raise StationError(f"triage agent failed: {res.error}", res.cost_usd)
     data = parse_json_object(res.text)
 
     out = TriageResult(

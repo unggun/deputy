@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 for k in ["CLICKUP_TOKEN", "CLICKUP_TOKEN_SIDE", "JIRA_EMAIL", "JIRA_TOKEN", "GH_TOKEN_WORK"]:
@@ -1028,6 +1029,551 @@ for label, ok in [("acceptance criteria reach the implementer", p1),
                   ("fix prompt still carries feedback and logs", p8)]:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(bool(ok))
+
+# --- fix 1: cycle-scoped plan comment keys ----------------------------------
+print("\ncycle-scoped plan comment keys (fix 1)")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T82", "Add CSV export to reports", "button downloads a CSV")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = FakeAgent(
+        {"decision": "execute", "confidence": 0.9, "scope": "m",
+         "plan": ["a", "b"], "acceptance_criteria": ["csv downloads"]},
+        work_replies=[
+            json.dumps({"verdict": "ready", "plan": ["a", "b"],
+                       "acceptance_criteria": ["csv downloads"]}),
+            json.dumps({"verdict": "ready", "plan": ["a", "b", "c"],
+                       "acceptance_criteria": ["csv downloads", "xlsx too"]}),
+        ])
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ew = vcs.ensure_worktree
+    vcs.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage -> planning
+        pipe.tick(when)   # planning -> plan-review (first plan posted)
+        n1 = len([c for c in prov.comments["T82"] if "**Plan**" in c.text])
+        state1_ok = store.get("mycorp:T82")["state"] == AIState.AWAITING_PLAN_OK.value
+
+        prov.human_reply("T82", "no, that's not what I meant, please redo this")
+        pipe.tick(when)   # plan-review -> new (rejected), then re-triage -> planning, same tick
+        pipe.tick(when)   # planning -> plan-review (second plan posted)
+
+        n2 = len([c for c in prov.comments["T82"] if "**Plan**" in c.text])
+        k1_ok = n2 == n1 + 1     # a genuinely new plan comment appeared
+        state2_ok = store.get("mycorp:T82")["state"] == AIState.AWAITING_PLAN_OK.value
+
+        pipe.tick(when)   # re-run the same tick: no third plan comment
+        n3 = len([c for c in prov.comments["T82"] if "**Plan**" in c.text])
+        k2_ok = n3 == n2
+    finally:
+        vcs.ensure_worktree = _real_ew
+
+for label, ok in [("the first plan comment posts and reaches plan-review", state1_ok and n1 == 1),
+                  ("a rejected plan produces a second, distinct plan comment", k1_ok),
+                  ("the ticket reaches plan-review again after the second round", state2_ok),
+                  ("re-running the same tick posts no duplicate plan comment", k2_ok)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(bool(ok))
+
+# --- fix 2: plan approval keywords match whole words, not substrings -------
+print("\nplan approval keyword word-boundaries (fix 2)")
+
+def _approval_case(name, reply_text, expect_state):
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config.load("config.example.yaml")
+        cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                                  log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+        src = cfg.sources(only=["mycorp"])[0]
+        task = mk("T83", "Add CSV export", "button downloads a CSV")
+        prov = FakeProvider([task])
+        store = Store(f"{tmp}/s.db")
+        agent = FakeAgent(
+            {"decision": "execute", "confidence": 0.9, "scope": "m",
+             "plan": ["a", "b"], "acceptance_criteria": ["csv downloads"]},
+            work_replies=[json.dumps({"verdict": "ready", "plan": ["a", "b"],
+                                      "acceptance_criteria": ["csv downloads"]})])
+        pipe = Pipeline(cfg, src, prov, agent, store)
+        when = dt.datetime(2026, 8, 10, 7, 0)
+
+        _checkout = Path(tmp) / "checkout"
+        _checkout.mkdir()
+        _real_ew = vcs.ensure_worktree
+        vcs.ensure_worktree = lambda *a, **k: _checkout
+        try:
+            pipe.tick(when)  # triage -> planning
+            pipe.tick(when)  # planning -> plan-review
+            prov.human_reply("T83", reply_text)
+            pipe.tick(when)  # human reply processed
+        finally:
+            vcs.ensure_worktree = _real_ew
+
+        got = store.get("mycorp:T83")["state"]
+        ok = got == expect_state.value
+        print(f"  {'PASS' if ok else 'FAIL':<5} {name:<58} -> {got}")
+        results.append(ok)
+
+_approval_case("'approved, go ahead now' approves ('no' inside 'now' must not block it)",
+               "approved, go ahead now", AIState.QUEUED)
+# A rejection sends the row to `new`, but 7am Monday is also inside the
+# triage window, so the same tick immediately re-triages it back into
+# planning (scope m still gates on approval) -- planning, not new, is what
+# a rejection actually looks like from outside a single tick.
+_approval_case("'no, hold off' is still a rejection", "no, hold off", AIState.PLANNING)
+
+# --- fix 3: review worktree is removed on reject and cycle exhaustion ------
+print("\nreview worktree cleanup on reject and cycle exhaustion (fix 3)")
+
+def _review_worktree_cleanup_case(name, verdicts, cycles, task_id):
+    tmp = tempfile.mkdtemp()
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b", mode="execute")
+    cfg.data["runner"]["limits"]["max_review_cycles"] = cycles
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk(task_id, "Fix footer typo", "'Copyrigth' -> 'Copyright'")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+
+    replies = []
+    for v in verdicts:
+        replies.append("implemented it")
+        replies.append(json.dumps(v))
+    agent = FakeAgent({"decision": "execute", "confidence": 0.95, "scope": "xs",
+                       "plan": ["fix typo"],
+                       "acceptance_criteria": ["footer reads Copyright"]},
+                      work_replies=replies)
+    pipe = Pipeline(cfg, src, prov, agent, store)
+
+    real = {n: getattr(vcs, n) for n in
+            ("ensure_worktree", "ensure_review_worktree", "commit_all", "push",
+             "create_pr", "diff_stat", "remove_worktree")}
+    removed = []
+    vcs.ensure_worktree = lambda *a, **k: Path(tmp)
+    vcs.ensure_review_worktree = lambda *a, **k: Path(tmp)
+    vcs.commit_all = lambda *a, **k: True
+    vcs.push = lambda *a, **k: None
+    vcs.diff_stat = lambda *a, **k: "1 file changed"
+    vcs.create_pr = lambda *a, **k: (7, "http://pr/7")
+    vcs.remove_worktree = lambda *a, **k: removed.append(1)
+    try:
+        when = dt.datetime(2026, 8, 10, 7, 0)
+        for _ in range(10):
+            pipe.tick(when)
+    finally:
+        for n, f in real.items():
+            setattr(vcs, n, f)
+
+    ok = len(removed) >= 1
+    print(f"  {'PASS' if ok else 'FAIL':<5} {name}")
+    results.append(ok)
+
+_review_worktree_cleanup_case("reject removes the review worktree", [_reject_v], 2, "T84")
+_review_worktree_cleanup_case("cycle exhaustion removes the review worktree",
+                              [_changes_v, _changes_v], 1, "T85")
+_review_worktree_cleanup_case("approve still removes the review worktree",
+                              [_approve_v], 2, "T86")
+
+# --- fix 4: planning worktree is removed on plan rejection ------------------
+print("\nplanning worktree cleanup on plan rejection (fix 4)")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T87", "Add CSV export", "button downloads a CSV")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = FakeAgent(
+        {"decision": "execute", "confidence": 0.9, "scope": "m",
+         "plan": ["a", "b"], "acceptance_criteria": ["csv downloads"]},
+        work_replies=[json.dumps({"verdict": "ready", "plan": ["a", "b"],
+                                  "acceptance_criteria": ["csv downloads"]})])
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ew = vcs.ensure_worktree
+    _real_rm = vcs.remove_worktree
+    removed = []
+    vcs.ensure_worktree = lambda *a, **k: _checkout
+    vcs.remove_worktree = lambda *a, **k: removed.append(1)
+    try:
+        pipe.tick(when)  # triage -> planning
+        pipe.tick(when)  # planning -> plan-review (worktree created)
+        prov.human_reply("T87", "no thanks, needs a different approach")
+        pipe.tick(when)  # rejection processed
+    finally:
+        vcs.ensure_worktree = _real_ew
+        vcs.remove_worktree = _real_rm
+
+    h1 = len(removed) == 1
+    # The row passes through `new` on its way back into planning: 7am
+    # Monday is also inside the triage window, so the very same tick that
+    # processes the rejection re-triages it straight back into planning.
+    h2 = store.get("mycorp:T87")["state"] == AIState.PLANNING.value
+
+for label, ok in [("rejecting a plan removes its worktree", h1),
+                  ("the row re-triages back into planning afterward", h2)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- fix 5: doctor validates ClickUp state_field_options coverage ----------
+print("\ndoctor: clickup state_field_options coverage (fix 5)")
+from runner.cli import _clickup_state_gaps
+
+_cfg_full = Config.load("config.example.yaml")
+d1 = _clickup_state_gaps(_cfg_full) == []
+
+_cfg_missing = Config.load("config.example.yaml")
+del _cfg_missing.data["sources"][0]["provider"]["state_field_options"]["planning"]
+_gaps = _clickup_state_gaps(_cfg_missing)
+d2 = any("planning" in g and "mycorp" in g for g in _gaps)
+
+_cfg_tag = Config.load("config.example.yaml")
+_cfg_tag.data["sources"][0]["provider"]["state_backend"] = "tag"
+del _cfg_tag.data["sources"][0]["provider"]["state_field_options"]
+d3 = _clickup_state_gaps(_cfg_tag) == []
+
+for label, ok in [("a fully-mapped clickup source reports no gaps", d1),
+                  ("a missing state option is reported by state and source", d2),
+                  ("the tag backend is exempt from the check", d3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- fix 6: lease acquired before marker/attempts are mutated --------------
+print("\nlease-before-mutation ordering (fix 6)")
+
+def _lease_race_case(name, state, marker_key):
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config.load("config.example.yaml")
+        cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                                  log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+        src = cfg.sources(only=["mycorp"])[0]
+        task = mk("T88", "Race test", "x")
+        prov = FakeProvider([task])
+        store = Store(f"{tmp}/s.db")
+        pipe = Pipeline(cfg, src, prov, FakeAgent({}), store)
+
+        store.upsert("mycorp:T88", source="mycorp", provider_task_id="T88",
+                     task_key="T88", repo_key="pulse-backend", branch="ai/t88",
+                     state=state.value, attempts=0, meta={marker_key: True})
+        # Simulate a concurrent runner holding the lease right now, while the
+        # snapshot `_advance` was handed (read moments earlier by tick()'s
+        # `in_flight()` query) still shows it expired -- exactly the race
+        # fix 6 protects against.
+        store.conn.execute(
+            "UPDATE tasks SET lease_owner='other-runner', lease_until=? WHERE task_id=?",
+            (int(time.time()) + 600, "mycorp:T88"))
+        store.conn.commit()
+
+        stale_row = dict(store.get("mycorp:T88"))
+        stale_row["lease_until"] = 0
+        stale_row["lease_owner"] = None
+
+        when = dt.datetime(2026, 8, 10, 7, 0)
+        pipe._advance(stale_row, when, cfg.get("runner.windows", {}))
+
+        after = store.get("mycorp:T88")
+        meta_untouched = json.loads(after["meta"] or "{}").get(marker_key) is True
+        attempts_untouched = int(after["attempts"]) == 0
+        lease_still_others = after["lease_owner"] == "other-runner"
+        ok = meta_untouched and attempts_untouched and lease_still_others
+        print(f"  {'PASS' if ok else 'FAIL':<5} {name}")
+        results.append(ok)
+
+_lease_race_case("planning: losing the lease race leaves plan_pending untouched",
+                 AIState.PLANNING, "plan_pending")
+_lease_race_case("review: losing the lease race leaves review_pending untouched",
+                 AIState.REVIEW, "review_pending")
+
+# --- fix 7: attempts resets at each successful station hand-off ------------
+print("\nattempts resets at station boundaries (fix 7)")
+
+class _FlakyAgent:
+    """reason() triages fine; work() crashes `crashes` times, then succeeds."""
+    def __init__(self, decision, crashes, ready_reply):
+        self.decision, self.crashes, self.ready_reply = decision, crashes, ready_reply
+        self.calls = 0
+    def reason(self, prompt, *, max_turns=1):
+        return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(self.decision))
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        self.calls += 1
+        if self.calls <= self.crashes:
+            raise RuntimeError("analyst crashed")
+        return AgentResult(ok=True, text=self.ready_reply, cost_usd=0.2)
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T89", "Add CSV export to reports", "button downloads a CSV")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    ready = json.dumps({"verdict": "ready", "plan": ["a"],
+                        "acceptance_criteria": ["csv downloads"]})
+    agent = _FlakyAgent({"decision": "execute", "confidence": 0.9, "scope": "m",
+                         "plan": ["a"], "acceptance_criteria": ["csv downloads"]},
+                        crashes=2, ready_reply=ready)
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ew = vcs.ensure_worktree
+    vcs.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage -> planning
+        pipe.tick(when)   # planning attempt (fresh entry): crash #1
+        pipe.tick(when)   # planning attempt (retry): crash #2, attempts -> 1... then 2
+        pipe.tick(when)   # planning attempt: analyst succeeds this time
+    finally:
+        vcs.ensure_worktree = _real_ew
+
+    row = store.get("mycorp:T89")
+    e1 = row["state"] == AIState.AWAITING_PLAN_OK.value
+    e2 = int(row["attempts"]) == 0
+
+for label, ok in [("planning recovers from crashes and reaches plan-review", e1),
+                  ("attempts resets to 0 once the analyst succeeds", e2)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b", mode="execute")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T60b", "Fix footer typo", "x")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = FakeAgent({"decision": "execute", "confidence": 0.95, "scope": "xs",
+                       "plan": ["fix typo"], "acceptance_criteria": ["footer reads Copyright"]},
+                      work_replies=["implemented it"])
+    pipe = Pipeline(cfg, src, prov, agent, store)
+
+    store.upsert("mycorp:T60b", source="mycorp", provider_task_id="T60b",
+                 task_key="T60b", repo_key="pulse-backend", branch="ai/t60b",
+                 state=AIState.QUEUED.value, attempts=2,   # simulated crashes from a prior station
+                 meta={"plan": ["fix typo"], "acceptance_criteria": ["footer reads Copyright"]})
+
+    real = {n: getattr(vcs, n) for n in ("ensure_worktree", "commit_all", "push")}
+    vcs.ensure_worktree = lambda *a, **k: Path(tmp)
+    vcs.commit_all = lambda *a, **k: True
+    vcs.push = lambda *a, **k: None
+    try:
+        pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    finally:
+        for n, f in real.items():
+            setattr(vcs, n, f)
+
+    after = store.get("mycorp:T60b")
+    f1 = after["state"] == AIState.REVIEW.value
+    f2 = int(after["attempts"]) == 0
+
+for label, ok in [("execute completing successfully moves to review", f1),
+                  ("attempts resets to 0 when the implementer station hands off", f2)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b", mode="execute")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T61b", "Fix footer typo", "x")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = FakeAgent({}, work_replies=[json.dumps(_changes_v)])
+    pipe = Pipeline(cfg, src, prov, agent, store)
+
+    store.upsert("mycorp:T61b", source="mycorp", provider_task_id="T61b",
+                 task_key="T61b", repo_key="pulse-backend", branch="ai/t61b",
+                 state=AIState.REVIEW.value, attempts=2,   # simulated crashes from a prior station
+                 meta={"review_pending": True, "review_cycle": 0,
+                      "acceptance_criteria": ["footer reads Copyright"]})
+
+    real_rw = vcs.ensure_review_worktree
+    real_rm = vcs.remove_worktree
+    vcs.ensure_review_worktree = lambda *a, **k: Path(tmp)
+    vcs.remove_worktree = lambda *a, **k: None
+    try:
+        pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    finally:
+        vcs.ensure_review_worktree = real_rw
+        vcs.remove_worktree = real_rm
+
+    after = store.get("mycorp:T61b")
+    after_meta = json.loads(after["meta"] or "{}")
+    g1 = after["state"] == AIState.QUEUED.value
+    g2 = int(after["attempts"]) == 0
+    g3 = after_meta.get("review_cycle") == 0 and after_meta.get("revision", {}).get("cycle") == 1
+
+for label, ok in [("request_changes hands the ticket back to queued", g1),
+                  ("attempts resets to 0 when the review station hands off", g2),
+                  ("meta.review_cycle stays a separate, untouched counter", g3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- fix 8: the daily budget is re-checked before each agent run in a tick -
+print("\ndaily budget re-checked before each agent run in the same tick (fix 8)")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    cfg.data["runner"]["limits"]["daily_budget_usd"] = 0.3
+    src = cfg.sources(only=["mycorp"])[0]
+    t1 = mk("T90", "Add CSV export to reports", "button downloads a CSV")
+    t2 = mk("T91", "Add JSON export to reports", "button downloads a JSON")
+    prov = FakeProvider([t1, t2])
+    store = Store(f"{tmp}/s.db")
+    agent = FakeAgent({"decision": "execute", "confidence": 0.9, "scope": "m",
+                       "plan": ["a"], "acceptance_criteria": ["export downloads"]},
+                      work_replies=[json.dumps({"verdict": "ready", "plan": ["a"],
+                                                "acceptance_criteria": ["export downloads"]})] * 2)
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ew = vcs.ensure_worktree
+    vcs.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage: both -> planning (cheap reason() calls only)
+        pipe.tick(when)   # planning: only as much analyst work as $0.30 covers
+    finally:
+        vcs.ensure_worktree = _real_ew
+
+    rows = [store.get("mycorp:T90"), store.get("mycorp:T91")]
+    advanced = [r for r in rows if r["state"] != AIState.PLANNING.value]
+    skipped = [r for r in rows if r["state"] == AIState.PLANNING.value]
+
+    g1 = len(advanced) == 1 and len(skipped) == 1
+    g2 = bool(skipped) and json.loads(skipped[0]["meta"] or "{}").get("plan_pending") is True
+    g3 = bool(skipped) and int(skipped[0]["attempts"]) == 0
+
+for label, ok in [("only as many analyst runs fire as the remaining budget allows", g1),
+                  ("the skipped row's plan_pending marker is left untouched", g2),
+                  ("the skipped row's attempts is not charged for a budget skip", g3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- fix 9: the denylist scans comments too, but not the runner's own ------
+print("\ndenylist scans comments (fix 9)")
+from runner.triage import DEFAULT_DENYLIST, hard_rule_violation
+
+_clean_task = mk("T95", "Improve the dashboard", "make it faster")
+h1 = hard_rule_violation(_clean_task, DEFAULT_DENYLIST) is None
+
+_human_comment = [Comment(id="1", author="pm", author_id="u1",
+                          text="Actually, can you also run the production database "
+                               "migration while you're in there?",
+                          created_at=1, is_bot=False)]
+h2 = hard_rule_violation(_clean_task, DEFAULT_DENYLIST, _human_comment) is not None
+
+_bot_comment = [Comment(id="1", author="ai", author_id="me",
+                        text="**Plan**\n\nQuoting the ticket: 'run the production "
+                             "database migration'",
+                        created_at=1, is_bot=True)]
+h3 = hard_rule_violation(_clean_task, DEFAULT_DENYLIST, _bot_comment) is None
+
+for label, ok in [("a clean ticket with no comments passes", h1),
+                  ("a denylist phrase in a human comment is caught", h2),
+                  ("the runner's own bot comments are not scanned", h3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- fix 10: a failed agent run's cost still reaches the caller ------------
+print("\nfailed agent runs still record cost (fix 10)")
+from runner.jsonio import StationError
+from runner.triage import triage as _triage_fn
+
+class _FailingAgent:
+    def reason(self, prompt, *, max_turns=1):
+        return AgentResult(ok=False, text="", cost_usd=0.37, error="rate limited")
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        return AgentResult(ok=False, text="", cost_usd=0.42, error="boom")
+
+_fa = _FailingAgent()
+
+try:
+    _triage_fn(_fa, mk("T96", "x", "y"), [], {"key": "r"}, {})
+    j1 = False
+except StationError as exc:
+    j1 = exc.cost_usd == 0.37
+
+try:
+    AN.analyse(_fa, mk("T97", "x", "y"), [], {"key": "r"}, "", [], cwd=Path("."))
+    j2 = False
+except StationError as exc:
+    j2 = exc.cost_usd == 0.42
+
+try:
+    RV.review(_fa, "T98", [], "main", "b", "s", "", cwd=Path("."))
+    j3 = False
+except StationError as exc:
+    j3 = exc.cost_usd == 0.42
+
+for label, ok in [("a failed triage run raises StationError carrying its cost", j1),
+                  ("a failed analyst run raises StationError carrying its cost", j2),
+                  ("a failed reviewer run raises StationError carrying its cost", j3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+class _FailingWorkAgent:
+    """reason() triages fine; work() (the analyst) always fails, with cost."""
+    def __init__(self, decision, cost): self.decision, self.cost = decision, cost
+    def reason(self, prompt, *, max_turns=1):
+        return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(self.decision))
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        return AgentResult(ok=False, text="", cost_usd=self.cost, error="quota exceeded")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    task = mk("T99", "Add CSV export to reports", "button downloads a CSV")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    agent = _FailingWorkAgent({"decision": "execute", "confidence": 0.9, "scope": "m",
+                               "plan": ["a"], "acceptance_criteria": ["csv downloads"]},
+                              cost=0.66)
+    pipe = Pipeline(cfg, src, prov, agent, store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+
+    _checkout = Path(tmp) / "checkout"
+    _checkout.mkdir()
+    _real_ew = vcs.ensure_worktree
+    vcs.ensure_worktree = lambda *a, **k: _checkout
+    try:
+        pipe.tick(when)   # triage -> planning
+        pipe.tick(when)   # planning: analyst run fails (ok=False)
+    finally:
+        vcs.ensure_worktree = _real_ew
+
+    j4 = store.spend_since(0) >= 0.66   # the failed run's cost reached the total
+    row = store.get("mycorp:T99")
+    j5 = row["state"] == AIState.PLANNING.value   # crash-recovery still owns the retry path
+    j6 = bool(row.get("last_error"))
+
+for label, ok in [("a failed analyst run's cost reaches the daily spend total", j4),
+                  ("the existing crash-recovery path still owns escalation", j5),
+                  ("the failure is still recorded as last_error on the row", j6)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
