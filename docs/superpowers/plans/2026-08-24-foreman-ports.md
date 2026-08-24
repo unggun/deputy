@@ -1146,7 +1146,7 @@ _rc2 = _ScriptedAgent([json.dumps({"verdict": "request_changes",
                                    "blocking_findings": ["no test for the empty case"],
                                    "summary": "close"})])
 _rr2, _ = RV.review(_rc2, "T31", [], "main", "b", "s", "", cwd=Path("."))
-v9 = _rr2.verdict == "request_changes" and _rr2.blocking_findings
+v9 = _rr2.verdict == "request_changes" and bool(_rr2.blocking_findings)
 
 # A request_changes with no findings is unactionable; treat it as approve.
 _rc3 = _ScriptedAgent([json.dumps({"verdict": "request_changes",
