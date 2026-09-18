@@ -148,6 +148,51 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cycle time is not clamped to the reporting window",
           cycles.get("acme:1#api", 0) > 35 * 86400)
 
+# --- overview: dashboard vs. pipeline agreement -----------------------------
+# `Reader.overview()`'s default for an unset `daily_budget_usd` must match
+# `Pipeline._limits_exceeded`'s -- a dashboard that reported $0 while the
+# pipeline was actually enforcing $20 would disagree with the gate it exists
+# to report on. Exercised against the real `Pipeline._limits_exceeded`
+# (duck-typed `self`, since building a full `Pipeline` needs a provider and
+# an agent) rather than a literal `20` copied into the test, so a future
+# change to the pipeline's default fails this test instead of silently
+# diverging from the dashboard.
+from runner.pipeline import Pipeline
+
+
+class _FakeStore:
+    def __init__(self, spend: float = 0.0) -> None:
+        self._spend = spend
+
+    def spend_since(self, epoch: int) -> float:
+        return self._spend
+
+    def tokens_since(self, epoch: int) -> int:
+        return 0
+
+
+class _FakeSelf:
+    def __init__(self, limits: dict) -> None:
+        self.limits = limits
+        self.store = _FakeStore()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    rdr = Reader(path, limits={})
+    reported_budget = rdr.overview(dt.datetime.now())["daily_budget_usd"]
+
+    fake = _FakeSelf({})
+    fake.store = _FakeStore(spend=reported_budget - 0.01)
+    under = Pipeline._limits_exceeded(fake, dt.datetime.now())
+    fake.store = _FakeStore(spend=reported_budget + 0.01)
+    over = Pipeline._limits_exceeded(fake, dt.datetime.now())
+
+    check("dashboard's default daily_budget_usd matches what the pipeline "
+          "actually enforces",
+          under is None and over is not None
+          and "daily budget exhausted" in over)
+
 # --- agent log discovery and tail ------------------------------------------
 import json as _json
 from runner.web import logs as weblogs

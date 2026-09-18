@@ -241,7 +241,11 @@ class Reader:
             "active": sum(counts.get(s, 0) for s in _ACTIVE),
             "max_active_tasks": int(self.limits.get("max_active_tasks", 3) or 3),
             "today": {"cost_usd": float(spent["c"]), "tokens": int(spent["t"])},
-            "daily_budget_usd": float(self.limits.get("daily_budget_usd", 0) or 0),
+            # 20 matches pipeline._limits_exceeded's own default, deliberately
+            # -- with the key unset in config, the pipeline still enforces a
+            # $20 cap, and a dashboard that showed $0 here would disagree with
+            # the gate it exists to report on.
+            "daily_budget_usd": float(self.limits.get("daily_budget_usd", 20) or 0),
             "daily_tokens": int(self.limits.get("daily_tokens", 0) or 0),
             "stuck": len(self.stuck(int(now.timestamp()))),
             "last_event_ts": int(last["ts"]),

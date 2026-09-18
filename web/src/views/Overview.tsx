@@ -19,8 +19,10 @@ export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
   const o = ov.data;
   const stuck = tasks.data?.stuck ?? [];
 
-  // A runner that has not ticked during an open window is the failure this
-  // dashboard exists to catch, and nothing else on the page would show it.
+  // This is time since the last *recorded event*, not a heartbeat -- an idle
+  // tick that finds no work records nothing, so a healthy-but-idle runner and
+  // a dead one look identical past the threshold. The tile is labelled and
+  // worded to match what it actually measures.
   const silent = Math.floor(Date.now() / 1000) - o.last_event_ts > 3600;
 
   return (
@@ -35,10 +37,10 @@ export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
                   sub={o.daily_tokens ? `cap ${o.daily_tokens.toLocaleString()}` : "no cap set"}
                   tone={o.daily_tokens && o.today.tokens >= o.daily_tokens ? STATUS.critical : undefined} />
         <StatTile label="Spend today" value={`$${o.today.cost_usd.toFixed(2)}`}
-                  sub={`budget $${o.daily_budget_usd.toFixed(2)}`}
-                  tone={o.today.cost_usd >= o.daily_budget_usd ? STATUS.critical : undefined} />
-        <StatTile label="Last tick" value={ago(o.last_event_ts)}
-                  sub={`${o.runner_id} · ${o.mode}`}
+                  sub={o.daily_budget_usd ? `budget $${o.daily_budget_usd.toFixed(2)}` : "no budget set"}
+                  tone={o.daily_budget_usd && o.today.cost_usd >= o.daily_budget_usd ? STATUS.critical : undefined} />
+        <StatTile label="Last activity" value={ago(o.last_event_ts)}
+                  sub={silent ? "stale — no activity in over 1h" : `${o.runner_id} · ${o.mode}`}
                   tone={silent ? STATUS.warning : undefined} />
       </div>
 
