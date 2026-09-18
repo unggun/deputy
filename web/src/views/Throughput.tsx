@@ -13,7 +13,15 @@ function histogram(seconds: number[]): { band: string; n: number }[] {
   ] as const;
   return bands.map(([band, cap], i) => {
     const floor = i === 0 ? 0 : (bands[i - 1][1] as number);
-    return { band, n: seconds.filter((s) => s > floor && s <= cap).length };
+    // The first band's lower bound is inclusive of 0: a row whose first
+    // recorded event *is* its transition to done has a cycle time of
+    // exactly 0 seconds, and `s > 0` would silently drop it from every
+    // band -- a row this chart's whole job is to count, vanishing with no
+    // sign it was excluded.
+    return {
+      band,
+      n: seconds.filter((s) => (i === 0 ? s >= floor : s > floor) && s <= cap).length,
+    };
   });
 }
 
@@ -27,8 +35,14 @@ export function Throughput() {
 
   const cycles: Record<number, number> = {};
   for (const r of data.review_cycles) cycles[r.cycles] = (cycles[r.cycles] ?? 0) + 1;
+  // Object.entries() on integer-like keys already enumerates in ascending
+  // numeric order. A string sort here would put "10x" before "2x" --
+  // lexicographic, not numeric -- so this sorts by the numeric cycle count
+  // instead of leaving that in, even though it duplicates what the
+  // enumeration order already gives for free.
   const cycleRows = Object.entries(cycles)
-    .map(([k, n]) => ({ cycles: `${k}x`, n })).sort((a, b) => a.cycles.localeCompare(b.cycles));
+    .map(([k, n]) => ({ cycles: `${k}x`, n }))
+    .sort((a, b) => Number(a.cycles.slice(0, -1)) - Number(b.cycles.slice(0, -1)));
 
   return (
     <div className="space-y-4 pt-4">
@@ -43,7 +57,7 @@ export function Throughput() {
             <XAxis dataKey="day" {...axis} />
             <YAxis {...axis} width={40} allowDecimals={false} />
             <Tooltip cursor={{ fill: "transparent" }} />
-            <Legend iconType="square" />
+            <Legend iconType="square" labelStyle={{ color: MUTED }} />
             <Bar dataKey="pr_open" name="pr-open" fill={STATUS.serious}
                  stroke={SURFACE[m]} strokeWidth={2}
                  radius={[4, 4, 0, 0]} />

@@ -18,16 +18,25 @@ export function ChartFrame({ title, columns, rows, children }: {
   children: ReactNode;
 }) {
   const [asTable, setAsTable] = useState(false);
+  const empty = rows.length === 0;
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between pb-2">
         <CardTitle className="text-base">{title}</CardTitle>
-        <Button variant="ghost" size="sm" onClick={() => setAsTable((v) => !v)}>
-          {asTable ? "chart" : "table"}
-        </Button>
+        {!empty && (
+          <Button variant="ghost" size="sm" onClick={() => setAsTable((v) => !v)}>
+            {asTable ? "chart" : "table"}
+          </Button>
+        )}
       </CardHeader>
       <CardContent>
-        {asTable ? (
+        {empty ? (
+          // A blank chart box is indistinguishable from a failed fetch --
+          // this dashboard exists to remove exactly that kind of ambiguity.
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            no data in this window
+          </p>
+        ) : asTable ? (
           <Table>
             <TableHeader><TableRow>
               {columns.map((c) => <TableHead key={c}>{c}</TableHead>)}

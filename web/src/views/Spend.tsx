@@ -5,6 +5,11 @@ import { ChartFrame } from "@/components/ChartFrame";
 import { GRID, MUTED, SERIES, STATIONS, SURFACE } from "@/lib/palette";
 import { useColorMode } from "@/lib/useColorMode";
 
+// Round once, here, so the stacked bar, its hover tooltip and the table view
+// all show the same cents -- not a rounded table cell next to a raw-float
+// tooltip.
+const round2 = (v: number) => Math.round(v * 100) / 100;
+
 export function Spend() {
   const { data } = useSpend(30);
   const m = useColorMode();
@@ -17,7 +22,7 @@ export function Spend() {
     const out: any = { day: d.day.slice(5) };
     for (const s of STATIONS) {
       out[`${s}_tok`] = d.kinds?.[s]?.tokens ?? 0;
-      out[`${s}_usd`] = d.kinds?.[s]?.cost_usd ?? 0;
+      out[`${s}_usd`] = round2(d.kinds?.[s]?.cost_usd ?? 0);
     }
     return out;
   });
@@ -46,7 +51,7 @@ export function Spend() {
             <XAxis dataKey="day" {...axis} />
             <YAxis {...axis} width={56} />
             <Tooltip cursor={{ fill: "transparent" }} />
-            <Legend iconType="square" />
+            <Legend iconType="square" labelStyle={{ color: MUTED }} />
             {bars("tok")}
           </BarChart>
         </ResponsiveContainer>
@@ -61,7 +66,7 @@ export function Spend() {
             <XAxis dataKey="day" {...axis} />
             <YAxis {...axis} width={56} />
             <Tooltip cursor={{ fill: "transparent" }} />
-            <Legend iconType="square" />
+            <Legend iconType="square" labelStyle={{ color: MUTED }} />
             {bars("usd")}
           </BarChart>
         </ResponsiveContainer>
