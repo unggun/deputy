@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from ..models import AIState
 from ..redact import redact
@@ -179,19 +179,34 @@ class Reader:
         return list(by_day.values())
 
     def cycle_times(self, days: int = 30) -> list[dict[str, Any]]:
-        """Seconds from a row's first recorded event to its transition to done."""
-        first: dict[str, int] = {}
-        done: dict[str, int] = {}
-        for r in self.conn.execute(
-                "SELECT ts, task_id, kind, detail FROM events"
-                " WHERE ts >= ? ORDER BY ts ASC", (self._since(days),)):
-            tid = r["task_id"]
-            if not tid:
-                continue
-            first.setdefault(tid, int(r["ts"]))
-            if (r["kind"] == "state"
-                    and str(r["detail"] or "").endswith(f"->{AIState.DONE.value}")):
-                done[tid] = int(r["ts"])
+        """Seconds from a row's true first event to its transition to done.
+
+        Two queries, deliberately: the `done` transition has to be found
+        inside the reporting window (that's what "which rows completed in
+        the last N days" means), but the row's *first* event can be far
+        outside it -- a ticket blocked for weeks before finishing is not
+        "born" on whatever day happens to be the window edge. Bounding the
+        first-event scan by the same `ts >= since` as the done scan would
+        silently understate the cycle time for exactly the rows this metric
+        exists to catch, with nothing in the output to show the true start
+        was excluded. So the unbounded MIN(ts) scan is restricted instead by
+        task_id, to only the rows that actually completed in the window.
+        """
+        done_rows = self.conn.execute(
+            "SELECT task_id, MAX(ts) done_ts FROM events"
+            " WHERE kind = 'state' AND detail LIKE ? AND ts >= ?"
+            " AND task_id IS NOT NULL GROUP BY task_id",
+            (f"%->{AIState.DONE.value}", self._since(days))).fetchall()
+        if not done_rows:
+            return []
+        done = {r["task_id"]: int(r["done_ts"]) for r in done_rows}
+        task_ids = list(done)
+        placeholders = ",".join("?" * len(task_ids))
+        first_rows = self.conn.execute(
+            f"SELECT task_id, MIN(ts) first_ts FROM events"
+            f" WHERE task_id IN ({placeholders}) GROUP BY task_id",
+            task_ids).fetchall()
+        first = {r["task_id"]: int(r["first_ts"]) for r in first_rows}
         return [{"task_id": tid, "seconds": done[tid] - first[tid]}
                 for tid in sorted(done) if tid in first]
 

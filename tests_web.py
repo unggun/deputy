@@ -124,5 +124,29 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cycle time measured from first event to done",
           len(cycles) == 1 and cycles[0]["seconds"] == 180)
 
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    # First event is well outside the 30-day reporting window; only the
+    # ->done transition falls inside it. A window-bounded first-event scan
+    # would understate this to (done_ts - window_start) instead of the true
+    # (done_ts - old_first_ts).
+    old_first = dt.datetime.now() - dt.timedelta(days=40)
+    recent_done = dt.datetime.now() - dt.timedelta(days=3)
+    old_first_ts = int(old_first.timestamp())
+    done_ts = int(recent_done.timestamp())
+    st.conn.execute(
+        "INSERT INTO events (ts, task_id, kind, detail) VALUES (?,?,?,?)",
+        (old_first_ts, "acme:1#api", "triage", "ok"))
+    st.conn.execute(
+        "INSERT INTO events (ts, task_id, kind, detail) VALUES (?,?,?,?)",
+        (done_ts, "acme:1#api", "state", "in-progress->done"))
+    st.conn.commit()
+    rdr = Reader(path, limits={})
+    cycles = {c["task_id"]: c["seconds"] for c in rdr.cycle_times(30)}
+    check("cycle time uses the row's true first event, not the window edge",
+          cycles.get("acme:1#api") == done_ts - old_first_ts)
+    check("cycle time is not clamped to the reporting window",
+          cycles.get("acme:1#api", 0) > 35 * 86400)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
