@@ -212,6 +212,7 @@ class ReviewResult:
     summary: str = ""
     brain_notes: list[str] = field(default_factory=list)
 
+
 def agent_log_name(task_key: str, repo_key: str, station: str) -> str:
     """Filename for one station's JSONL run log.
 

@@ -2500,11 +2500,37 @@ _c_checks.append(("two repos of one ticket get different log names",
 
 import inspect as _inspect
 _src = _inspect.getsource(Pipeline)
+_c_checks.append(("all four log paths go through agent_log_name",
+                  _src.count("agent_log_name(") == 4))
 _c_checks.append(("pipeline builds log paths through agent_log_name",
                   "agent_log_name(" in _src
                   and "-implement.log" not in _src
                   and "-plan.log" not in _src
-                  and "-review.log" not in _src))
+                  and "-review.log" not in _src
+                  and "-fix-" not in _src))
+
+# --- the collision is actually fixed ------------------------------------------
+# The old bug: two rows of a cross-repo ticket would both hit one log_path
+# path, because it depended on task.key alone. _EventLog opens with "w", so
+# the second row's run truncated the first's. Verify both repos' logs persist.
+from runner.agents.claude_code import _EventLog
+with tempfile.TemporaryDirectory() as _tmp:
+    _path1 = Path(_tmp) / _aln("DEV-1", "api", "implement")
+    _path2 = Path(_tmp) / _aln("DEV-1", "web", "implement")
+
+    _log1 = _EventLog(_path1)
+    _log1.event("test", marker="api-run")
+    _log1.close()
+
+    _log2 = _EventLog(_path2)
+    _log2.event("test", marker="web-run")
+    _log2.close()
+
+    _c_checks.append(("both logs exist after opening each by different name",
+                      _path1.exists() and _path2.exists()))
+    _c_checks.append(("each log contains its own event",
+                      "api-run" in _path1.read_text()
+                      and "web-run" in _path2.read_text()))
 
 for label, ok in _c_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
@@ -2512,4 +2538,3 @@ for label, ok in _c_checks:
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
-
