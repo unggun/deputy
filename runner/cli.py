@@ -203,6 +203,17 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
         print(f"WARNING: binding {host} exposes ticket titles, PR URLs and "
               f"error text to anything that can reach this machine.",
               file=sys.stderr)
+
+    db = Path(str(cfg.get("runner.db_path", "~/.ai-runner/state.db"))).expanduser()
+    if not db.exists():
+        # Refuse rather than serve an empty dashboard. Zeros rendered from a
+        # missing database are indistinguishable from a runner that ran and
+        # found nothing to do, and this dashboard exists to make that kind of
+        # ambiguity impossible.
+        print(f"no state database at {db}\n"
+              f"run `ai-task-runner run` at least once first.", file=sys.stderr)
+        return 1
+
     url = f"http://{host}:{port}/"
     print(f"dashboard on {url}  (read-only; ctrl-c to stop)")
     if open_browser:

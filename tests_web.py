@@ -219,5 +219,17 @@ with tempfile.TemporaryDirectory() as tmp:
     check("oversized record's second poll is not identical to the first",
           second != first)
 
+with tempfile.TemporaryDirectory() as tmp:
+    # A missing db must fail with a sentence naming the path, not sqlite's
+    # bare "unable to open database file" -- that's what `serve` and any
+    # other caller that bypasses it are left to show an operator.
+    missing = Path(tmp) / "no-such.db"
+    try:
+        Reader(str(missing))
+        check("Reader on a missing db raises and names the path", False)
+    except FileNotFoundError as exc:
+        check("Reader on a missing db raises and names the path",
+              str(missing) in str(exc))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

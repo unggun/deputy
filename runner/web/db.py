@@ -43,8 +43,17 @@ class Reader:
         # mode=ro fails writes at the SQLite layer, so a future convenience
         # helper cannot quietly gain one. timeout covers the brief window
         # where a tick holds the write lock.
-        self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
-                                    timeout=5, check_same_thread=False)
+        try:
+            self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                        timeout=5, check_same_thread=False)
+        except sqlite3.OperationalError as exc:
+            # mode=ro refuses to create the file, so a missing db surfaces as
+            # "unable to open database file" -- true, but useless to whoever
+            # has to act on it. Name the path so the message alone is enough.
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"no state database at {path}") from exc
+            raise
         self.conn.row_factory = sqlite3.Row
         self.secrets = list(secrets)
         self.limits = limits or {}
