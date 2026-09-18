@@ -3,6 +3,8 @@ import { useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Overview } from "@/views/Overview";
 import { Board } from "@/views/Board";
+import { Spend } from "@/views/Spend";
+import { Throughput } from "@/views/Throughput";
 
 const qc = new QueryClient();
 
@@ -26,8 +28,8 @@ export default function App() {
           </TabsList>
           <TabsContent value="overview"><Overview onOpen={setOpenId} /></TabsContent>
           <TabsContent value="board"><Board onOpen={setOpenId} /></TabsContent>
-          <TabsContent value="spend">{/* Task 8 */}</TabsContent>
-          <TabsContent value="throughput">{/* Task 8 */}</TabsContent>
+          <TabsContent value="spend"><Spend /></TabsContent>
+          <TabsContent value="throughput"><Throughput /></TabsContent>
           <TabsContent value="graph">{/* Task 9 */}</TabsContent>
         </Tabs>
       </div>
