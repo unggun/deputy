@@ -193,5 +193,31 @@ with tempfile.TemporaryDirectory() as tmp:
     check("station names cannot escape the log root",
           weblogs.tail(root, "DEV-1", "api", "../../etc/passwd", 0)["missing"] is True)
 
+    # Legacy fix-N logs must be discoverable via stations(), not just
+    # readable via tail() -- pipeline.py writes fix-N stations too, and a
+    # fixed ("plan", "implement", "review") legacy scan would leave one
+    # readable but never listed for the UI to ask for.
+    (root / "DEV-2-fix-1.log").write_text(
+        _json.dumps({"seq": 1, "type": "result"}) + "\n", encoding="utf-8")
+    check("legacy fix-N logs are discoverable via stations()",
+          "fix-1" in weblogs.stations(root, "DEV-2", "api"))
+
+with tempfile.TemporaryDirectory() as tmp:
+    # A record larger than a whole read window must not livelock: the reader
+    # has to advance past it, not spin forever returning the same offset.
+    root = Path(tmp)
+    big_record = _json.dumps({"seq": 1, "type": "output",
+                               "text": "x" * 170}) + "\n"
+    (root / "DEV-3__api__implement.log").write_text(
+        big_record, encoding="utf-8")
+
+    first = weblogs.tail(root, "DEV-3", "api", "implement", 0, max_bytes=64)
+    second = weblogs.tail(root, "DEV-3", "api", "implement",
+                          first["next_offset"], max_bytes=64)
+    check("oversized record advances next_offset instead of stalling",
+          second["next_offset"] > first["next_offset"])
+    check("oversized record's second poll is not identical to the first",
+          second != first)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

@@ -40,9 +40,15 @@ def stations(log_root: Path, task_key: str, repo_key: str) -> list[str]:
         name = path.name[len(prefix):-len(".log")]
         if _STATION.match(name):
             out.append(name)
-    for station in ("plan", "implement", "review"):
-        if station not in out and (log_root / f"{task_key}-{station}.log").exists():
-            out.append(station)
+    # Legacy pre-per-repo names: glob rather than enumerate a fixed list of
+    # stations, because a row can carry a legacy `fix-N` log too (pipeline.py
+    # writes those), and a fixed ("plan", "implement", "review") loop would
+    # leave it readable via tail() but never listed here for the UI to ask for.
+    legacy_prefix = f"{task_key}-"
+    for path in sorted(log_root.glob(f"{legacy_prefix}*.log")):
+        name = path.name[len(legacy_prefix):-len(".log")]
+        if _STATION.match(name) and name not in out:
+            out.append(name)
     return out
 
 
@@ -75,6 +81,16 @@ def tail(log_root: Path, task_key: str, repo_key: str, station: str,
     # cheaper than guessing at it.
     cut = chunk.rfind(b"\n")
     if cut == -1:
+        if len(chunk) >= max_bytes:
+            # One record longer than a whole read window. Advancing past it is
+            # the only way the caller ever makes progress: stalling here means
+            # next_offset never moves and the UI polls this log forever. The
+            # writer's own _EventLog does the same thing at its size cap --
+            # tell the reader what happened, don't go quiet.
+            nxt = start + len(chunk)
+            return {"lines": [{"type": "oversized", "bytes": len(chunk)}],
+                    "next_offset": nxt, "eof": nxt >= size, "missing": False}
+        # A record the writer has not finished yet. Re-read it next poll.
         return {"lines": [], "next_offset": start, "eof": start >= size,
                 "missing": False}
     consumed = cut + 1
