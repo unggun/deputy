@@ -8,6 +8,20 @@ dependencies = ["requests>=2.31", "pyyaml>=6.0"]
 [project.scripts]
 ai-task-runner = "runner.cli:main"
 
+[project.optional-dependencies]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+
+[tool.setuptools]
+# Explicit, not flat-layout auto-discovery: the new top-level `web/` source
+# directory must not be mistaken for a package.
+packages = { find = { include = ["runner*"] } }
+
+[tool.setuptools.package-data]
+# Auto-discovery finds Python packages and carries no other files, so without
+# this the built dashboard is dropped from the wheel and `serve` 404s every
+# asset while importing cleanly.
+"runner.web" = ["static/**/*"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

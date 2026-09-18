@@ -25,3 +25,5 @@ venv/
 
 # Isolated worktrees — scratch, never committed
 .claude/worktrees/
+
+web/node_modules/

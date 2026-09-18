@@ -185,6 +185,33 @@ def _doctor(cfg: Config) -> int:
     return 0
 
 
+def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
+    """Run the read-only dashboard.
+
+    Imports are local on purpose: FastAPI is an optional extra and `run` --
+    the cron entrypoint -- must keep starting without it.
+    """
+    try:
+        import uvicorn
+        from runner.web.api import build_app
+    except ImportError:
+        print("the dashboard needs its optional dependencies:\n"
+              "    pip install -e '.[web]'", file=sys.stderr)
+        return 1
+
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"WARNING: binding {host} exposes ticket titles, PR URLs and "
+              f"error text to anything that can reach this machine.",
+              file=sys.stderr)
+    url = f"http://{host}:{port}/"
+    print(f"dashboard on {url}  (read-only; ctrl-c to stop)")
+    if open_browser:
+        import webbrowser
+        webbrowser.open(url)
+    uvicorn.run(build_app(cfg), host=host, port=port, log_level="warning")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="ai-task-runner")
     ap.add_argument("-c", "--config", default="config.yaml")
@@ -201,6 +228,10 @@ def main(argv: list[str] | None = None) -> int:
     daemon.add_argument("--dry-run", action="store_true")
     sub.add_parser("status", help="show in-flight tasks")
     sub.add_parser("graph", help="print the workflow state graph as Mermaid")
+    serve = sub.add_parser("serve", help="read-only dashboard on localhost")
+    serve.add_argument("--port", type=int, default=8787)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--no-open", action="store_true")
 
     args = ap.parse_args(argv)
 
@@ -229,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
                   f"attempts={r['attempts']} ${r['cost_usd']:.2f} "
                   f"{r['tokens'] or 0:>9,}tok {r['pr_url'] or ''}")
         return 0
+
+    if args.cmd == "serve":
+        return _serve(cfg, args.host, args.port, not args.no_open)
 
     if args.force:
         cfg.data.setdefault("runner", {})["windows"] = {
