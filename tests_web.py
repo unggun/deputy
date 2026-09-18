@@ -231,5 +231,76 @@ with tempfile.TemporaryDirectory() as tmp:
         check("Reader on a missing db raises and names the path",
               str(missing) in str(exc))
 
+# --- api.py --------------------------------------------------------------
+# Nothing above exercises HTTP at all -- that's how the SPA catch-all
+# swallowing /api/* got past review once. `fastapi` (and its TestClient)
+# only ship with the optional `web` extra, so this whole block is guarded:
+# a host without the extra must still get a clean run, not an ImportError,
+# and a skip must never silently read as a pass (it is not appended to
+# `results`).
+try:
+    from fastapi.testclient import TestClient
+except ImportError:
+    TestClient = None
+
+if TestClient is None:
+    print("\napi.py checks skipped -- fastapi (the `web` extra) is not "
+          "installed")
+else:
+    print("\ndashboard api layer")
+    from runner.config import Config
+    from runner.web import api as web_api
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        db_path = str(tmp_path / "api.db")
+        st = Store(db_path)
+        st.upsert("acme:1#api", source="acme", provider_task_id="1",
+                  task_key="DEV-1", title="healthy", state="in-progress",
+                  repo_key="api", attempts=0)
+
+        # A synthetic static/assets dir so the SPA catch-all is actually
+        # mounted (build_app only registers it when `STATIC / "assets"`
+        # exists) -- otherwise the /api/does-not-exist check below would
+        # pass for the wrong reason: no catch-all route to swallow it.
+        static_dir = tmp_path / "static"
+        (static_dir / "assets").mkdir(parents=True)
+        (static_dir / "index.html").write_text("<html></html>",
+                                               encoding="utf-8")
+
+        cfg = Config(data={"runner": {"db_path": db_path,
+                                      "log_dir": str(tmp_path / "logs"),
+                                      "limits": {}},
+                           "vcs_profiles": {}, "sources": []},
+                    source_path=tmp_path / "config.yaml")
+
+        # build_app reads the module-level STATIC constant at call time, so
+        # pointing it at our synthetic dir before calling build_app is
+        # enough -- no need to touch the real runner/web/static tree.
+        original_static = web_api.STATIC
+        web_api.STATIC = static_dir
+        try:
+            client = TestClient(web_api.build_app(cfg))
+
+            r = client.get("/api/does-not-exist")
+            check("unknown /api path 404s even with the SPA catch-all mounted",
+                  r.status_code == 404)
+
+            r = client.get("/api/task", params={"id": "acme:1#api"})
+            check("task route resolves a row id containing '#'",
+                  r.status_code == 200 and r.json().get("task_key") == "DEV-1")
+            check("task route response has no meta key",
+                  r.status_code == 200 and "meta" not in r.json())
+
+            r = client.get("/api/task", params={"id": "nope"})
+            check("task route 404s for an unknown id", r.status_code == 404)
+
+            r = client.get("/api/tasks")
+            check("tasks route responses have no meta key",
+                  r.status_code == 200
+                  and all("meta" not in t for t in r.json()["tasks"]))
+        finally:
+            web_api.STATIC = original_static
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

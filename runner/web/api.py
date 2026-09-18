@@ -167,8 +167,12 @@ def build_app(cfg: Config) -> FastAPI:
 
         @app.get("/{full_path:path}")
         def spa(full_path: str) -> FileResponse:
-            # Single-page app: every non-API path serves index.html so client
-            # routing works on a hard refresh.
+            # The catch-all exists so client routing survives a hard refresh.
+            # It must not answer for /api: an unknown endpoint has to 404, or
+            # a typo'd path returns an HTML document to a caller parsing JSON
+            # and the error surfaces far from its cause.
+            if full_path == "api" or full_path.startswith("api/"):
+                raise HTTPException(404, "no such endpoint")
             index = STATIC / "index.html"
             if not index.exists():
                 raise HTTPException(

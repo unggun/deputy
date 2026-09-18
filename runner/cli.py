@@ -192,8 +192,10 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
     the cron entrypoint -- must keep starting without it.
     """
     try:
+        import sqlite3
         import uvicorn
         from runner.web.api import build_app
+        from runner.web.db import Reader
     except ImportError:
         print("the dashboard needs its optional dependencies:\n"
               "    pip install -e '.[web]'", file=sys.stderr)
@@ -205,13 +207,25 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
               file=sys.stderr)
 
     db = Path(str(cfg.get("runner.db_path", "~/.ai-runner/state.db"))).expanduser()
-    if not db.exists():
-        # Refuse rather than serve an empty dashboard. Zeros rendered from a
-        # missing database are indistinguishable from a runner that ran and
-        # found nothing to do, and this dashboard exists to make that kind of
-        # ambiguity impossible.
+    # Refuse rather than serve an empty or broken dashboard. Zeros rendered
+    # from a missing database are indistinguishable from a runner that ran
+    # and found nothing to do -- exactly the ambiguity this dashboard exists
+    # to remove -- so this probes with an actual open-and-query rather than
+    # `db.exists()`, which is true for a directory or a corrupt file and
+    # would otherwise bind the port and then 500 on every request.
+    try:
+        probe = Reader(str(db), limits={})
+        probe.conn.execute("SELECT 1 FROM tasks LIMIT 1")
+        probe.close()
+    except FileNotFoundError:
         print(f"no state database at {db}\n"
               f"run `ai-task-runner run` at least once first.", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        # Exists but is not a usable runner database -- a directory, a
+        # corrupt file, or something else entirely.
+        print(f"{db} is not a readable ai-task-runner database: {exc}",
+              file=sys.stderr)
         return 1
 
     url = f"http://{host}:{port}/"
