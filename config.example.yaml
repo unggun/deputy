@@ -29,6 +29,15 @@ runner:
                              # max_fix_attempts, which covers crashes and CI.
     agent_timeout_minutes: 45
     daily_budget_usd: 15
+    # Tokens are the *other* daily limit, and on a claude.ai login they are the
+    # one that actually bites. `total_cost_usd` from the CLI prices the run as
+    # if it were API traffic; with a subscription that money is never billed,
+    # while the 5-hourly/weekly quota it really consumes goes unmeasured by
+    # `daily_budget_usd`. This counts input + output + cache tokens, the same
+    # units the quota is in. 0 (or omitted) disables the token gate; both
+    # limits are checked before every agent run and whichever trips first
+    # stops the tick.
+    daily_tokens: 0
     brain_max_bytes: 8000    # per-repo note file cap; at the cap appends are
                              # refused and logged, never silently evicted
 
@@ -53,6 +62,28 @@ agent:
   permission_mode: dontAsk
   timeout_minutes: 45
   max_budget_usd: 2.0
+  # Per-run cap on the JSONL event log under `runner.log_dir`. work() streams
+  # the agent's output there as it is produced, so a run that is killed still
+  # leaves evidence. At the cap the log records that it stopped rather than
+  # dropping the file or blocking the agent's pipes.
+  max_log_bytes: 33554432    # 32 MiB
+  # Ceiling on the prompt, which travels in argv. Past the kernel's limit the
+  # exec fails as a bare OSError; the runner refuses first, with a message an
+  # operator can act on, and spends nothing. Defaults to 400000 on macOS and
+  # 120000 on Linux, which caps any single argument at 128 KiB. Both leave
+  # plenty of room for a real ticket, so tripping this normally means a
+  # description or comment thread that wants trimming, not a limit that wants
+  # raising.
+  # max_prompt_bytes: 400000
+  # Triage (`reason()`) is a tool-less classification of ticket text, so it
+  # runs in this empty directory with MCP servers, skills and settings turned
+  # off. Otherwise `claude` loads the CLAUDE.md, settings and git state of
+  # whatever directory cron happened to launch the runner from, and triage
+  # answers about *that* project instead of the ticket. A fixed path, not a
+  # temp dir: the cwd is part of the system prompt, so a changing path misses
+  # the prompt cache on every call.
+  triage_dir: ~/.ai-runner/triage
+  isolate_triage: true       # false restores the pre-fix behaviour
   # `Agent` lets work() dispatch subagents. Subagent definitions come from
   # .claude/agents/*.md in the target repo, since work() runs with the
   # worktree as its cwd. Remove it to forbid subagents entirely.
@@ -187,6 +218,18 @@ sources:
       review_status: "In Review"
       done_status: "Done"
       skip_labels: ["no-ai"]
+      # Optional opt-IN gate. Omit it (the default) and every ready issue
+      # assigned to you is a candidate. Set it when a non-engineer files the
+      # tickets and a human breaks them down first: only issues carrying ALL
+      # of these labels get triaged. Applies to new tickets only -- in-flight
+      # rows are re-read by key and keep advancing.
+      # require_labels: ["ai-ready"]
+    # Two repos behind ONE Jira project. Nothing in the ticket metadata tells
+    # them apart, so triage routes: it is shown each repo's key, language and
+    # notes and returns the ones that need a change. A ticket that spans both
+    # gets one row per repo -- separate branch, PR and review -- and the Jira
+    # AI State field shows the least advanced of them. Routing is only as good
+    # as `language` and `notes`; triage never reads the repo itself.
     repos:
       - key: acme-api
         containers: ["ACME"]           # Jira project keys
@@ -195,5 +238,18 @@ sources:
         remote: git@github.com:acme-client/api.git
         base_branch: develop
         language: "Go"
+        notes: >-
+          Backend. Endpoints, business rules, persistence, background jobs.
         setup: "go mod download"
         test: "go test ./..."
+      - key: acme-web
+        containers: ["ACME"]           # same project as acme-api, on purpose
+        vcs_profile: client-acme
+        path: ~/code/acme-web
+        remote: git@github.com:acme-client/web.git
+        base_branch: develop
+        language: "React + TypeScript"
+        notes: >-
+          Frontend. Pages, components, forms, client-side state, styling.
+        setup: "npm ci"
+        test: "npm test"

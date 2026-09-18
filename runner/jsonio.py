@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any
 
+from .models import Spend
+
 _FENCE = re.compile(r"^```(?:json)?|```$", re.MULTILINE)
 
 
@@ -34,16 +36,30 @@ class StationError(RuntimeError):
     """Raised when a station's underlying agent run itself failed (`res.ok`
     is False) rather than merely returning unparseable text.
 
-    Carries the cost already spent on that run. Without this, `raise
-    RuntimeError(...)` discarded `res.cost_usd` on the way out — the caller
-    never saw it, so `store.record(...)` never ran, and a failed run's spend
-    was invisible to `daily_budget_usd` forever even though the provider had
-    already billed it.
+    Carries the spend already committed on that run. Without this, `raise
+    RuntimeError(...)` discarded it on the way out — the caller never saw it,
+    so `store.record(...)` never ran, and a failed run's spend was invisible
+    to the daily limits forever even though the quota had already been drawn
+    down.
     """
 
-    def __init__(self, message: str, cost_usd: float = 0.0) -> None:
+    def __init__(self, message: str, spend: "Spend | float | None" = None) -> None:
         super().__init__(message)
-        self.cost_usd = cost_usd
+        if spend is None:
+            spend = Spend()
+        elif isinstance(spend, (int, float)):
+            # Tolerated so a caller that only knows a dollar figure still
+            # reports it rather than dropping the spend entirely.
+            spend = Spend(cost_usd=float(spend))
+        self.spend: Spend = spend
+
+    @property
+    def cost_usd(self) -> float:
+        return self.spend.cost_usd
+
+    @property
+    def tokens(self) -> int:
+        return self.spend.tokens
 
 
 def str_list(value: Any) -> list[str]:

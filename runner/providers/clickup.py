@@ -142,6 +142,19 @@ class ClickUpProvider(TaskProvider):
                         "closed": other.status in closed})
         return out
 
+    def branch_key(self, task: Task) -> str:
+        """The task id in the form ClickUp's git integration parses.
+
+        ClickUp links a branch, commit or PR to a task by finding the task id
+        in its name, and a bare native id (`86abc1234`) is not enough — the
+        integration looks for the `CU-` prefix. A Custom Task ID (`DEV-1234`)
+        is matched verbatim instead, and is the more readable of the two, so it
+        wins when the workspace has them enabled.
+        """
+        if task.raw.get("custom_id"):
+            return task.key
+        return f"CU-{task.id}"
+
     # --- mapping ------------------------------------------------------
     def _to_task(self, t: dict[str, Any]) -> Task:
         tags = [str(x.get("name", "")).lower() for x in t.get("tags", [])]

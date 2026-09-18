@@ -12,11 +12,21 @@ from pathlib import Path
 from . import brain, graph, providers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
-from .models import AIState
+from .models import AgentResult, AIState
 from .pipeline import Pipeline
 from .state import Store
 
 BOT_MARKER_DEFAULT = "<!-- ai-runner -->"
+
+# The reply an isolated triage call gives when it can see no project at all.
+# Kept verbatim in the prompt and in CLAUDE.md's description of correct
+# isolation, so the doc and the check cannot drift apart.
+CANARY_SENTINEL = "NO PROJECT CONTEXT"
+CANARY_PROMPT = (
+    "What software project are you currently working in? Answer with the "
+    "project name and one sentence about what it does. If you have no project "
+    f"context at all, reply with exactly: {CANARY_SENTINEL}"
+)
 
 
 def _logging(cfg: Config, verbose: bool) -> None:
@@ -74,6 +84,38 @@ def _clickup_state_gaps(cfg: Config) -> list[str]:
     return problems
 
 
+def _isolation_status(isolate_triage: bool,
+                      res: AgentResult) -> tuple[str, str]:
+    """Did triage really run with no ambient project context?
+
+    `--allowedTools ""` removes the ability to act, not the ambient context,
+    and `_triage_cwd` deliberately degrades to the launch directory when the
+    triage dir cannot be created. Both leave triage reading whatever repo cron
+    happened to start in, and neither says so at the point it matters. This is
+    the check that asks.
+
+    Returns one of `ok`, `skipped`, `broken`, `unverified` plus a detail line.
+    `unverified` is deliberately distinct from `ok`: doctor is what operators
+    are told to run before trusting the runner, so a check that could not be
+    performed must never read as a pass.
+    """
+    if not isolate_triage:
+        return ("skipped",
+                "agent.isolate_triage is false, so triage inherits the launch "
+                "directory's CLAUDE.md, settings and git state")
+    if not res.ok:
+        why = "timed out" if res.timed_out else (res.error or "no reply")
+        return ("unverified", f"the canary run did not complete: {why}")
+    reply = (res.text or "").strip()
+    if not reply:
+        return ("unverified", "the canary returned an empty reply")
+    if CANARY_SENTINEL in reply:
+        return ("ok", "triage sees no project context")
+    return ("broken",
+            f"triage can see a project, so it will judge tickets against it: "
+            f"{reply[:300]}")
+
+
 def _doctor(cfg: Config) -> int:
     log = logging.getLogger("doctor")
     problems: list[str] = []
@@ -90,6 +132,16 @@ def _doctor(cfg: Config) -> int:
                             "interactively, or `claude auth login`")
         else:
             log.info("Claude Code authenticated")
+            canary = agent.reason(CANARY_PROMPT)
+            status, detail = _isolation_status(agent.isolate_triage, canary)
+            log.info("triage isolation canary: %s (%d tokens, $%.4f)",
+                     status, canary.usage.total, canary.cost_usd)
+            if status in ("broken", "unverified"):
+                problems.append(f"triage isolation {status}: {detail}")
+            elif status == "skipped":
+                log.warning("triage isolation check skipped: %s", detail)
+            else:
+                log.info("triage isolation OK — %s", detail)
     except Exception as exc:  # noqa: BLE001
         problems.append(f"agent: {exc}")
 
@@ -171,8 +223,11 @@ def main(argv: list[str] | None = None) -> int:
         if not rows:
             print("nothing in flight")
         for r in rows:
+            # Both currencies: on a subscription login the dollar figure is
+            # notional and the token count is the one `daily_tokens` gates on.
             print(f"{r['source']:<16} {r['task_key']:<12} {r['state']:<14} "
-                  f"attempts={r['attempts']} ${r['cost_usd']:.2f} {r['pr_url'] or ''}")
+                  f"attempts={r['attempts']} ${r['cost_usd']:.2f} "
+                  f"{r['tokens'] or 0:>9,}tok {r['pr_url'] or ''}")
         return 0
 
     if args.force:

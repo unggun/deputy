@@ -1,0 +1,313 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "One Tick of ai-task-runner run",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "gates",
+        "label": "Gates before any work",
+        "focus": [
+          "cron",
+          "windows",
+          "budget",
+          "idle",
+          "spent"
+        ],
+        "note": "Days, windows and daily limits are enforced in-process, not in cron."
+      },
+      {
+        "id": "advance",
+        "label": "Advance work in flight",
+        "focus": [
+          "inflight",
+          "dispatch",
+          "stations"
+        ],
+        "note": "Cheap, no-LLM bookkeeping runs before anything new is triaged."
+      },
+      {
+        "id": "intake",
+        "label": "Intake and orphans",
+        "focus": [
+          "candidates",
+          "known",
+          "do_triage",
+          "orphan"
+        ],
+        "note": "A ticket in flight with no local row belongs to another machine."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "sched",
+      "label": "Scheduler gates"
+    },
+    {
+      "id": "advance",
+      "label": "Advance in-flight rows"
+    },
+    {
+      "id": "triage",
+      "label": "Triage new tickets"
+    },
+    {
+      "id": "stop",
+      "label": "Deferred to the next tick",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "gate_phase",
+      "label": "Gate the tick",
+      "fromCol": 0,
+      "toCol": 2
+    },
+    {
+      "id": "work_phase",
+      "label": "One step per row, then exit",
+      "fromCol": 3,
+      "toCol": 5,
+      "variant": "emphasis"
+    }
+  ],
+  "groups": [
+    {
+      "id": "triage_cap",
+      "label": "capped at max_new_triage_per_run",
+      "lane": "triage",
+      "fromCol": 3,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "mainPath": [
+    "cron",
+    "windows",
+    "budget",
+    "inflight",
+    "dispatch",
+    "stations"
+  ],
+  "nodes": [
+    {
+      "id": "cron",
+      "lane": "sched",
+      "col": 0,
+      "type": "external",
+      "label": "Cron fires",
+      "sublabel": "ai-task-runner run",
+      "width": 152
+    },
+    {
+      "id": "windows",
+      "lane": "sched",
+      "col": 1,
+      "type": "security",
+      "label": "Days + window",
+      "sublabel": "advance / triage / execute",
+      "width": 152
+    },
+    {
+      "id": "budget",
+      "lane": "sched",
+      "col": 2,
+      "type": "security",
+      "label": "Daily limits",
+      "sublabel": "USD and token caps",
+      "width": 152
+    },
+    {
+      "id": "inflight",
+      "lane": "advance",
+      "col": 3,
+      "type": "database",
+      "label": "in_flight rows",
+      "sublabel": "this source only",
+      "width": 152
+    },
+    {
+      "id": "dispatch",
+      "lane": "advance",
+      "col": 4,
+      "type": "backend",
+      "label": "_advance(row)",
+      "sublabel": "branch on AI State",
+      "tag": "one step, then return",
+      "width": 152
+    },
+    {
+      "id": "stations",
+      "lane": "advance",
+      "col": 5,
+      "type": "backend",
+      "label": "Station or poll",
+      "sublabel": "plan, execute, review, PR",
+      "width": 152
+    },
+    {
+      "id": "candidates",
+      "lane": "triage",
+      "col": 3,
+      "type": "external",
+      "label": "fetch_candidates()",
+      "sublabel": "assigned and open",
+      "width": 152
+    },
+    {
+      "id": "known",
+      "lane": "triage",
+      "col": 4,
+      "type": "database",
+      "label": "Seen before?",
+      "sublabel": "rows_for_task(source, id)",
+      "width": 152
+    },
+    {
+      "id": "do_triage",
+      "lane": "triage",
+      "col": 5,
+      "type": "backend",
+      "label": "_do_triage()",
+      "sublabel": "one tool-less LLM call",
+      "width": 152
+    },
+    {
+      "id": "idle",
+      "lane": "stop",
+      "col": 1,
+      "type": "messagebus",
+      "label": "Nothing to do",
+      "sublabel": "wrong day or window",
+      "width": 152
+    },
+    {
+      "id": "spent",
+      "lane": "stop",
+      "col": 2,
+      "type": "messagebus",
+      "label": "Budget spent",
+      "sublabel": "resume after midnight",
+      "width": 152
+    },
+    {
+      "id": "orphan",
+      "lane": "stop",
+      "col": 4,
+      "type": "security",
+      "label": "Orphan",
+      "sublabel": "blocked, ask a human",
+      "width": 152
+    }
+  ],
+  "edges": [
+    {
+      "id": "cron-windows",
+      "from": "cron",
+      "to": "windows",
+      "variant": "emphasis"
+    },
+    {
+      "id": "windows-budget",
+      "from": "windows",
+      "to": "budget",
+      "label": "inside the window",
+      "variant": "emphasis"
+    },
+    {
+      "id": "windows-idle",
+      "from": "windows",
+      "to": "idle",
+      "label": "outside",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "budget-spent",
+      "from": "budget",
+      "to": "spent",
+      "label": "cap reached",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "budget-inflight",
+      "from": "budget",
+      "to": "inflight",
+      "label": "1. advance first",
+      "variant": "emphasis"
+    },
+    {
+      "id": "budget-candidates",
+      "from": "budget",
+      "to": "candidates",
+      "label": "2. then triage",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "inflight-dispatch",
+      "from": "inflight",
+      "to": "dispatch",
+      "variant": "emphasis"
+    },
+    {
+      "id": "dispatch-stations",
+      "from": "dispatch",
+      "to": "stations",
+      "label": "lease + execute window",
+      "variant": "emphasis"
+    },
+    {
+      "id": "candidates-known",
+      "from": "candidates",
+      "to": "known"
+    },
+    {
+      "id": "known-triage",
+      "from": "known",
+      "to": "do_triage",
+      "label": "never seen"
+    },
+    {
+      "id": "known-orphan",
+      "from": "known",
+      "to": "orphan",
+      "label": "in flight elsewhere",
+      "variant": "security",
+      "role": "error"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Tick and exit",
+      "items": [
+        "Every task advances by at most one step per tick",
+        "Nothing blocks on CI, on a reviewer, or on a human",
+        "A closed laptop costs one step, never a ticket"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Ordering is deliberate",
+      "items": [
+        "Cheap no-LLM bookkeeping runs before any new triage",
+        "Budget is re-checked before every single agent run",
+        "A crash on one row records last_error and the tick continues"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Kill switches",
+      "items": [
+        "runner.mode shadow triages and comments but writes no code",
+        "The per-ticket no-ai tag removes one ticket from the funnel",
+        "cli._tick_all swallows per-source errors so one workspace cannot stop the rest"
+      ]
+    }
+  ]
+}

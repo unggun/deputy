@@ -38,16 +38,31 @@ class Source:
     def provider_type(self) -> str:
         return str(self.provider.get("type", "clickup"))
 
-    def repo_for_container(self, container_id: str, container_name: str) -> dict[str, Any] | None:
-        """Match a repo by ClickUp list id / Jira project key, or by name."""
+    def repos_for_container(self, container_id: str,
+                            container_name: str) -> list[dict[str, Any]]:
+        """Every repo a ticket in this container could land in.
+
+        A ClickUp list usually maps to exactly one repo, but a Jira project
+        routinely covers a backend and a frontend. Returning all the matches
+        (rather than the first) is what lets triage pick between them, and
+        what lets one ticket fan out to several of them.
+        """
         cid, cname = str(container_id), str(container_name).lower()
+        hits = []
         for repo in self.repos:
             ids = [str(x) for x in repo.get("containers", [])]
             names = [str(x).lower() for x in repo.get("container_names", [])]
             if cid in ids or cname in names:
-                return repo
+                hits.append(repo)
         # A source with exactly one repo needs no mapping at all.
-        return self.repos[0] if len(self.repos) == 1 else None
+        if not hits and len(self.repos) == 1:
+            return list(self.repos)
+        return hits
+
+    def repo_for_container(self, container_id: str, container_name: str) -> dict[str, Any] | None:
+        """First match only. Kept for callers that genuinely want one repo."""
+        hits = self.repos_for_container(container_id, container_name)
+        return hits[0] if hits else None
 
     def repo_by_key(self, key: str) -> dict[str, Any] | None:
         return next((r for r in self.repos if r.get("key") == key), None)

@@ -16,7 +16,7 @@ from typing import Any
 
 from .agents.base import CodingAgent
 from .jsonio import StationError, parse_json_object, str_list
-from .models import ReviewResult
+from .models import ReviewResult, Spend
 
 log = logging.getLogger(__name__)
 
@@ -111,21 +111,21 @@ def build_prompt(task_key: str, criteria: list[str], base: str, branch: str,
 def review(agent: CodingAgent, task_key: str, criteria: list[str], base: str,
            branch: str, impl_summary: str, brain_block: str, *,
            cwd: Path, model: str | None = None, tools: list[str] | None = None,
-           log_path: Path | None = None) -> tuple[ReviewResult, float]:
+           log_path: Path | None = None) -> tuple[ReviewResult, Spend]:
     """Run the reviewer in `cwd`. Retries once on unparseable output."""
     prompt = build_prompt(task_key, criteria, base, branch, impl_summary,
                           brain_block)
     allowed = REVIEWER_TOOLS if tools is None else tools
 
-    cost = 0.0
+    spend = Spend()
     data: dict[str, Any] | None = None
     for attempt in (1, 2):
         res = agent.work(prompt if attempt == 1 else prompt + _RETRY_SUFFIX,
                          cwd, log_path=log_path, model=model,
                          allowed_tools=allowed)
-        cost += res.cost_usd
+        spend += Spend.of(res)
         if not res.ok:
-            raise StationError(f"reviewer agent failed: {res.error}", cost)
+            raise StationError(f"reviewer agent failed: {res.error}", spend)
         try:
             data = parse_json_object(res.text)
             break
@@ -153,4 +153,4 @@ def review(agent: CodingAgent, task_key: str, criteria: list[str], base: str,
     if out.verdict == "request_changes" and not out.blocking_findings:
         log.warning("reviewer requested changes with no findings; treating as approve")
         out.verdict = "approve"
-    return out, cost
+    return out, spend

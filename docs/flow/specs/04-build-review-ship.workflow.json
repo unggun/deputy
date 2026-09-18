@@ -1,0 +1,278 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Zoom: Queued to Merged",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy",
+        "label": "Straight through",
+        "focus": [
+          "queued",
+          "implement",
+          "push",
+          "review",
+          "pr_open",
+          "done"
+        ],
+        "note": "Each hop is one tick; nothing waits inside a tick."
+      },
+      {
+        "id": "revision",
+        "label": "Revision loop",
+        "focus": [
+          "review",
+          "queued",
+          "implement"
+        ],
+        "note": "A reviewer asking for changes sends the row back for another implementation pass."
+      },
+      {
+        "id": "escalation",
+        "label": "Escalation paths",
+        "focus": [
+          "push",
+          "review",
+          "pr_open",
+          "blocked"
+        ],
+        "note": "Every dead end is an explicit comment on the ticket, never a silent stall."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "build",
+      "label": "Implementer station"
+    },
+    {
+      "id": "judge",
+      "label": "Reviewer station"
+    },
+    {
+      "id": "ship",
+      "label": "Pull request and CI"
+    },
+    {
+      "id": "stop",
+      "label": "Escalated to a human",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "write_phase",
+      "label": "Write the code",
+      "fromCol": 0,
+      "toCol": 2
+    },
+    {
+      "id": "ship_phase",
+      "label": "Judge it, then ship it",
+      "fromCol": 3,
+      "toCol": 5,
+      "variant": "emphasis"
+    }
+  ],
+  "groups": [
+    {
+      "id": "under_lease",
+      "label": "one agent per repo, under a lease",
+      "lane": "build",
+      "fromCol": 1,
+      "toCol": 2,
+      "variant": "emphasis"
+    }
+  ],
+  "mainPath": [
+    "queued",
+    "implement",
+    "push",
+    "review",
+    "pr_open",
+    "done"
+  ],
+  "nodes": [
+    {
+      "id": "queued",
+      "lane": "build",
+      "col": 0,
+      "type": "messagebus",
+      "label": "queued",
+      "sublabel": "slot, repo, window",
+      "width": 178
+    },
+    {
+      "id": "implement",
+      "lane": "build",
+      "col": 1,
+      "type": "backend",
+      "label": "in-progress",
+      "sublabel": "work(): 60 turns",
+      "tag": "plan + brain notes",
+      "width": 178
+    },
+    {
+      "id": "push",
+      "lane": "build",
+      "col": 2,
+      "type": "messagebus",
+      "label": "Commit + push",
+      "sublabel": "no PR opened yet",
+      "width": 178,
+      "tag": "no diff: escalate"
+    },
+    {
+      "id": "fix",
+      "lane": "build",
+      "col": 5,
+      "type": "backend",
+      "label": "Fix pass",
+      "sublabel": "work() on the PR",
+      "width": 178
+    },
+    {
+      "id": "review",
+      "lane": "judge",
+      "col": 3,
+      "type": "backend",
+      "label": "review",
+      "sublabel": "independent, read-only",
+      "width": 178
+    },
+    {
+      "id": "pr_open",
+      "lane": "ship",
+      "col": 4,
+      "type": "cloud",
+      "label": "pr-open",
+      "sublabel": "draft until green",
+      "width": 178
+    },
+    {
+      "id": "done",
+      "lane": "ship",
+      "col": 5,
+      "type": "frontend",
+      "label": "done",
+      "sublabel": "PR merged",
+      "width": 178
+    },
+    {
+      "id": "blocked",
+      "lane": "stop",
+      "col": 4,
+      "type": "security",
+      "label": "blocked",
+      "sublabel": "a human takes over",
+      "width": 178
+    }
+  ],
+  "edges": [
+    {
+      "id": "queued-implement",
+      "from": "queued",
+      "to": "implement",
+      "label": "lease acquired",
+      "variant": "emphasis"
+    },
+    {
+      "id": "implement-push",
+      "from": "implement",
+      "to": "push",
+      "label": "diff produced",
+      "variant": "emphasis"
+    },
+    {
+      "id": "push-review",
+      "from": "push",
+      "to": "review",
+      "label": "branch pushed",
+      "variant": "emphasis"
+    },
+    {
+      "id": "review-pr",
+      "from": "review",
+      "to": "pr_open",
+      "label": "approved",
+      "variant": "emphasis"
+    },
+    {
+      "id": "pr-done",
+      "from": "pr_open",
+      "to": "done",
+      "label": "merged",
+      "variant": "emphasis"
+    },
+    {
+      "id": "review-queued",
+      "from": "review",
+      "to": "queued",
+      "label": "changes requested",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "pr-fix",
+      "from": "pr_open",
+      "to": "fix",
+      "label": "CI red or human comment",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "fix-pr",
+      "from": "fix",
+      "to": "pr_open",
+      "label": "fixes pushed",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "review-blocked",
+      "from": "review",
+      "to": "blocked",
+      "label": "rejected or exhausted",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "pr-blocked",
+      "from": "pr_open",
+      "to": "blocked",
+      "label": "PR closed",
+      "variant": "security",
+      "role": "error"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "One agent per repo",
+      "items": [
+        "Two agents on one base branch produce conflicting PRs",
+        "review and pr-open hold a slot but release the repo lock",
+        "A ticket spanning two repos spends one slot in each"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Budgets that actually bite",
+      "items": [
+        "attempts resets to 0 on every clean hand-off between stations",
+        "An expired lease on in-progress means a dead run, and requeues",
+        "max_review_cycles is authoritative over max_fix_attempts"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Only an approving review writes to the brain",
+      "items": [
+        "Notes are appended before the PR is even opened",
+        "A rejected plan, a rejected review or a crash writes nothing",
+        "At brain_max_bytes it stops appending rather than forgetting"
+      ]
+    }
+  ]
+}

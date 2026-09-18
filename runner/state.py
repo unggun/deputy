@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     lease_owner          TEXT,
     lease_until          INTEGER NOT NULL DEFAULT 0,
     cost_usd             REAL NOT NULL DEFAULT 0,
+    tokens               INTEGER NOT NULL DEFAULT 0,
     last_error           TEXT,
     meta                 TEXT NOT NULL DEFAULT '{}',
     updated_at           INTEGER NOT NULL DEFAULT 0
@@ -41,10 +42,12 @@ CREATE TABLE IF NOT EXISTS events (
     task_id  TEXT,
     kind     TEXT NOT NULL,
     detail   TEXT,
-    cost_usd REAL NOT NULL DEFAULT 0
+    cost_usd REAL NOT NULL DEFAULT 0,
+    tokens   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source, state);
+CREATE INDEX IF NOT EXISTS idx_tasks_ticket ON tasks(source, provider_task_id);
 CREATE TABLE IF NOT EXISTS posted_comments (
     idempotency_key TEXT PRIMARY KEY,
     task_id TEXT,
@@ -64,6 +67,26 @@ class Store:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self.conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for databases created by older versions.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so new
+        columns in `SCHEMA` never reach a DB that already has the table. The
+        alternative -- recreating the DB -- would drop every in-flight row's
+        branch and PR number and orphan real work on the remote.
+        """
+        for table, column, decl in (
+            ("events", "tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("tasks", "tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            names = {r["name"] for r in
+                     self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in names:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         self.conn.commit()
 
     # --- task rows ----------------------------------------------------
@@ -94,6 +117,26 @@ class Store:
 
     def set_state(self, task_id: str, state: AIState, **extra: Any) -> None:
         self.upsert(task_id, state=state.value, **extra)
+
+    def rows_for_task(self, source: str, provider_task_id: str) -> list[dict[str, Any]]:
+        """Every local row for one remote ticket.
+
+        A ticket that spans two repos has one row per repo, each with its own
+        branch, PR and state. Row ids are not predictable before triage has
+        chosen the repos, so "do I already know this ticket?" has to be a
+        query on (source, provider_task_id) rather than a `get(row_id)`.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM tasks WHERE source = ? AND provider_task_id = ?"
+            " ORDER BY task_id ASC", (source, provider_task_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete(self, task_id: str) -> None:
+        """Drop one row. Used when a pre-triage placeholder is replaced by the
+        per-repo rows triage actually routed the ticket to."""
+        self.conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+        self.conn.commit()
 
     def in_flight(self, source: str | None = None) -> list[dict[str, Any]]:
         terminal = [s.value for s in AIState if s.is_terminal]
@@ -141,15 +184,18 @@ class Store:
 
     # --- accounting ---------------------------------------------------
     def record(self, kind: str, task_id: str | None = None,
-               detail: str = "", cost_usd: float = 0.0) -> None:
+               detail: str = "", cost_usd: float = 0.0,
+               tokens: int = 0) -> None:
         self.conn.execute(
-            "INSERT INTO events (ts, task_id, kind, detail, cost_usd) VALUES (?,?,?,?,?)",
-            (_now(), task_id, kind, detail[:4000], cost_usd),
+            "INSERT INTO events (ts, task_id, kind, detail, cost_usd, tokens)"
+            " VALUES (?,?,?,?,?,?)",
+            (_now(), task_id, kind, detail[:4000], cost_usd, int(tokens)),
         )
-        if task_id and cost_usd:
+        if task_id and (cost_usd or tokens):
             self.conn.execute(
-                "UPDATE tasks SET cost_usd = cost_usd + ? WHERE task_id = ?",
-                (cost_usd, task_id),
+                "UPDATE tasks SET cost_usd = cost_usd + ?, tokens = tokens + ?"
+                " WHERE task_id = ?",
+                (cost_usd, int(tokens), task_id),
             )
         self.conn.commit()
 
@@ -158,6 +204,18 @@ class Store:
             "SELECT COALESCE(SUM(cost_usd), 0) s FROM events WHERE ts >= ?", (epoch,)
         ).fetchone()
         return float(row["s"])
+
+    def tokens_since(self, epoch: int) -> int:
+        """Tokens consumed since `epoch`.
+
+        The counterpart to `spend_since`. On a subscription login the dollar
+        figure is an API-equivalent estimate of work drawn from the
+        developer's quota; this is the number that tracks the quota itself.
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(tokens), 0) s FROM events WHERE ts >= ?", (epoch,)
+        ).fetchone()
+        return int(row["s"])
 
     # --- comment idempotency -------------------------------------------
     def claim_comment(self, key: str, task_id: str) -> bool:

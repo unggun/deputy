@@ -78,7 +78,77 @@ class TriageResult:
     risk_flags: list[str] = field(default_factory=list)
     plan: list[str] = field(default_factory=list)
     acceptance_criteria: list[str] = field(default_factory=list)
-    repo_key: str | None = None
+    # Every repo this ticket needs a change in. One entry is the common case;
+    # a feature spanning a backend and a frontend has two, and the pipeline
+    # fans out one independent row (branch, worktree, PR, review) per entry.
+    repo_keys: list[str] = field(default_factory=list)
+
+    @property
+    def repo_key(self) -> str | None:
+        """The primary repo. Convenience for the single-repo path."""
+        return self.repo_keys[0] if self.repo_keys else None
+
+
+@dataclass
+class TokenUsage:
+    """Tokens consumed by one agent run.
+
+    Recorded *alongside* `cost_usd`, not instead of it, because the two gate
+    different things. With a claude.ai login the CLI's `total_cost_usd` is an
+    API-*equivalent* number: it prices work that is actually drawn from the
+    developer's 5-hourly/weekly subscription quota, so `daily_budget_usd`
+    limits money nobody is billed for while the constraint that really bites
+    -- the quota -- goes unmeasured. Token counts are the same currency the
+    quota is denominated in.
+    """
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        """All four counts summed.
+
+        Cache reads are included: they are billed at a discount but are still
+        tokens the model processed, so they count against rate limits. This is
+        a proxy for quota consumption, not a billing figure.
+        """
+        return (self.input_tokens + self.output_tokens
+                + self.cache_creation_input_tokens + self.cache_read_input_tokens)
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cache_creation_input_tokens=(self.cache_creation_input_tokens
+                                         + other.cache_creation_input_tokens),
+            cache_read_input_tokens=(self.cache_read_input_tokens
+                                     + other.cache_read_input_tokens),
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any] | None) -> "TokenUsage":
+        """Read a `usage` object off a Claude Code result event.
+
+        Missing and malformed fields both become 0 rather than raising: usage
+        accounting must never be the thing that fails a run that otherwise
+        produced a working change.
+        """
+        usage = (payload or {}).get("usage")
+        if not isinstance(usage, dict):
+            return cls()
+        def count(name: str) -> int:
+            try:
+                return max(0, int(usage.get(name) or 0))
+            except (TypeError, ValueError):
+                return 0
+        return cls(
+            input_tokens=count("input_tokens"),
+            output_tokens=count("output_tokens"),
+            cache_creation_input_tokens=count("cache_creation_input_tokens"),
+            cache_read_input_tokens=count("cache_read_input_tokens"),
+        )
 
 
 @dataclass
@@ -90,6 +160,33 @@ class AgentResult:
     duration_ms: int = 0
     error: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    timed_out: bool = False
+
+
+@dataclass
+class Spend:
+    """What one station cost, in both currencies.
+
+    Stations used to return a bare `float` cost. Threading a second number
+    through every return and every `StationError` as a separate positional
+    argument invites the two drifting apart at one call site; one object
+    cannot.
+    """
+    cost_usd: float = 0.0
+    usage: TokenUsage = field(default_factory=TokenUsage)
+
+    @property
+    def tokens(self) -> int:
+        return self.usage.total
+
+    def __add__(self, other: "Spend") -> "Spend":
+        return Spend(cost_usd=self.cost_usd + other.cost_usd,
+                     usage=self.usage + other.usage)
+
+    @classmethod
+    def of(cls, res: AgentResult) -> "Spend":
+        return cls(cost_usd=res.cost_usd, usage=res.usage)
 
 
 @dataclass

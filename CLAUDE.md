@@ -91,18 +91,58 @@ between parallel runs.
 ### Local state vs. remote state
 
 SQLite (`Store`) is per-laptop; the AI State field/property on the ticket is the only
-shared state. Row ids are namespaced `"{source.key}:{provider_task_id}"` so two
-workspaces cannot collide in one DB — `_row_id()` builds them, `_pid()` unwraps them.
+shared state. Row ids are namespaced so two workspaces cannot collide in one DB —
+`_row_id()` builds them, `_pid()` unwraps them. Two shapes:
+
+- `"{source.key}:{provider_task_id}"` — the pre-triage **placeholder**. It records
+  that the ticket was seen (and any triage crash, which has no repo to blame) before
+  routing has happened. `clarify` and `human_only` decisions end here too.
+- `"{source.key}:{provider_task_id}#{repo_key}"` — a **routed** row, one per repo.
+  `_route()` creates them and retires the placeholder.
+
+Because the ids are unknowable until triage has routed the ticket, "do I already know
+this ticket?" is `store.rows_for_task(source, pid)`, never `store.get(row_id)`. Rows
+written before per-repo fan-out existed carry the two-segment id *with* a `repo_key`
+and no `#`; they keep advancing unchanged, and `_route()` reuses rather than re-keys
+them.
 
 **Never adopt an orphan.** A ticket marked in-flight remotely with no local row means
 another laptop or a reassignment; `_orphan()` marks it `blocked` with an explanatory
 comment and stops. The branch, worktree and PR live elsewhere.
 
+### One ticket, several repos
+
+A Jira project routinely covers a backend and a frontend, and nothing in the ticket
+metadata tells them apart. So **triage routes**: `Source.repos_for_container()` returns
+every candidate, `_build_prompt` shows the model each one's `key`, `language` and
+`notes`, and it returns `repos: [...]`. `_pick_repos()` drops anything not offered, and
+with a single candidate the model is not consulted at all — a hallucinated key must not
+turn a routable ticket into a spurious `clarify`. Routing quality is entirely a function
+of how accurate `language` and `notes` are in config; they are not decoration.
+
+A ticket naming two repos gets **two independent rows** — own branch, worktree, PR,
+review cycle, attempt counter and brain file. What they share is the one remote AI State
+field, so writes to it are aggregated by `_remote_state()`: **least advanced wins**
+(a ticket is only `done` when every repo is), except that `blocked`/`human-only` on any
+row outranks progress on the others. Never call `provider.set_ai_state` directly from a
+station — go through `_set()` / `_push_remote_state()`, or one repo's progress will
+overwrite the other's.
+
+Provider *workflow status* writes are gated the same way through `_set_status_when()`:
+the first repo to merge must not flip the ticket to `done_status` while the second PR is
+still open.
+
+Re-triage (a human answered, or rejected a plan) **keeps the existing repo set** —
+`_candidate_repos()` offers only the repos already assigned. Re-routing would strand
+whatever branch and worktree the dropped row already owned.
+
 ### Concurrency and safety invariants
 
 - **One agent per repo** (`graph.repo_is_free`). Two agents branching off the same base
   produce conflicting PRs. File-overlap detection is a tempting refinement but you don't
-  know which files a ticket touches until after the agent has run.
+  know which files a ticket touches until after the agent has run. A cross-repo ticket
+  does not violate this — its rows are in *different* repos — but it does consume one
+  `max_active_tasks` slot per repo, which is correct: that is two agent runs.
 - **Leases** (`store.acquire_lease` / `release_lease`) guard execution; an expired lease
   on an `in-progress` row means a dead run and requeues with an incremented attempt.
 - **Idempotent comments** — every comment goes through `_comment(rid, key, md)`, which
@@ -125,8 +165,11 @@ own model and tool set instead of adding new methods. That gives four effectivel
 independent seams:
 
 - `reason(prompt, *, max_turns=1)` — triage. Runs `claude -p` with `--allowedTools ""`
-  and one turn, so **triage never reads the repo**; it judges `scope` from ticket text
-  plus the `notes:` string in config. Uses `agent.triage_model`.
+  and one turn, so **triage never reads the repo**; it judges `scope` *and routes the
+  ticket to one or more repos* from ticket text plus each candidate repo's `language`
+  and `notes` in config. Uses `agent.triage_model`. `--allowedTools ""` removes the
+  ability to *act* but not the ambient context, so isolation is a separate mechanism —
+  see below.
 - `work(prompt, cwd, *, log_path=None)` — implementation and fix passes. 60 turns, full
   allowlist, cwd is the worktree. Uses `agent.model`.
 - `work(prompt, cwd, model=agent.model, allowed_tools=agent.planner_tools)` — the
@@ -151,9 +194,99 @@ API-*equivalent* number, which means `limits.daily_budget_usd` is gating on mone
 pays while the real constraint goes untracked.
 
 To put the runner on separate pay-as-you-go credits, set `ANTHROPIC_API_KEY` in the cron
-environment only (`_run()` inherits the parent env and passes no `env=`, so this scopes
-cleanly). Add `CLAUDE_CODE_SIMPLE=1` so a missing key fails loudly instead of silently
-falling back to the subscription.
+environment only (`_run()` passes the parent env through `_sanitized_env()`, which strips
+only `GIT_*`, so this scopes cleanly). Add `CLAUDE_CODE_SIMPLE=1` so a missing key fails
+loudly instead of silently falling back to the subscription.
+
+So **both** currencies are recorded. Every agent run returns a `TokenUsage`
+(input + output + cache-create + cache-read); `Spend` carries it alongside `cost_usd`
+through the stations and `StationError`, and `store.record(...)` writes both to the
+`events` ledger and accrues both onto the task row. `limits.daily_tokens` gates on the
+token sum exactly as `daily_budget_usd` gates on the dollar sum — `_limits_exceeded()`
+checks both before every agent run and reports whichever tripped. `daily_tokens: 0`
+(the default) disables the token gate. For scale: a trivial one-turn `work()` run
+measured 40k tokens and $0.03, so on a subscription the dollar limit will essentially
+never fire on its own.
+
+### Triage isolation
+
+`reason()` used to pass `cwd=None`, so triage inherited the directory cron launched the
+runner from — and `claude` loads that directory's `CLAUDE.md`, settings, skills, MCP tool
+definitions and git state into the system prompt *before* reading the prompt. Triage did
+not "never read the repo": it read whichever repo it was standing in, and answered about
+it. Asked what project it was in, unisolated triage recited this repository's `CLAUDE.md`;
+isolated triage answers `NO PROJECT CONTEXT`.
+
+So `reason()` runs in `agent.triage_dir` (a fixed empty directory, default
+`~/.ai-runner/triage`) with `TRIAGE_ISOLATION`: `--strict-mcp-config`,
+`--disable-slash-commands`, `--setting-sources ""`. Fixed and not a temp dir because the
+cwd is part of the system prompt — a path that changes per call misses the prompt cache
+per call. An uncreatable directory logs and falls back to the old behaviour rather than
+stranding every new ticket. `agent.isolate_triage: false` opts out.
+
+That fallback is silent by design and therefore easy to be wrong about, so `doctor`
+**checks it rather than trusting it**: it runs one real `reason()` call with
+`cli.py::CANARY_PROMPT` and asserts the reply contains `CANARY_SENTINEL`
+(`NO PROJECT CONTEXT`, kept verbatim in both places so the doc and the check cannot
+drift). `_isolation_status()` grades the reply `ok` / `skipped` / `broken` /
+`unverified`, and **`unverified` is not a pass** — a canary that timed out or came back
+empty proves nothing, so it lands in `problems` and `doctor` exits non-zero. Only
+`agent.isolate_triage: false` is graded `skipped`, since that is a config choice rather
+than a fault. The check costs one small agent run per `doctor`; `doctor` is operator-run,
+not the cron entrypoint, so that is affordable — do not move it into `run`.
+
+`work()` is deliberately **not** isolated: the target repo's own `CLAUDE.md` and settings
+are exactly the context the implementer, analyst and reviewer are supposed to have. Do not
+"make this consistent" by applying the triage flags to `work()`.
+
+### Agent process supervision
+
+`work()` runs `claude -p --output-format stream-json --verbose` and consumes NDJSON as it
+arrives; the final `type: "result"` event carries `result`, `total_cost_usd`, `num_turns`,
+`duration_ms` and `usage`. `reason()` stays on `--output-format json` — one turn, nothing
+to stream. Three invariants live in `agents/claude_code.py` and are easy to undo by
+accident:
+
+- **The child leads its own process group** (`start_new_session=True`) and timeouts go
+  through `_kill_tree()`, which signals the *group* (SIGTERM, then SIGKILL after
+  `TERM_GRACE_SECONDS`). `subprocess.run(timeout=...)` kills only the direct child, and
+  Claude Code's bash invocations, MCP servers and subagents outlive it — still holding the
+  worktree, still spending quota. `_kill_tree()` also runs on the normal exit path, for the
+  same reason. Never replace this with a plain `run(timeout=...)`.
+- **stderr is drained on its own thread.** Not optional: a child that fills its stderr pipe
+  blocks on write forever while the main thread is reading stdout. The same reasoning
+  applies at the `_EventLog` cap — it stops *recording*, but the pipes keep being read.
+- **stdin is `DEVNULL`.** `claude -p` reads a non-TTY stdin and *appends it to the
+  prompt*. An inherited stdin therefore feeds the agent whatever happens to be on it — a
+  heredoc, a pipe, or a terminal it then blocks on forever. The prompt goes in argv; this
+  is not a spare channel.
+- **The environment is sanitised.** `_sanitized_env()` strips `GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE` and friends, which otherwise override the worktree and point the agent's
+  `git` at a different repository, and sets `AI_TASK_RUNNER_RUN_ID` so a nested agent can
+  tell it is already inside a managed run.
+- **The prompt has a ceiling.** It travels in argv, so past the kernel's limit the exec
+  fails as a bare `OSError` — at the one moment an operator most needs a readable
+  sentence. `_run()` refuses first, returning `ok=False` with both byte counts, which the
+  stations already turn into a `StationError` and an escalation. The check lives in
+  `_run()`, the single funnel `reason()` and `work()` both pass through, so a fifth seam
+  cannot be added that skips it; and it counts `len(prompt.encode())`, not `len(prompt)`,
+  or a multibyte prompt slips through at three times the ceiling.
+  `agent.max_prompt_bytes` defaults to 400000 on macOS and 120000 on Linux, which caps a
+  single argument at 128 KiB. **Never truncate instead** — a shortened prompt buys a
+  confident answer about the wrong ticket.
+- **The model is verified, not assumed.** `--model` is a request; the result payload
+  reports what answered in `modelUsage`. `_check_model()` warns when the requested model
+  is absent from a non-empty `modelUsage` and does nothing else. Warn-only is deliberate
+  twice over: a `work()` run legitimately reports several models (`allowed_tools`
+  includes `Agent`, and subagents bill separately), so the test is *presence*, not
+  exclusivity; and an absent or unrecognised `modelUsage` stays silent so an upstream
+  schema change cannot warn on every run. Matching tolerates alias-vs-canonical
+  (`sonnet` → `claude-sonnet-5`).
+
+The per-run JSONL event log under `runner.log_dir` is written as output arrives and flushed
+per event, so a killed run still leaves evidence — the previous `log_path` write only
+happened after the process returned, which is exactly when it was least likely to.
+`agent.max_log_bytes` bounds it.
 
 ### Gating: mode, windows, policy
 
@@ -186,10 +319,22 @@ corruption.
   mirrored to `ai:*` labels so boards stay readable.
 - **Jira JQL**: `labels NOT IN ("no-ai")` silently drops issues with *no labels at all*.
   The `(labels IS EMPTY OR ...)` branch is required, not defensive.
+- **Jira `require_labels`** is the opt-*in* counterpart to `skip_labels`: an AND of
+  `labels = "x"` clauses, so more entries narrow the funnel. It only shapes
+  `fetch_candidates()`, i.e. new triage — `_advance` re-reads in-flight rows via
+  `get_task`, so pulling the label off a ticket mid-flight does not abandon its
+  branch or PR. ClickUp has no equivalent yet (`skip_tags` only).
 - **Jira comments** use `/rest/api/2` (plain text); reads use `/rest/api/3` +
   `_flatten_adf` since v3 comments demand Atlassian Document Format for no benefit.
   Search uses `/rest/api/3/search/jql` with `nextPageToken`, not the deprecated
   `/search` with `startAt`.
+- **Branch names** come from `vcs.branch_name(provider.branch_key(task), title)`.
+  `TaskProvider.branch_key()` defaults to `task.key`; ClickUp overrides it to
+  `CU-<native id>` because the integration only links a branch to a task when the
+  id carries that prefix (a Custom Task ID is matched verbatim, so it is used
+  as-is). `branch_name` slugs the key with `keep_case=True` — lowercasing it would
+  break that matching, so `slug()`'s default lowercasing must not creep back in
+  there.
 - **ClickUp dependencies**: the API returns mirror rows for both directions. Disambiguate
   by `dep["task_id"] == this task` (meaning it waits on `depends_on`), not by `type`.
 - **ClickUp state backend** is configurable: `custom_field` (atomic, filterable —
@@ -201,6 +346,17 @@ corruption.
   as clear.
 
 ## Security posture
+
+**Nothing reaches a ticket unredacted.** `redact()` (`runner/redact.py`) scrubs credential
+material, and every path that can carry subprocess output outward goes through it:
+`Pipeline._comment` / `_escalate` (the one funnel for provider comments), the `last_error`
+writes, `vcs.run`'s `CommandError`, and the agent event log. It combines shape patterns
+(`ghp_`, `github_pat_`, `sk-ant-`, `ATATT`, `pk_N_`, bearer headers, `user:pass@host` in a
+remote URL) with exact-value matching against the tokens this runner actually injects —
+`Pipeline._known_secrets()` gathers them from every vcs profile, and the agent adapter picks
+them up by env var *name*, which is what catches a custom `token_env: GH_TOKEN_ACME`. Keep
+the patterns narrow: a greedy rule eats branch names and SHAs, and an unreadable escalation
+comment just sends the human off to run the failing command by hand.
 
 Agent runs use `permission_mode: dontAsk` with an explicit `allowed_tools` allowlist;
 `bypassPermissions` is only acceptable inside a disposable container. Worktrees live

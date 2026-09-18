@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Sequence: Approved Plan to Merged PR",
+    "quality_profile": "showcase",
+    "viewBox": [1200, 610],
+    "column_fit": "spread",
+    "views": [
+      { "id": "implement", "label": "Implement tick", "focus": ["pipeline", "agent", "git"], "note": "The agent edits inside an isolated worktree and never commits." },
+      { "id": "review", "label": "Review tick", "focus": ["pipeline", "agent", "github"], "note": "An independent pass judges the diff before any PR exists." },
+      { "id": "poll", "label": "Polling the PR", "focus": ["pipeline", "github", "human", "tracker"], "note": "CI and human feedback are read once per tick, never waited on." }
+    ]
+  },
+  "participants": [
+    { "id": "human", "type": "security", "label": "Developer" },
+    { "id": "tracker", "type": "external", "label": "ClickUp / Jira" },
+    { "id": "pipeline", "type": "backend", "label": "Pipeline" },
+    { "id": "agent", "type": "messagebus", "label": "Claude Code" },
+    { "id": "git", "type": "cloud", "label": "Worktree" },
+    { "id": "github", "type": "frontend", "label": "GitHub" }
+  ],
+  "segments": [
+    { "from": 160, "to": 271, "label": "Tick N — implement, commit, push" },
+    { "from": 283, "to": 367, "label": "Tick N+1 — review, then open the PR" },
+    { "from": 379, "to": 495, "label": "Tick N+2 onward — poll the PR" }
+  ],
+  "messages": [
+    { "id": "implement", "from": "pipeline", "to": "agent", "y": 170, "label": "work(): 60 turns, full allowlist", "variant": "emphasis" },
+    { "id": "edits", "from": "agent", "to": "git", "y": 199, "label": "edits files, runs the repo test command", "variant": "default" },
+    { "id": "summary", "from": "agent", "to": "pipeline", "y": 228, "label": "summary of what changed", "variant": "return" },
+    { "id": "push", "from": "pipeline", "to": "git", "y": 257, "label": "commit_all + push, no PR yet", "variant": "default" },
+    { "id": "review", "from": "pipeline", "to": "agent", "y": 295, "label": "work(): judge diff against criteria", "variant": "emphasis" },
+    { "id": "approved", "from": "agent", "to": "pipeline", "y": 324, "label": "approve, plus notes for the brain", "variant": "return" },
+    { "id": "openpr", "from": "pipeline", "to": "github", "y": 353, "label": "gh pr create --draft", "variant": "emphasis" },
+    { "id": "poll", "from": "github", "to": "pipeline", "y": 391, "label": "CI green, no allowlisted feedback", "variant": "return" },
+    { "id": "ready", "from": "pipeline", "to": "github", "y": 420, "label": "mark ready for review", "variant": "default" },
+    { "id": "merge", "from": "human", "to": "github", "y": 449, "label": "merges the PR", "variant": "emphasis" },
+    { "id": "done", "from": "pipeline", "to": "tracker", "y": 478, "label": "AI State done, workflow status done", "variant": "emphasis" }
+  ],
+  "activations": [
+    { "participant": "pipeline", "from": 165, "to": 262, "type": "backend" },
+    { "participant": "agent", "from": 165, "to": 233, "type": "messagebus" },
+    { "participant": "pipeline", "from": 290, "to": 358, "type": "backend" },
+    { "participant": "agent", "from": 290, "to": 329, "type": "messagebus" },
+    { "participant": "pipeline", "from": 386, "to": 483, "type": "backend" },
+    { "participant": "github", "from": 348, "to": 454, "type": "frontend" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "The agent never touches git",
+      "items": [
+        "Prompts forbid committing, pushing and opening a PR",
+        "Worktrees live under work_dir, never in your own checkout",
+        "GIT_DIR and friends are stripped from the child environment"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Review comes before the PR",
+      "items": [
+        "A rejected branch never becomes a pull request at all",
+        "request_changes sends the row back to queued for another pass",
+        "Only an approving review appends to the per-repo brain"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Polling is never waiting",
+      "items": [
+        "Pending CI simply ends the tick; the next tick looks again",
+        "Only allowlisted reviewers count as human feedback",
+        "A closed PR, or exhausted fix attempts, escalates to a human"
+      ]
+    }
+  ]
+}

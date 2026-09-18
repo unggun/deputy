@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-task-runner — Flow Diagrams</title>
+<style>
+  :root{
+    --bg:#f7f8f8; --panel:#ffffff; --ink:#15211f; --muted:#5d6b68;
+    --line:#dfe4e3; --accent:#0e8f74; --accent-soft:#e6f4f0;
+    --chip:#f0f3f2; --code:#0f766e;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0d1211; --panel:#141b1a; --ink:#e7edeb; --muted:#93a29f;
+      --line:#243230; --accent:#3fd4ab; --accent-soft:#12312a;
+      --chip:#1b2423; --code:#5eead4;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0d1211; --panel:#141b1a; --ink:#e7edeb; --muted:#93a29f;
+    --line:#243230; --accent:#3fd4ab; --accent-soft:#12312a;
+    --chip:#1b2423; --code:#5eead4;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding-block:48px 72px;padding-left:24px;padding-right:24px}
+  header{border-bottom:1px solid var(--line);padding-bottom:28px;margin-bottom:36px}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+           color:var(--accent);margin:0 0 10px}
+  h1{font-family:var(--mono);font-size:clamp(24px,4.2vw,36px);line-height:1.15;margin:0 0 14px;
+     letter-spacing:-.01em}
+  .lede{margin:0;max-width:66ch;color:var(--muted);font-size:15px}
+  .lede code{font-family:var(--mono);font-size:.92em;color:var(--code)}
+
+  h2{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+     color:var(--muted);margin:40px 0 16px;font-weight:600}
+  h2:first-of-type{margin-top:0}
+
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  a.card{display:block;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+         padding:18px 20px 20px;text-decoration:none;color:inherit;
+         transition:border-color .15s ease, transform .15s ease}
+  a.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+  a.card:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  .num{font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:.1em}
+  .kind{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+        color:var(--muted);background:var(--chip);border:1px solid var(--line);
+        border-radius:999px;padding:2px 8px;margin-left:8px;vertical-align:1px}
+  .card h3{font-family:var(--mono);font-size:16px;margin:8px 0 8px;letter-spacing:-.005em}
+  .card p{margin:0;font-size:13.5px;color:var(--muted)}
+  .card ul{margin:10px 0 0;padding-left:16px;font-size:12.5px;color:var(--muted)}
+  .card li{margin:3px 0}
+  code{font-family:var(--mono);font-size:.92em;color:var(--code)}
+
+  .note{margin-top:44px;padding:18px 20px;background:var(--accent-soft);border:1px solid var(--line);
+        border-radius:12px;font-size:13px;color:var(--ink)}
+  .note h3{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;
+           margin:0 0 10px;color:var(--accent)}
+  .note p{margin:0 0 8px;max-width:80ch}
+  .note p:last-child{margin-bottom:0}
+  pre{margin:10px 0 0;padding:12px 14px;background:var(--panel);border:1px solid var(--line);
+      border-radius:8px;overflow-x:auto;font-family:var(--mono);font-size:12px;color:var(--ink)}
+  footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);
+         font-size:12px;color:var(--muted);font-family:var(--mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">ai-task-runner</p>
+  <h1>Flow diagrams</h1>
+  <p class="lede">
+    Six views of the same machine: a resumable bridge between a task manager and a coding agent.
+    Each page is standalone and interactive — pan, zoom, search, trace a relationship, step through
+    the guided views, switch light/dark, or export. Start with the system map, then follow a ticket
+    through the two zoomed paths.
+  </p>
+</header>
+
+<h2>Start here</h2>
+<div class="grid">
+  <a class="card" href="01-system-map.html">
+    <span class="num">01</span><span class="kind">Architecture</span>
+    <h3>System map</h3>
+    <p>What the pieces are and which seam each one sits behind: providers, agents, vcs, the local
+       SQLite store and the per-repo brain.</p>
+    <ul>
+      <li><code>pipeline.py</code> names no tracker, agent or host</li>
+      <li>Local state vs. the one shared AI State field</li>
+      <li>Where redaction happens on the way out</li>
+    </ul>
+  </a>
+
+  <a class="card" href="02-one-tick.html">
+    <span class="num">02</span><span class="kind">Workflow</span>
+    <h3>One tick</h3>
+    <p>What a single <code>ai-task-runner run</code> actually does: day and window gates, daily
+       limits, advance in-flight rows first, then triage what is new.</p>
+    <ul>
+      <li>Every task moves at most one step, then the process exits</li>
+      <li>Cheap bookkeeping runs before any LLM call</li>
+      <li>Orphan detection: never adopt another machine's work</li>
+    </ul>
+  </a>
+</div>
+
+<h2>Zoom: the front half</h2>
+<div class="grid">
+  <a class="card" href="03-triage-and-plan.html">
+    <span class="num">03</span><span class="kind">Workflow</span>
+    <h3>New ticket → queued</h3>
+    <p>The denylist, the tool-less triage call, routing to one or more repositories, the scope gate
+       and the analyst's grounded plan.</p>
+    <ul>
+      <li>Hard rules overrule the model, every time</li>
+      <li>Triage judges text only — it cannot open the repo</li>
+      <li>Re-triage keeps the repo set so no branch is stranded</li>
+    </ul>
+  </a>
+
+  <a class="card" href="05-sequence-triage.html">
+    <span class="num">05</span><span class="kind">Sequence</span>
+    <h3>Ticket → approved plan</h3>
+    <p>The same stretch as call traffic: who calls whom, in which tick, and where the process stops
+       and starts again.</p>
+    <ul>
+      <li>Each band is a separate short-lived process</li>
+      <li><code>reason()</code> vs. <code>work()</code> with read-only planner tools</li>
+      <li>Approval is an ordinary ticket comment</li>
+    </ul>
+  </a>
+</div>
+
+<h2>Zoom: the back half</h2>
+<div class="grid">
+  <a class="card" href="04-build-review-ship.html">
+    <span class="num">04</span><span class="kind">Workflow</span>
+    <h3>Queued → merged</h3>
+    <p>The implementer, the independent reviewer that runs <em>before</em> any PR exists, the
+       revision loop, the CI fix loop and every escalation.</p>
+    <ul>
+      <li>One agent per repo, held by a lease</li>
+      <li>Crash budgets reset on each clean hand-off</li>
+      <li>Only an approving review writes to the brain</li>
+    </ul>
+  </a>
+
+  <a class="card" href="06-sequence-ship.html">
+    <span class="num">06</span><span class="kind">Sequence</span>
+    <h3>Approved plan → merged PR</h3>
+    <p>Implement, commit, push, review, open a draft PR, then poll it tick by tick until a human
+       merges.</p>
+    <ul>
+      <li>The agent edits; the runner commits, pushes and opens the PR</li>
+      <li>Worktrees are isolated, never your own checkout</li>
+      <li>Polling is never waiting — pending CI just ends the tick</li>
+    </ul>
+  </a>
+</div>
+
+<div class="note">
+  <h3>How these were made</h3>
+  <p>Each page is generated from a small typed JSON specification in <code>specs/</code> and
+     validated against layout, crossing, label-clearance and desktop-readability checks before it
+     is written. To change a diagram, edit its spec and re-render it rather than hand-editing the
+     HTML.</p>
+  <pre>node ~/.claude/skills/archify/bin/archify.mjs deliver workflow \
+  docs/flow/specs/04-build-review-ship.workflow.json \
+  docs/flow/04-build-review-ship.html --quality showcase</pre>
+  <p style="margin-top:12px">The live state graph itself stays authoritative in
+     <code>runner/graph.py</code>; <code>ai-task-runner graph</code> prints it as Mermaid straight
+     from the same <code>TRANSITIONS</code> table the runtime uses.</p>
+</div>
+
+<footer>Generated from the source in runner/ — pipeline.py, graph.py, triage.py, analyst.py, review.py, vcs.py</footer>
+
+</div>
+</body>
+</html>

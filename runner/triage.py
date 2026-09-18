@@ -7,7 +7,7 @@ from typing import Any
 
 from .agents.base import CodingAgent
 from .jsonio import StationError, parse_json_object
-from .models import Comment, Task, TriageResult
+from .models import Comment, Spend, Task, TriageResult
 
 log = logging.getLogger(__name__)
 
@@ -39,9 +39,18 @@ one comment.
 
 Choose "execute" ONLY IF ALL of these hold:
 - The desired end state is unambiguous and testable.
-- It is scoped to application code in one repository.
+- It is scoped to application code in the repositories listed under REPOS.
 - No production data, credentials, infrastructure, auth model, or payments.
 - A competent engineer new to the ticket could start without asking anything.
+
+You also route the ticket. "repos" is the list of repositories that need a
+code change for this ticket to be done. Each one gets its OWN branch, PR and
+review, so name a repo only if it genuinely needs changing:
+- Most tickets touch exactly one repo. Prefer one.
+- Name several only when the work truly spans them - e.g. a new API endpoint
+  in the backend AND the screen that calls it in the frontend.
+- Use the exact `key` from the REPOS section. Never invent a key.
+- If you cannot tell which repo it belongs to, choose "clarify" and ask.
 
 Choose "clarify" if requirements, acceptance criteria, affected surface,
 expected behaviour, or reproduction steps are missing or ambiguous.
@@ -60,24 +69,52 @@ Reply with a SINGLE JSON object and nothing else. No markdown, no prose:
   "hints": ["concrete next steps or likely causes - only for human_only"],
   "risk_flags": ["prod-data" | "migration" | "secrets" | "auth" | "payments" | "infra" | "ux-decision"],
   "acceptance_criteria": ["what 'done' means, inferred from the ticket"],
-  "plan": ["ordered implementation steps - only for execute"]
+  "plan": ["ordered implementation steps - only for execute"],
+  "repos": ["repo keys that need a code change - only for execute"]
 }"""
 
 
-def _build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any] | None) -> str:
+def _build_prompt(task: Task, comments: list[Comment],
+                  repos: list[dict[str, Any]]) -> str:
     thread = "\n".join(
         f"[{'AI' if c.is_bot else c.author}] {c.text.strip()}" for c in comments[-20:]
     ) or "(no comments)"
-    repo_note = (
-        f"Target repository: {repo['key']} ({repo.get('language', 'unknown stack')})\n"
-        f"Notes: {repo.get('notes', '-')}\n" if repo else
-        "No repository is mapped to this list. That alone forces 'clarify'.\n"
-    )
+    if not repos:
+        repo_note = "No repository is mapped to this list. That alone forces 'clarify'.\n"
+    else:
+        repo_note = "\n".join(
+            f"- key: {r['key']}\n"
+            f"  stack: {r.get('language', 'unknown stack')}\n"
+            f"  notes: {r.get('notes', '-')}"
+            for r in repos
+        ) + "\n"
     return (
         f"{SYSTEM}\n\n=== TICKET ===\n{task.as_prompt_block()}\n"
-        f"=== REPO ===\n{repo_note}\n=== COMMENT THREAD ===\n{thread}\n\n"
+        f"=== REPOS ===\n{repo_note}\n=== COMMENT THREAD ===\n{thread}\n\n"
         "Return the JSON object now."
     )
+
+
+def _pick_repos(data: dict[str, Any], repos: list[dict[str, Any]]) -> list[str]:
+    """Resolve the model's `repos` against the candidates it was offered.
+
+    The model does not get to invent a repo: anything not in `repos` is
+    dropped. With a single candidate the model is not consulted at all --
+    there is nothing to choose, and letting a hallucinated key empty the list
+    would turn a routable ticket into a spurious `clarify`.
+    """
+    valid = {str(r["key"]) for r in repos}
+    if len(valid) <= 1:
+        return [str(r["key"]) for r in repos]
+    raw = data.get("repos") or []
+    if isinstance(raw, str):        # a model that answered with a bare string
+        raw = [raw]
+    picked = [k for k in (str(x) for x in raw) if k in valid]
+    seen: set[str] = set()
+    out = [k for k in picked if not (k in seen or seen.add(k))]
+    if not out:
+        log.warning("triage returned no usable repo from %s; offered %s", raw, sorted(valid))
+    return out
 
 
 def hard_rule_violation(task: Task, patterns: list[str],
@@ -102,7 +139,14 @@ def hard_rule_violation(task: Task, patterns: list[str],
 
 
 def triage(agent: CodingAgent, task: Task, comments: list[Comment],
-           repo: dict[str, Any] | None, policy: dict[str, Any]) -> tuple[TriageResult, float]:
+           repos: list[dict[str, Any]] | dict[str, Any] | None,
+           policy: dict[str, Any]) -> tuple[TriageResult, float]:
+    # Callers used to pass a single repo dict (or None). Accept both shapes so
+    # a stale caller routes to one repo instead of failing obscurely.
+    if repos is None:
+        repos = []
+    elif isinstance(repos, dict):
+        repos = [repos]
     patterns = policy.get("denylist_patterns") or DEFAULT_DENYLIST
     hit = hard_rule_violation(task, patterns, comments)
     if hit:
@@ -111,11 +155,11 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
             reasoning=f"Blocked by policy rule /{hit}/ — this class of change is never automated.",
             hints=["A human must scope and verify this change."],
             risk_flags=["policy-denylist"],
-        ), 0.0
+        ), Spend()
 
-    res = agent.reason(_build_prompt(task, comments, repo))
+    res = agent.reason(_build_prompt(task, comments, repos))
     if not res.ok:
-        raise StationError(f"triage agent failed: {res.error}", res.cost_usd)
+        raise StationError(f"triage agent failed: {res.error}", Spend.of(res))
     data = parse_json_object(res.text)
 
     out = TriageResult(
@@ -128,14 +172,16 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
         risk_flags=[str(x) for x in data.get("risk_flags", [])],
         plan=[str(x) for x in data.get("plan", [])],
         acceptance_criteria=[str(x) for x in data.get("acceptance_criteria", [])],
-        repo_key=repo["key"] if repo else None,
+        repo_keys=_pick_repos(data, repos),
     )
 
     # Post-conditions the model does not get to override.
     min_conf = float(policy.get("min_execute_confidence", 0.75))
     if out.decision == "execute":
-        if repo is None:
-            out.decision, out.reasoning = "clarify", "No repository mapped to this list."
+        if not out.repo_keys:
+            out.decision = "clarify"
+            out.reasoning = ("No repository mapped to this list." if not repos else
+                             "Could not tell which repository this ticket belongs in.")
             out.questions = out.questions or ["Which repository should this change land in?"]
         elif out.confidence < min_conf:
             out.decision = "clarify"
@@ -145,4 +191,4 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
             out.decision = "clarify"
             out.questions = out.questions or [
                 "This looks large. Can it be split into smaller, independently shippable tickets?"]
-    return out, res.cost_usd
+    return out, Spend.of(res)

@@ -110,6 +110,86 @@ hand when that happens.
 | `agent.reviewer_model` | model for the independent review pass; falls back to `agent.model` |
 | `agent.planner_tools` | tools available to the analyst station; read-only by construction, which is what makes planning safe in `mode: shadow` |
 | `agent.reviewer_tools` | tools available to the reviewer station; the repo's own `test` command is appended at call time |
+| `limits.daily_tokens` | daily token ceiling; `0` (default) disables it. See *Two daily limits* below |
+| `agent.max_log_bytes` | cap on one run's JSONL event log under `runner.log_dir` |
+| `agent.triage_dir` | the empty directory triage runs in (default `~/.ai-runner/triage`) |
+| `agent.isolate_triage` | `false` lets triage inherit the launch directory's context again |
+
+## Two daily limits, because dollars are the wrong unit
+
+`claude -p` bills exactly like an interactive session — the auth decides, not the flag.
+With a claude.ai login the runner spends your **5-hourly/weekly subscription quota**, and
+the `total_cost_usd` the CLI reports is an API-*equivalent* price for work nobody is
+actually invoiced for. Gating only on `daily_budget_usd` therefore limits notional money
+while the constraint that really stops you — the quota — goes unmeasured.
+
+So every run records tokens as well: input, output, cache-create and cache-read, summed.
+`limits.daily_tokens` gates on that sum the same way `daily_budget_usd` gates on dollars.
+Both are checked before *every* agent run, not just at the top of a tick, and whichever
+trips first stops the tick with a message saying which.
+
+To calibrate: a trivial one-turn run measured **40,156 tokens and $0.032** — the cache-read
+tokens dominate. On a subscription the dollar limit will essentially never fire on its own,
+so if you want a real ceiling, set `daily_tokens`. On an `ANTHROPIC_API_KEY` the dollar
+figure is the true one and you can leave `daily_tokens: 0`.
+
+`ai-task-runner status` prints both per row.
+
+## Triage does not read your repos — now actually
+
+Triage is meant to classify a ticket from its text alone. It used to run with no working
+directory of its own, which meant it inherited whatever directory you launched the runner
+from — and `claude` loads that directory's `CLAUDE.md`, settings, skills, MCP tool
+definitions and git state into the system prompt before it reads a word of your prompt.
+`--allowedTools ""` stops the model *acting* on a repo; it never stopped it being handed
+one.
+
+Asked "what project is your working directory?", triage launched from this repo used to
+recite this repo's `CLAUDE.md`. It now answers `NO PROJECT CONTEXT`.
+
+Triage therefore runs in `agent.triage_dir` — a fixed empty directory — with MCP servers,
+skills and settings sources switched off. Fixed rather than a fresh temp directory because
+the cwd is part of the system prompt, so a path that changes every call would miss the
+prompt cache every call. On one ticket-shaped prompt this took a triage call from ~46k
+tokens to ~32k, but the reason to do it is correctness, not cost.
+
+`work()` is **not** isolated, deliberately: the target repository's own `CLAUDE.md` is
+exactly the context the implementer, analyst and reviewer need.
+
+Set `agent.isolate_triage: false` to go back to the old behaviour.
+
+## What happens when a run is killed
+
+Agent runs are supervised rather than simply waited on:
+
+- The agent leads its own **process group**, and a timeout kills the group — SIGTERM, then
+  SIGKILL. Python's own `subprocess` timeout kills only the process it launched, which
+  leaves Claude Code's bash invocations, MCP servers and subagents alive, still holding the
+  worktree and still spending quota. The group is also reaped on the normal exit path.
+- Output is streamed to a **JSONL event log** under `runner.log_dir` as it is produced and
+  flushed per event, so a run that is killed still leaves a readable record — and you can
+  `tail -f` a run in flight. It is bounded by `agent.max_log_bytes`; at the cap it records
+  that it stopped rather than dropping the file or stalling the agent.
+- **stdin is closed.** `claude -p` reads a non-TTY stdin and appends it to the prompt, so
+  an inherited stdin quietly feeds the agent whatever is on it — a pipe, a heredoc, or a
+  terminal it then waits on forever. The prompt is passed in argv.
+- The child gets a **sanitised environment**: inherited `GIT_DIR` / `GIT_WORK_TREE` /
+  `GIT_INDEX_FILE` are stripped (they would silently point the agent's `git` at a different
+  repository), and `AI_TASK_RUNNER_RUN_ID` is set so a nested agent can tell it is already
+  inside a managed run.
+
+## Credentials never reach a ticket
+
+Escalation comments, `last_error` values and the event log all carry raw subprocess output,
+and a ticket comment is permanent and workspace-visible. Everything on those paths is
+scrubbed by `runner/redact.py`, which matches both credential *shapes* (`ghp_`,
+`github_pat_`, `sk-ant-`, `ATATT`, `pk_N_`, bearer headers, and `user:pass@host` inside a
+git remote URL) and the *exact values* of the tokens the runner injects — including a
+custom `token_env: GH_TOKEN_ACME`, found by env var name.
+
+Patterns are deliberately narrow. A greedy rule would eat branch names and SHAs, and an
+unreadable escalation comment just sends you off to run the failing command by hand with
+the same credentials.
 
 ## Multiple workspaces, providers and GitHub accounts
 
@@ -136,6 +216,40 @@ The profile also sets `GIT_SSH_COMMAND` and `GIT_AUTHOR_*`, so the right key is
 used for push and commits are attributed to the right identity, regardless of
 your global git config.
 
+## One ticket, several repos
+
+A ClickUp list usually maps to one repo. A Jira project routinely covers a backend
+and a frontend with nothing in the ticket to tell them apart — so **triage routes**.
+List every repo under the source with the same `containers:` value, and triage is
+shown each one's `key`, `language` and `notes` and picks the ones that need a change:
+
+```yaml
+repos:
+  - key: shop-api
+    containers: ["EPD"]
+    language: "Go 1.24 REST API"
+    notes: "Endpoints, business rules, persistence, background jobs."
+  - key: shop-web
+    containers: ["EPD"]
+    language: "Next.js 15 + React 19 + TypeScript"
+    notes: "Pages, components, forms, client-side state, styling."
+```
+
+Routing is only as good as those two fields. They are the entire basis for the
+decision — triage never reads the repo.
+
+A feature that genuinely spans both gets **one row per repo**: separate branch,
+worktree, PR, review cycle and brain file, advancing independently. What they share
+is the ticket's single AI State field, which shows the **least advanced** of the rows
+— so it reads `in-progress` while either repo still has work, and only reaches `done`
+once both PRs have merged. A row that gets blocked or escalated outranks the other's
+progress, so a problem in one repo surfaces immediately. Comments name their repo.
+
+The provider's own workflow status (`done_status` and friends) is gated the same way:
+the first PR to merge will not close the ticket while the second is still open.
+
+Each repo costs one `max_active_tasks` slot, because each is a real agent run.
+
 ## Reassignment and multiple laptops
 
 Each developer's SQLite is local, so the AI State field is the only shared state.
@@ -146,14 +260,33 @@ comment, and stops. Clearing the field re-triages from scratch.
 
 ## Install
 
+Every machine that runs a tick needs all of these on `PATH`:
+
+| Needs | Why | Check |
+|---|---|---|
+| Python ≥ 3.10 | the runner itself | `python3 -V` |
+| `git` | worktrees, commits, push | `git --version` |
+| `gh` | every PR operation | `gh --version` |
+| `claude` | the coding agent | `claude --version` |
+| `bash` | each repo's `setup:` runs as `bash -lc` | `bash --version` |
+| each repo's own toolchain | `setup:` and `test:` really execute | `pnpm -v`, `go version`, … |
+
 ```bash
-pipx install -e .          # or: pip install -e .
+python3 -m venv .venv && .venv/bin/pip install -e .   # or: pipx install -e .
 cp config.example.yaml config.yaml
 export CLICKUP_TOKEN=pk_xxx GH_TOKEN_WORK=ghp_xxx
-gh auth login              # GitHub CLI, used for all PR operations
-claude auth status         # each dev uses their own Claude login
+gh auth login              # or skip it and set GH_TOKEN_* per vcs_profile
+claude auth status         # must report an authenticated identity
 ai-task-runner doctor      # checks every source, profile and repo
 ```
+
+A venv rather than a bare `pip install` because Debian/Ubuntu ship PEP 668
+`externally-managed-environment` and will refuse the system-wide install.
+
+`doctor` is the gate, not a formality: it validates the transition table, every
+`vcs_profile`'s auth, every provider credential, the repo mapping, and — on a
+ClickUp `custom_field` source — that every `AIState` has a dropdown option.
+Schedule nothing until it exits 0.
 
 ## Run
 
@@ -167,12 +300,18 @@ python3 tests_smoke.py                      # offline state-machine tests
 
 ## Schedule
 
-One job every 15 minutes. Phase gating lives in `config.yaml`, not in cron.
+One job every 15 minutes. Phase gating lives in `config.yaml`, not in the
+scheduler, so the schedule itself is deliberately dumb.
 
-**macOS / Linux**
+**macOS / Linux** — through a wrapper, never a bare command. Cron gets a
+near-empty environment and reads neither `.profile` nor `.bashrc`, so `claude`
+and `gh` are off `PATH` and every `${VAR}` in `config.yaml` is unset:
+
 ```cron
-*/15 * * * * cd /opt/ai-task-runner && /usr/local/bin/ai-task-runner run >> /var/log/ai-runner.log 2>&1
+*/15 * * * * $HOME/.ai-runner/run.sh run >> $HOME/.ai-runner/logs/cron.log 2>&1
 ```
+
+The wrapper is in *Deploy on a VPS* below — it is identical on a laptop.
 
 **Windows**
 ```powershell
@@ -184,6 +323,250 @@ schtasks /create /tn "ai-task-runner" /sc minute /mo 15 ^
 ```bash
 ai-task-runner daemon --interval 900
 ```
+
+On a Linux server, prefer a systemd timer over both — the next section.
+
+## Deploy on a VPS
+
+A server is the natural home for this: nothing sleeps, nothing closes, and the
+time windows finally mean what they say. The runner itself does not change — it
+is still tick-and-exit — but a headless box exposes every assumption a laptop
+quietly satisfied: an interactive login, a populated `PATH`, your timezone, your
+SSH agent, your shell profile. The steps below are in dependency order; the
+table at the end is what each skipped step looks like when it fails.
+
+**Run exactly one runner per source.** The AI State field is the only shared
+state, so a second runner that meets a ticket marked in-flight with no local row
+of its own will not adopt it: it marks it `blocked` and stops (see *Reassignment
+and multiple laptops*). Before the VPS takes over, let the laptop finish or drain
+whatever is in flight, then disable its schedule. Copying `state.db` over is the
+only way to keep an already-moving ticket moving.
+
+Sized for one runner: 2 vCPU, 4 GB RAM plus swap, and disk for a full checkout
+*and* a worktree per active task per repo — `node_modules` twice over adds up.
+Outbound 443 to `api.anthropic.com`, `github.com`, and your task manager
+(`api.clickup.com` / `*.atlassian.net`); outbound 22 to `github.com` as well if
+any `remote:` is an SSH URL.
+
+### 1. A user of its own
+
+```bash
+sudo adduser --disabled-password --gecos "" airunner
+sudo -u airunner -H bash -l
+```
+
+The agent runs each repo's `setup:` through `bash -lc` and holds `Write`/`Edit`
+on the worktree. Give it its own account, never root.
+
+### 2. Set the timezone
+
+```bash
+sudo timedatectl set-timezone Europe/Amsterdam   # yours, not the VPS default
+```
+
+`runner.days` and `runner.windows` are compared against naive local time. A VPS
+left on UTC runs your 06:30 triage window at whatever 06:30 UTC is for you, and
+`days:` rolls over at the wrong midnight.
+
+### 3. Toolchain
+
+```bash
+sudo apt update && sudo apt install -y python3-venv git curl
+# gh — from GitHub's own apt repo, the distro package lags badly
+sudo apt install -y gh          # see cli.github.com for the keyring setup
+# node, if any repo's setup:/test: needs it — system-wide, see step 7
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
+# the agent
+curl -fsSL https://claude.ai/install.sh | bash    # lands in ~/.local/bin/claude
+```
+
+### 4. Authenticate Claude headlessly
+
+`claude auth login` wants a browser, which a VPS does not have. Two ways round it:
+
+| | How | Bills |
+|---|---|---|
+| Subscription | run `claude setup-token` **on your laptop**, put the token in `CLAUDE_CODE_OAUTH_TOKEN` on the VPS | your 5-hourly/weekly quota, competing with your own Claude Code use |
+| API credits | `ANTHROPIC_API_KEY` + `CLAUDE_CODE_SIMPLE=1` | pay-as-you-go, and `limits.daily_budget_usd` finally gates real money |
+
+`doctor` warns when `ANTHROPIC_API_KEY` is unset for exactly this reason: on
+subscription auth the `total_cost_usd` the CLI reports is an API-*equivalent*
+number, so the budget limit is gating spend nobody pays while the real
+constraint — your quota — goes untracked. `CLAUDE_CODE_SIMPLE=1` makes a missing
+key fail loudly instead of silently falling back to the subscription.
+
+### 5. Git identities
+
+Each `vcs_profile` needs its credentials present on the VPS:
+
+* `token_env:` — mint a PAT (scope `repo`) for that GitHub account and export it.
+  This is what `gh pr create` uses. Never `gh auth switch`: it mutates global
+  state and races.
+* `ssh_key:` — copy the private key over, `chmod 600`, and copy any matching
+  `Host` block from your laptop's `~/.ssh/config`. `profile_env()` sets
+  `GIT_SSH_COMMAND` with `IdentitiesOnly=yes` and
+  `StrictHostKeyChecking=accept-new`, so first contact needs no `known_hosts`
+  seeding — but a remote written against an SSH alias
+  (`git@github.com-acme:org/repo.git`) still resolves that alias through
+  `~/.ssh/config`, and without the block the clone fails with a DNS error.
+
+Verify each one before going further:
+
+```bash
+GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_work -o IdentitiesOnly=yes" \
+  ssh -T git@github.com          # must greet the account you expect
+GH_TOKEN=$GH_TOKEN_WORK gh auth status
+```
+
+### 6. Config
+
+```bash
+sudo install -d -o airunner -g airunner /opt/ai-task-runner
+git clone <this repo> /opt/ai-task-runner && cd /opt/ai-task-runner
+python3 -m venv .venv && .venv/bin/pip install -e .
+cp config.example.yaml config.yaml
+```
+
+These are per-machine, and silently wrong if you copy a laptop's `config.yaml`:
+
+| Key | Why |
+|---|---|
+| `runner.id` | lease ownership; two machines sharing an id can steal each other's rows |
+| `repos[].path` | `/Users/you/code/x` does not exist on Linux |
+| `runner.work_dir`, `db_path`, `log_dir`, `brain_dir` | must live on a disk the service user owns |
+| `runner.mode` | start at `shadow` on a new host, whatever the laptop was on |
+
+### 7. Secrets, in a file the scheduler can read
+
+```bash
+install -m 700 -d ~/.ai-runner
+cat > ~/.ai-runner/env <<'EOF'
+CLICKUP_TOKEN=pk_xxx
+JIRA_EMAIL=you@example.com
+JIRA_TOKEN=xxx
+GH_TOKEN_WORK=ghp_xxx
+CLAUDE_CODE_OAUTH_TOKEN=xxx
+EOF
+chmod 600 ~/.ai-runner/env
+```
+
+`Config.load` raises on the first unset `${VAR}`, so a tick with a half-loaded
+environment fails immediately rather than half-working — which is the good news:
+the failure mode is loud. Note the file has no `export` keywords; systemd's
+`EnvironmentFile=` parses `KEY=value` only and does not run a shell.
+
+`bash -lc` — which is how each repo's `setup:` runs — sources `~/.profile`, and
+on Debian `~/.bashrc` returns immediately for non-interactive shells. So a
+`nvm`/`fnm` line living in `~/.bashrc` is invisible to the agent and
+`pnpm install` dies with "command not found". Install node system-wide, or put
+the `PATH` export in `~/.profile` above the interactive guard.
+
+### 8. Prove it works before scheduling it
+
+```bash
+set -a; . ~/.ai-runner/env; set +a
+cd /opt/ai-task-runner
+.venv/bin/ai-task-runner doctor              # must exit 0
+.venv/bin/ai-task-runner run --dry-run --force
+.venv/bin/python3 tests_smoke.py             # offline state-machine tests
+```
+
+### 9. A systemd timer
+
+Preferred over cron on a VPS: it takes the env file directly, it will not start
+a second tick on top of one still running, and `journalctl` beats a stray log file.
+
+`/etc/systemd/system/ai-task-runner.service`:
+
+```ini
+[Unit]
+Description=ai-task-runner — one tick
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=airunner
+WorkingDirectory=/opt/ai-task-runner
+EnvironmentFile=/home/airunner/.ai-runner/env
+Environment=PATH=/home/airunner/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/ai-task-runner/.venv/bin/ai-task-runner run -c /opt/ai-task-runner/config.yaml
+TimeoutStartSec=3600
+```
+
+`TimeoutStartSec` has to clear `limits.agent_timeout_minutes` (45 by default)
+with room to spare — systemd's 90-second default would kill a tick in the middle
+of an agent run. `PATH` is explicit because a unit inherits almost nothing:
+without it `claude` is not found and `ClaudeCodeAgent.__init__` raises before any
+work starts.
+
+`/etc/systemd/system/ai-task-runner.timer`:
+
+```ini
+[Unit]
+Description=ai-task-runner every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*:0/15
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-task-runner.timer
+systemctl list-timers ai-task-runner.timer
+sudo systemctl start --no-block ai-task-runner.service   # one tick, by hand
+journalctl -u ai-task-runner -f
+```
+
+Cron instead, if you prefer it — but it needs a wrapper, because cron gets a
+near-empty environment and reads neither `.profile` nor `.bashrc`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+set -a; . "$HOME/.ai-runner/env"; set +a
+cd /opt/ai-task-runner
+exec /opt/ai-task-runner/.venv/bin/ai-task-runner "$@"
+```
+
+```cron
+*/15 * * * * $HOME/.ai-runner/run.sh run >> $HOME/.ai-runner/logs/cron.log 2>&1
+```
+
+### 10. Keep an eye on it
+
+```bash
+set -a; . ~/.ai-runner/env; set +a           # `status` still loads config.yaml
+/opt/ai-task-runner/.venv/bin/ai-task-runner status -c /opt/ai-task-runner/config.yaml
+journalctl -u ai-task-runner --since today | grep '"lvl":"ERROR"'
+du -sh ~/.ai-runner/work/*                   # worktrees are not free
+```
+
+Logs are JSON lines, one `runner.log` in `runner.log_dir` plus whatever the
+scheduler captures. Rotate them — `/etc/logrotate.d/ai-runner` with `weekly`,
+`rotate 8`, `compress`, `copytruncate` is enough. Nothing prunes worktrees except
+the pipeline itself, so watch the disk for the first few weeks.
+
+### What breaks first
+
+| Symptom | Cause |
+|---|---|
+| `Config references unset env var CLICKUP_TOKEN` | the scheduler never saw your env file |
+| `` `claude` not found on PATH `` | `~/.local/bin` missing from the unit's `PATH` |
+| `doctor` reports `git`/`gh` missing | same, for a cron run without a wrapper |
+| nothing happens, ever | VPS on UTC and `runner.windows` in your local time — or it is Saturday and `runner.days` excludes it |
+| in-flight tickets all go to `blocked` on the first tick | they were started elsewhere and this host has no local row, so `_orphan()` refuses to adopt them — drain the old host first, or copy its `state.db` |
+| two hosts fighting over the same row | both configs carry the same `runner.id`, so each satisfies the other's lease |
+| `Permission denied (publickey)` on push | key not copied, wrong mode, or an SSH alias missing from `~/.ssh/config` |
+| `pnpm: command not found` inside `setup:` | node installed via `nvm` in `~/.bashrc`, which `bash -lc` never reads |
+| the unit is killed mid-run at 90s | `TimeoutStartSec` left at the systemd default |
 
 ## Rollout
 
@@ -234,6 +617,19 @@ human must act on are mirrored to labels (`ai:needs-input`, `ai:human-only`,
 
 One JQL trap the provider handles for you: `labels NOT IN ("no-ai")` silently
 drops issues that have **no labels at all**. The `IS EMPTY` branch is required.
+
+`skip_labels` is the opt-out; `require_labels` is the opt-in. Set the latter and
+the runner only triages issues carrying **all** of those labels — useful when a
+non-engineer files the tickets and a developer breaks them into runner-sized
+leaves by hand:
+
+```yaml
+require_labels: ["ai-ready"]
+```
+
+It gates `fetch_candidates()`, which feeds new triage only. In-flight tickets are
+re-read by key each tick, so removing the label from a ticket the runner already
+picked up will not strand it — add `no-ai` or unassign it to stop one mid-flight.
 
 ## Security notes
 

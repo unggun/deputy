@@ -40,6 +40,10 @@ class JiraProvider(TaskProvider):
         self.ready_status = str(cfg.get("ready_status", "To Do"))
         self.projects = [str(p) for p in cfg.get("projects", [])]
         self.skip_labels = [str(x) for x in cfg.get("skip_labels", ["no-ai"])]
+        # Opt-IN gate. Empty (the default) means "every ready ticket assigned to
+        # me is a candidate". Set it when a non-engineer files the epics and a
+        # human breaks them down by hand: only the leaves they mark are picked up.
+        self.require_labels = [str(x) for x in cfg.get("require_labels", [])]
         self.s = requests.Session()
         self.s.auth = HTTPBasicAuth(str(cfg["email"]), str(cfg["token"]))
         self.s.headers.update({"Accept": "application/json",
@@ -65,6 +69,13 @@ class JiraProvider(TaskProvider):
                  "resolution = EMPTY"]
         if self.projects:
             parts.append("project IN (" + ", ".join(f'"{p}"' for p in self.projects) + ")")
+        if self.require_labels:
+            # AND, not IN: every label listed must be present, so extra entries
+            # narrow the funnel rather than widening it. Note this gates triage
+            # only — fetch_candidates() feeds new tickets, while in-flight rows
+            # are re-read by key, so pulling the label off a ticket the runner
+            # already picked up does not strand it mid-PR.
+            parts.extend(f'labels = "{x}"' for x in self.require_labels)
         if self.skip_labels:
             # NOTE: `labels NOT IN (...)` alone silently drops issues with no
             # labels at all. The IS EMPTY branch is required, not optional.

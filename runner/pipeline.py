@@ -15,6 +15,7 @@ from .config import Config, Source
 from .jsonio import StationError
 from .models import AIState, AnalysisResult, ReviewResult, Task, TriageResult
 from .providers.base import TaskProvider
+from .redact import redact
 from .state import Store
 from .triage import triage
 
@@ -53,11 +54,30 @@ class Pipeline:
         self.acfg = cfg.get("agent", {}) or {}
         self.brain_root = cfg.path("runner.brain_dir", "~/.ai-runner/brain")
         self.pcfg = source.provider
+        # Lazily gathered on first use: building it touches every vcs
+        # profile, and a shadow-mode tick may never need one.
+        self._secrets: list[str] | None = None
 
     # --- source-scoped helpers ----------------------------------------
-    def _row_id(self, provider_task_id: str) -> str:
-        """Namespace task ids so two workspaces can't collide in one DB."""
-        return f"{self.source.key}:{provider_task_id}"
+    def _row_id(self, provider_task_id: str, repo_key: str | None = None) -> str:
+        """Namespace task ids so two workspaces can't collide in one DB.
+
+        Two shapes:
+          "{source}:{ticket}"            before triage has routed the ticket
+          "{source}:{ticket}#{repo}"     once it has
+
+        A ticket that needs a change in two repos gets two rows, each with its
+        own branch, worktree, PR, review cycle and attempt counter. `#` and not
+        `:` because comment idempotency keys are already "{rid}:{key}", and
+        `_pid` splits on `:`.
+
+        Rows written before per-repo fan-out existed carry the two-segment id
+        with a repo_key column and no `#`. They keep advancing unchanged --
+        `_advance` only ever uses `row["task_id"]`, and `rows_for_task` finds
+        them by (source, provider_task_id) regardless of id shape.
+        """
+        base = f"{self.source.key}:{provider_task_id}"
+        return f"{base}#{repo_key}" if repo_key else base
 
     def _env_for(self, repo: dict[str, Any]) -> dict[str, str]:
         return vcs.profile_env(self.cfg.profile_for_repo(repo))
@@ -84,10 +104,9 @@ class Pipeline:
             log.info("outside advance window, nothing to do")
             return
 
-        budget = float(self.limits.get("daily_budget_usd", 20))
-        spent = self.store.spend_since(_midnight_epoch(now))
-        if spent >= budget:
-            log.warning("daily budget exhausted (%.2f / %.2f USD)", spent, budget)
+        reason = self._limits_exceeded(now)
+        if reason:
+            log.warning("%s; nothing to do", reason)
             return
 
         # 1. Advance work already in flight (cheap first).
@@ -96,7 +115,8 @@ class Pipeline:
                 self._advance(row, now, windows)
             except Exception as exc:  # noqa: BLE001
                 log.exception("advance failed for %s", row["task_id"])
-                self.store.upsert(row["task_id"], last_error=str(exc)[:1000])
+                self.store.upsert(row["task_id"],
+                                  last_error=self._clean(str(exc))[:1000])
 
         # 2. Triage new tickets.
         if _in_window(now, windows.get("triage", [])):
@@ -109,17 +129,23 @@ class Pipeline:
         for task in self.provider.fetch_candidates():
             if n >= cap:
                 break
-            row_id = self._row_id(task.id)
-            local = self.store.get(row_id)
-            if local and local["state"] != AIState.NEW.value:
+            # One ticket can own several rows (one per repo), and their ids
+            # depend on a routing decision triage has not made yet -- so this
+            # has to be a lookup by ticket, not by row id.
+            rows = self.store.rows_for_task(self.source.key, task.id)
+            if any(r["state"] != AIState.NEW.value for r in rows):
                 continue
             if task.ai_state != AIState.NEW:
                 # The remote says work is under way but this machine has no record
                 # of it - it was started on another laptop, or reassigned to us.
-                if local is None and not task.ai_state.is_terminal:
+                if not rows and not task.ai_state.is_terminal:
                     self._orphan(task)
                 continue
             n += 1
+            # Placeholder row, keyed without a repo segment: it records that we
+            # have seen this ticket (and any triage crash) before triage has
+            # decided which repos it belongs to. `_route` retires it.
+            row_id = self._row_id(task.id)
             self.store.upsert(row_id, source=self.source.key,
                               provider_task_id=task.id,
                               task_key=task.key, title=task.title,
@@ -128,7 +154,7 @@ class Pipeline:
                 self._do_triage(task)
             except Exception as exc:  # noqa: BLE001
                 log.exception("triage failed for %s", task.key)
-                self.store.upsert(row_id, last_error=str(exc)[:1000])
+                self.store.upsert(row_id, last_error=self._clean(str(exc))[:1000])
 
     def _orphan(self, task: Task) -> None:
         """A ticket mid-flight on a machine that has no local state for it.
@@ -150,20 +176,73 @@ class Pipeline:
             f"the next run. Any existing branch or PR will need to be closed manually first.")
         self.provider.set_ai_state(task.id, AIState.BLOCKED)
 
+    def _candidate_repos(self, task: Task) -> list[dict[str, Any]]:
+        """Repos triage is allowed to choose between for this ticket.
+
+        On a re-triage (a human answered a question, or rejected a plan) the
+        ticket already has rows, and those rows may already own branches and
+        worktrees. Re-running the routing decision could strand them, so an
+        already-routed ticket keeps its repos and triage only re-judges the
+        work itself.
+        """
+        assigned = [r["repo_key"] for r in self.store.rows_for_task(self.source.key, task.id)
+                    if r.get("repo_key")]
+        if assigned:
+            keep = [self.source.repo_by_key(k) for k in dict.fromkeys(assigned)]
+            hits = [r for r in keep if r]
+            if hits:
+                return hits
+        return self.source.repos_for_container(task.list_id, task.list_name)
+
+    def _route(self, task: Task, repo_keys: list[str], meta: dict[str, Any],
+               state: AIState) -> None:
+        """Give the ticket one row per repo and move them all to `state`.
+
+        Rows for repos this ticket no longer needs are dropped, and the
+        pre-triage placeholder is retired, so `rows_for_task` afterwards
+        returns exactly the repos triage chose.
+        """
+        existing = {r["task_id"]: r for r in self.store.rows_for_task(self.source.key, task.id)}
+        # The placeholder may have been sitting in needs-input tracking where
+        # the human's reply landed; carry that forward so the routed rows do
+        # not re-read the whole thread as fresh.
+        seen_comment = next((r.get("last_seen_comment_id") for r in existing.values()
+                             if r.get("last_seen_comment_id")), None)
+        wanted: list[str] = []
+        for rk in repo_keys:
+            rid = self._row_id(task.id, rk)
+            # An older two-segment row already carrying this repo is reused as
+            # it stands: it may own a branch or a PR, and re-keying it would
+            # orphan both.
+            legacy = next((tid for tid, r in existing.items()
+                           if r.get("repo_key") == rk and "#" not in tid), None)
+            wanted.append(legacy or rid)
+            self.store.upsert(legacy or rid, source=self.source.key,
+                              provider_task_id=task.id, task_key=task.key,
+                              title=task.title, repo_key=rk,
+                              provider_updated_at=task.updated_at, meta=dict(meta),
+                              **({"last_seen_comment_id": seen_comment} if seen_comment else {}))
+        for tid in existing:
+            if tid not in wanted:
+                self.store.delete(tid)
+        for tid in wanted:
+            self._set(tid, state)
+
     def _do_triage(self, task: Task) -> None:
         rid = self._row_id(task.id)
         comments = self.provider.list_comments(task.id)
-        repo = self.source.repo_for_container(task.list_id, task.list_name)
+        repos = self._candidate_repos(task)
         try:
-            result, cost = triage(self.agent, task, comments, repo, self.policy)
+            result, spend = triage(self.agent, task, comments, repos, self.policy)
         except StationError as exc:
             # The agent run itself failed (not just an unparseable reply).
             # Record what it cost before this propagates to the generic
             # per-row handler in tick() — otherwise a failing triage run
             # spends money `daily_budget_usd` never finds out about.
-            self.store.record("triage", rid, f"failed: {exc}", exc.cost_usd)
+            self.store.record("triage", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
             raise
-        self.store.record("triage", rid, f"{result.decision} ({result.scope})", cost)
+        self.store.record("triage", rid, f"{result.decision} ({result.scope})",
+                          spend.cost_usd, spend.tokens)
         log.info("[%s] triage -> %s (conf %.2f)", task.key, result.decision, result.confidence)
 
         if result.decision == "human_only":
@@ -182,18 +261,23 @@ class Pipeline:
         meta = {"plan": result.plan, "acceptance_criteria": result.acceptance_criteria}
         gate = str(self.policy.get("require_plan_approval_from_scope", "m"))
         order = {"xs": 0, "s": 1, "m": 2, "l": 3}
+        if len(result.repo_keys) > 1:
+            log.info("[%s] spans %d repos: %s", task.key,
+                     len(result.repo_keys), ", ".join(result.repo_keys))
         if self.mode == "shadow" or order.get(result.scope, 2) >= order.get(gate, 2):
             # Mark this as a fresh entry into PLANNING so the arm below does
-            # not mistake a healthy first run for a crash recovery.
+            # not mistake a healthy first run for a crash recovery. Each repo
+            # gets its own analyst pass: the plan for the backend is not the
+            # plan for the frontend.
             meta["plan_pending"] = True
-            self.store.upsert(rid, repo_key=result.repo_key, meta=meta)
             # A human is going to read this plan, so ground it in the code
             # first. The plan comment is posted by _plan, not here.
-            self._set(rid, AIState.PLANNING)
+            self._route(task, result.repo_keys, meta, AIState.PLANNING)
         else:
-            self.store.upsert(rid, repo_key=result.repo_key, meta=meta)
-            self._comment(rid, "plan", _fmt_plan(result, shadow=False))
-            self._set(rid, AIState.QUEUED)
+            self._route(task, result.repo_keys, meta, AIState.QUEUED)
+            for rk in result.repo_keys:
+                self._comment(self._row_id(task.id, rk), "plan",
+                              _fmt_plan(result, shadow=False))
 
     # ==================================================================
     def _advance(self, row: dict[str, Any], now: dt.datetime,
@@ -343,7 +427,7 @@ class Pipeline:
             return
 
         env = self._env_for(repo)
-        branch = row["branch"] or vcs.branch_name(task.key, task.title)
+        branch = row["branch"] or vcs.branch_name(self.provider.branch_key(task), task.title)
         wt = vcs.ensure_worktree(repo, branch, self.work_root, env=env)
         self.store.upsert(rid, branch=branch)
 
@@ -359,7 +443,7 @@ class Pipeline:
         # idempotency claim in `_comment` still suppresses the duplicate.
         round_key = len(comments)
         try:
-            result, cost = analyst.analyse(
+            result, spend = analyst.analyse(
                 self.agent, task, comments, repo,
                 self._brain_block(repo["key"]), meta.get("acceptance_criteria", []),
                 cwd=wt,
@@ -368,9 +452,9 @@ class Pipeline:
                 log_path=self.log_root / f"{task.key}-plan.log",
             )
         except StationError as exc:
-            self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd)
+            self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
             raise
-        self.store.record("plan", rid, result.verdict, cost)
+        self.store.record("plan", rid, result.verdict, spend.cost_usd, spend.tokens)
         # The analyst produced output without crashing: this station's own
         # crash budget resets so the next station starts with a clean slate
         # instead of inheriting attempts spent recovering earlier crashes.
@@ -403,13 +487,17 @@ class Pipeline:
             return
         env = self._env_for(repo)
 
-        branch = row["branch"] or vcs.branch_name(task.key, task.title)
+        branch = row["branch"] or vcs.branch_name(self.provider.branch_key(task), task.title)
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
         revision = meta.get("revision")
 
         self.store.set_state(rid, AIState.IN_PROGRESS, branch=branch)
-        self.provider.set_ai_state(task.id, AIState.IN_PROGRESS)
-        self.provider.set_status(task.id, self._status("in_progress_status", "in progress"))
+        self._push_remote_state(rid)
+        # Only claim "in progress" on the board once no repo on this ticket is
+        # further back than that -- a second repo still queued means the ticket
+        # as a whole has not started.
+        self._set_status_when(rid, AIState.IN_PROGRESS,
+                              "in_progress_status", "in progress")
         if not revision:
             self._comment(rid, f"start-{branch}", f"Starting work on branch `{branch}`.")
 
@@ -424,7 +512,8 @@ class Pipeline:
             prompt = _work_prompt(task, repo, meta, brain_block)
         res = self.agent.work(prompt, wt,
                               log_path=self.log_root / f"{task.key}-implement.log")
-        self.store.record("implement", rid, res.error or "ok", res.cost_usd)
+        self.store.record("implement", rid, res.error or "ok", res.cost_usd,
+                          res.usage.total)
 
         if not res.ok:
             self._escalate(rid, f"Agent run failed: {res.error}")
@@ -465,7 +554,7 @@ class Pipeline:
 
         wt = vcs.ensure_review_worktree(repo, branch, self.work_root, env=env)
         try:
-            result, cost = review.review(
+            result, spend = review.review(
                 self.agent, task.key, meta.get("acceptance_criteria", []),
                 base, branch, meta.get("impl_summary", ""),
                 self._brain_block(repo["key"]),
@@ -475,9 +564,9 @@ class Pipeline:
                 log_path=self.log_root / f"{task.key}-review.log",
             )
         except StationError as exc:
-            self.store.record("review", rid, f"failed: {exc}", exc.cost_usd)
+            self.store.record("review", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
             raise
-        self.store.record("review", rid, result.verdict, cost)
+        self.store.record("review", rid, result.verdict, spend.cost_usd, spend.tokens)
         cycle = int(meta.get("review_cycle", 0))
 
         if result.verdict == "reject":
@@ -525,7 +614,7 @@ class Pipeline:
         )
         self.store.set_state(rid, AIState.PR_OPEN, pr_number=number,
                              pr_url=url, attempts=0)
-        self.provider.set_ai_state(task.id, AIState.PR_OPEN)
+        self._push_remote_state(rid)
         self._comment(rid, f"pr-{number}",
                       f"Review passed. Opened draft PR: {url}\n\n{result.summary}")
         # The row is already fully committed (state, PR, comment) — a failure
@@ -553,7 +642,6 @@ class Pipeline:
     def _poll_pr(self, row: dict[str, Any], now: dt.datetime,
                  windows: dict[str, Any]) -> None:
         rid, number = row["task_id"], int(row["pr_number"])
-        pid = row["provider_task_id"]
         repo = self.source.repo_by_key(row["repo_key"] or "")
         env = self._env_for(repo)
         wt = self.work_root / repo["key"] / vcs.slug(row["branch"], 60)
@@ -563,7 +651,9 @@ class Pipeline:
         st = vcs.pr_status(wt, number, env=env)
         if st["merged"]:
             self._set(rid, AIState.DONE)
-            self.provider.set_status(pid, self._status("done_status", "done"))
+            # Gated: on a two-repo ticket the first merge must not close the
+            # ticket out from under the second, still-open PR.
+            self._set_status_when(rid, AIState.DONE, "done_status", "done")
             self._comment(rid, f"merged-{number}", f"PR merged: {st['url']}")
             vcs.remove_worktree(repo, wt, env=env)
             return
@@ -577,13 +667,28 @@ class Pipeline:
         allowlist = (repo.get("reviewer_allowlist")
                      or profile.get("reviewer_allowlist")
                      or self.cfg.get("vcs.reviewer_allowlist", []) or [])
-        feedback = vcs.human_feedback(wt, number, allowlist, env=env)
+        meta = json.loads(row["meta"] or "{}")
+        # Only feedback newer than the last round we acted on. Without this a
+        # comment that needs no code change is re-read on every poll and runs
+        # the fix agent again, forever, at full agent cost per tick.
+        feedback = vcs.human_feedback(wt, number, allowlist,
+                                      since_iso=meta.get("feedback_seen_at"),
+                                      env=env)
+        approvals = vcs.approving_reactions(wt, number, allowlist, env=env)
         needs_fix = st["ci"] == "failing" or bool(feedback)
+
+        if approvals and not feedback and st["ci"] != "failing":
+            # Reviewed and approved by reaction alone. Say so once, then keep
+            # waiting for a merge rather than sitting mute or "fixing" nothing.
+            self._comment(rid, f"approved-{number}",
+                          "Reviewed with no changes requested "
+                          f"({', '.join('@' + a for a in approvals)}). "
+                          f"Waiting on merge: {st['url']}")
 
         if not needs_fix:
             if st["draft"] and st["ci"] in ("passing", "none"):
                 vcs.mark_ready(wt, number, env=env)
-                self.provider.set_status(pid, self._status("review_status", "code review"))
+                self._set_status_when(rid, AIState.PR_OPEN, "review_status", "code review")
                 self._comment(rid, f"ready-{number}",
                               f"Checks are green. PR is ready for review: {st['url']}")
             return
@@ -602,14 +707,31 @@ class Pipeline:
                              self._brain_block(repo["key"]))
         res = self.agent.work(prompt, wt,
                               log_path=self.log_root / f"{row['task_key']}-fix-{attempts}.log")
-        self.store.record("fix", rid, res.error or "ok", res.cost_usd)
+        self.store.record("fix", rid, res.error or "ok", res.cost_usd,
+                          res.usage.total)
+        # Second-precision and Z-suffixed to match GitHub's `createdAt`: these
+        # are compared as strings, and an isoformat() fraction sorts *before*
+        # a bare `Z`, which would let a same-second comment through forever.
+        meta["feedback_seen_at"] = dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
         if res.ok and vcs.commit_all(wt, f"{row['task_key']}: address review/CI feedback", env=env):
             vcs.push(wt, row["branch"], env=env)
             self._comment(rid, f"fix-{number}-{attempts}",
                           f"Pushed fixes (attempt {attempts}).\n\n{res.text[:1200]}")
-            self.store.upsert(rid, attempts=attempts)
+            self.store.upsert(rid, attempts=attempts, meta=meta)
+        elif res.ok:
+            # The agent ran cleanly and changed nothing, which means the
+            # feedback needed no code change -- an integration notice, a
+            # reviewer saying it looks fine, a question already answered.
+            # Escalating here blocks a perfectly healthy PR, so instead record
+            # the watermark and keep waiting. Only a crashed agent is a fault.
+            self.store.upsert(rid, meta=meta)
+            log.info("[%s] PR %d feedback needed no code change; still waiting",
+                     row["task_key"], number)
         else:
-            self._escalate(rid, f"Could not resolve feedback automatically: {res.error or 'no changes produced'}")
+            # Deliberately not recording the watermark: this feedback was not
+            # handled, and a human taking the row over should still see it.
+            self._escalate(rid, f"Could not resolve feedback automatically: {res.error}")
 
     # --- human reply detection -----------------------------------------
     def _check_for_human_reply(self, row: dict[str, Any], state: AIState) -> None:
@@ -660,46 +782,164 @@ class Pipeline:
                        row.get("task_key"), wt, exc_info=True)
 
     # --- helpers -------------------------------------------------------
+    def _limits_exceeded(self, now: dt.datetime) -> str | None:
+        """Which daily limit, if any, is spent. Returns a reason or None.
+
+        Two limits, because with a claude.ai login they measure different
+        things. `total_cost_usd` from the CLI is an API-*equivalent* price for
+        work that is actually drawn from the developer's 5-hourly/weekly
+        subscription quota — real money for an `ANTHROPIC_API_KEY` run,
+        notional for a subscription run. `daily_tokens` is denominated in the
+        same units as the quota, so it is the limit that bites on the setup
+        most people actually have. Whichever trips first stops the tick.
+        """
+        midnight = _midnight_epoch(now)
+        budget = float(self.limits.get("daily_budget_usd", 20))
+        spent = self.store.spend_since(midnight)
+        if spent >= budget:
+            return f"daily budget exhausted ({spent:.2f} / {budget:.2f} USD)"
+        cap = int(self.limits.get("daily_tokens", 0) or 0)
+        if cap:
+            used = self.store.tokens_since(midnight)
+            if used >= cap:
+                return f"daily token cap exhausted ({used:,} / {cap:,} tokens)"
+        return None
+
     def _budget_available(self, now: dt.datetime) -> bool:
         """Re-checked immediately before every agent run (analyst, implementer,
         reviewer, CI fix).
 
-        `tick()` checks `daily_budget_usd` once, before any work starts. But
-        one tick can run several of those agent passes across several rows —
+        `tick()` checks the daily limits once, before any work starts. But one
+        tick can run several of those agent passes across several rows —
         without a re-check here, spend recorded by an earlier row in the same
         tick is invisible until the *next* tick's top-of-tick gate, by which
-        point the budget may already be blown well past the configured cap.
+        point the limit may already be blown well past the configured cap.
         """
-        budget = float(self.limits.get("daily_budget_usd", 20))
-        spent = self.store.spend_since(_midnight_epoch(now))
-        if spent >= budget:
-            log.warning("[%s] daily budget exhausted mid-tick (%.2f / %.2f USD); "
-                       "deferring further agent runs to the next tick",
-                       self.source.key, spent, budget)
+        reason = self._limits_exceeded(now)
+        if reason:
+            log.warning("[%s] %s mid-tick; deferring further agent runs to "
+                        "the next tick", self.source.key, reason)
             return False
         return True
 
     def _pid(self, rid: str) -> str:
         row = self.store.get(rid) or {}
-        return str(row.get("provider_task_id") or rid.split(":", 1)[-1])
+        # The fallback has to drop the "#repo" segment too, or a missing row
+        # would address the provider with "EPD-101#shop-web".
+        return str(row.get("provider_task_id") or rid.split(":", 1)[-1].split("#", 1)[0])
+
+    # --- one ticket, several rows --------------------------------------
+    # Least-advanced-wins ordering for the single remote state field shared by
+    # every row of one ticket. A ticket is only `done` once every repo is; it
+    # reads `in-progress` while any repo still has work. Because each row moves
+    # forward independently, the minimum is the honest answer -- claiming
+    # `pr-open` while the other repo has not been written yet would be a lie to
+    # whoever is reading the board.
+    _PROGRESS = [AIState.NEW, AIState.NEEDS_INPUT, AIState.PLANNING,
+                 AIState.AWAITING_PLAN_OK, AIState.QUEUED, AIState.IN_PROGRESS,
+                 AIState.REVIEW, AIState.PR_OPEN, AIState.DONE]
+
+    def _sibling_rows(self, rid: str) -> list[dict[str, Any]]:
+        pid = self._pid(rid)
+        rows = self.store.rows_for_task(self.source.key, pid)
+        return rows or ([r] if (r := self.store.get(rid)) else [])
+
+    def _remote_state(self, rid: str) -> AIState:
+        """What the ticket's single AI State field should say right now.
+
+        With one row this is just that row's state, so the single-repo path is
+        byte-identical to what it was before fan-out existed.
+        """
+        rows = self._sibling_rows(rid)
+        states = []
+        for r in rows:
+            try:
+                states.append(AIState(r["state"]))
+            except ValueError:                      # unknown value in the DB
+                continue
+        if not states:
+            return AIState(self.store.get(rid)["state"])
+        # Anything needing a human outranks progress: surface it immediately
+        # rather than hiding it behind the other repo's healthy state.
+        for attention in (AIState.BLOCKED, AIState.HUMAN_ONLY):
+            if attention in states:
+                return attention
+        rank = {st: i for i, st in enumerate(self._PROGRESS)}
+        return min(states, key=lambda st: rank.get(st, 0))
+
+    def _push_remote_state(self, rid: str) -> None:
+        self.provider.set_ai_state(self._pid(rid), self._remote_state(rid))
+
+    def _set_status_when(self, rid: str, reached: AIState,
+                         name: str, default: str) -> None:
+        """Move the provider's own workflow status, but only once EVERY repo
+        on this ticket has reached `reached`.
+
+        Without the gate, the first repo to merge would flip a two-repo ticket
+        to the done status while the other PR was still open.
+        """
+        if self._remote_state(rid) is reached:
+            self.provider.set_status(self._pid(rid), self._status(name, default))
+
+    def _repo_tag(self, rid: str) -> str:
+        """`[repo] ` prefix for comments, only when the ticket spans repos."""
+        rows = self._sibling_rows(rid)
+        if len(rows) < 2:
+            return ""
+        row = self.store.get(rid) or {}
+        return f"`{row.get('repo_key') or '?'}` — " if row.get("repo_key") else ""
 
     def _set(self, rid: str, state: AIState) -> None:
         row = self.store.get(rid)
         if row:
             graph.check(AIState(row["state"]), state)
         self.store.set_state(rid, state)
-        self.provider.set_ai_state(self._pid(rid), state)
+        self._push_remote_state(rid)
 
     def _comment(self, rid: str, key: str, markdown: str) -> None:
+        """Post one comment, at most once ever.
+
+        Everything bound for a ticket goes through here, which makes this the
+        one place credential scrubbing has to happen. Comment bodies routinely
+        carry agent output, `git` stderr and `gh` stderr verbatim, and a
+        ticket comment is permanent and visible to the whole workspace.
+        """
         if not self.store.claim_comment(f"{rid}:{key}", rid):
             return
-        self.provider.add_comment(self._pid(rid), markdown)
+        body = self._clean(markdown)
+        self.provider.add_comment(self._pid(rid), f"{self._repo_tag(rid)}{body}")
 
     def _escalate(self, rid: str, reason: str) -> None:
+        reason = self._clean(reason)
         self.store.set_state(rid, AIState.BLOCKED, last_error=reason[:1000])
         pid = self._pid(rid)
-        self.provider.set_ai_state(pid, AIState.BLOCKED)
-        self.provider.add_comment(pid, f"**Escalated to a human.**\n\n{reason}")
+        self._push_remote_state(rid)
+        self.provider.add_comment(
+            pid, f"{self._repo_tag(rid)}**Escalated to a human.**\n\n{reason}")
+
+    def _clean(self, text: str) -> str:
+        """Scrub credentials out of text on its way to a ticket or the store.
+
+        `extra` is every token this runner injects into a subprocess
+        environment, gathered across all configured vcs profiles: those are
+        the exact values most likely to come back out of a failing `git push`
+        or `gh` call, and an exact-value match catches formats the shape
+        patterns in `redact` do not know about.
+        """
+        return redact(text, self._known_secrets())
+
+    def _known_secrets(self) -> list[str]:
+        if self._secrets is None:
+            found: list[str] = []
+            for repo in self.source.repos:
+                try:
+                    found.extend(self._env_for(repo).values())
+                except Exception:  # noqa: BLE001
+                    # A profile with a missing token env var is `doctor`'s
+                    # problem. Redaction must never be the thing that raises.
+                    continue
+            self._secrets = sorted(set(found), key=len, reverse=True)
+        return self._secrets
 
 
 def _matches_any(body: str, keywords: list[str]) -> bool:

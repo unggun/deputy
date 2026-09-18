@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import os
 import sys
@@ -14,10 +15,21 @@ for k in ["CLICKUP_TOKEN", "CLICKUP_TOKEN_SIDE", "JIRA_EMAIL", "JIRA_TOKEN", "GH
 sys.path.insert(0, str(Path(__file__).parent))
 
 from runner.config import Config
-from runner.models import AgentResult, AIState, Comment, ReviewResult, Task
+from runner.models import (AgentResult, AIState, Comment, ReviewResult,
+                           Spend, Task, TokenUsage)
 from runner.pipeline import Pipeline
 from runner.providers.base import TaskProvider
 from runner.state import Store
+
+
+def rid(task_key: str, repo: str = "pulse-backend") -> str:
+    """Row id as the pipeline builds it: "{source}:{ticket}#{repo}".
+
+    Triage routes a ticket to one or more repos and gives each its own row, so
+    the id is only knowable after routing. Tests that pre-seed a row by hand
+    keep the older two-segment id on purpose -- that path still has to work.
+    """
+    return f"mycorp:{task_key}#{repo}"
 
 
 class FakeProvider(TaskProvider):
@@ -176,13 +188,13 @@ with tempfile.TemporaryDirectory() as tmp:
 
         prov.human_reply("T7", "approved, go ahead")
         pipe.tick(when)
-        q_ok = store.get("mycorp:T7")["state"] == AIState.QUEUED.value
+        q_ok = store.get(rid("T7"))["state"] == AIState.QUEUED.value
         print(f"  {'PASS' if q_ok else 'FAIL':<5} 'approved' moves plan-review -> queued")
         results.append(q_ok)
 
         # shadow mode must never execute
         pipe.tick(when)
-        ex_ok = store.get("mycorp:T7")["state"] == AIState.QUEUED.value
+        ex_ok = store.get(rid("T7"))["state"] == AIState.QUEUED.value
         print(f"  {'PASS' if ex_ok else 'FAIL':<5} shadow mode never executes")
         results.append(ex_ok)
     finally:
@@ -224,6 +236,32 @@ with tempfile.TemporaryDirectory() as tmp:
                       ("inside triage window: acts", w3)]:
         print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
         results.append(ok)
+
+# --- clickup branch key -----------------------------------------------------
+print("\nclickup branch key")
+from runner.providers.clickup import ClickUpProvider
+from runner import vcs as _V
+
+def _cu_task(tid, key, raw):
+    return Task(id=tid, key=key, title="Add CSV export", description="", status="ready",
+                url="", list_id="1", list_name="L", tags=[], assignee_ids=["me"],
+                updated_at=0, ai_state=AIState.NEW, raw=raw)
+
+# Unbound on purpose: branch_key touches no instance state, so this stays offline.
+c1 = ClickUpProvider.branch_key(None, _cu_task("86abc1234", "86abc1234",
+                                               {"id": "86abc1234"})) == "CU-86abc1234"
+# A Custom Task ID is what ClickUp matches verbatim; it must not gain a prefix.
+c2 = ClickUpProvider.branch_key(None, _cu_task("86abc1234", "DEV-1234",
+                                               {"id": "86abc1234",
+                                                "custom_id": "DEV-1234"})) == "DEV-1234"
+c3 = _V.branch_name(ClickUpProvider.branch_key(None, _cu_task(
+    "86abc1234", "86abc1234", {"id": "86abc1234"})), "Add CSV export"
+    ) == "ai/CU-86abc1234-add-csv-export"
+for label, ok in [("native clickup id gets the CU- prefix", c1),
+                  ("custom task id is used verbatim", c2),
+                  ("prefix survives into the branch name", c3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
 
 # --- graph structure --------------------------------------------------------
 print("\nworkflow graph")
@@ -382,13 +420,19 @@ else:
                                               env=env).resolve() == rv.resolve()
 
         bn = vcs.branch_name("DEV-12", "Add CSV export to reports")
-        bn_ok = bn.startswith("ai/dev-12-") and " " not in bn
+        bn_ok = bn.startswith("ai/DEV-12-") and " " not in bn and bn.endswith(
+            "-add-csv-export-to-reports")
+        # A ClickUp native id only links back to the task with the `CU-` prefix,
+        # and the prefix has to survive slugging.
+        cu = vcs.branch_name("CU-86abc1234", "Add CSV export")
+        cu_ok = cu.startswith("ai/CU-86abc1234-")
 
         for label, ok in [("review worktree holds the pushed commit", rv_sha == sha),
                           ("review worktree is detached", rv_head),
                           ("review worktree is separate from the impl worktree", rv_apart),
                           ("re-running review checkout is idempotent", rv_again),
-                          ("branch_name slugs key and title", bn_ok)]:
+                          ("branch_name slugs key and title", bn_ok),
+                          ("branch_name keeps the ticket key's case", cu_ok)]:
             print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
             results.append(ok)
 
@@ -416,24 +460,63 @@ else:
 print("\nagent seams")
 import runner.agents.claude_code as CC
 
-class _Proc:
-    returncode = 0
-    stderr = ""
-    stdout = json.dumps({"result": "{}", "total_cost_usd": 0.0,
-                         "num_turns": 1, "duration_ms": 1})
+_RESULT = {"type": "result", "subtype": "success", "result": "{}",
+           "total_cost_usd": 0.0, "num_turns": 1, "duration_ms": 1,
+           "usage": {"input_tokens": 10, "output_tokens": 5,
+                     "cache_creation_input_tokens": 2,
+                     "cache_read_input_tokens": 3}}
+
+
+class _FakeProc:
+    """Stands in for a finished `claude` process.
+
+    `poll()` reports an exit code from the start, which is what keeps
+    `_kill_tree` out of the picture: a fake with a live-looking pid would send
+    SIGTERM to this test process's own group.
+    """
+
+    def __init__(self, cmd, stdout_text="", returncode=0, stderr_text=""):
+        self.args = cmd
+        self.returncode = returncode
+        self.pid = -1
+        self.stdout = io.StringIO(stdout_text)
+        self.stderr = io.StringIO(stderr_text)
+
+    def wait(self, timeout=None): return self.returncode
+    def poll(self): return self.returncode
+    def kill(self): pass
+
+
+def _fake_stdout(cmd):
+    """What the real CLI would print for this argv."""
+    fmt = cmd[cmd.index("--output-format") + 1] if "--output-format" in cmd else "json"
+    if fmt == "stream-json":
+        return ("".join(json.dumps(e) + "\n" for e in
+                        [{"type": "system", "subtype": "init"},
+                         {"type": "assistant", "message": {"content": "..."}}])
+                + json.dumps(_RESULT) + "\n")
+    return json.dumps({k: v for k, v in _RESULT.items() if k != "type"})
+
+
+def _stub_popen(sink, stdout_for=_fake_stdout, returncode=0, stderr_text=""):
+    def popen(cmd, **kw):
+        sink.append((cmd, kw))
+        return _FakeProc(cmd, stdout_for(cmd), returncode, stderr_text)
+    return popen
+
 
 def _capture(cfg, **work_kwargs):
-    """Run reason() and work() with subprocess stubbed; return both argv lists."""
+    """Run reason() and work() with Popen stubbed; return both argv lists."""
     seen = []
     agent = CC.ClaudeCodeAgent({"binary": sys.executable, **cfg})
-    real = CC.subprocess.run
-    CC.subprocess.run = lambda cmd, **kw: (seen.append(cmd), _Proc())[1]
+    real = CC.subprocess.Popen
+    CC.subprocess.Popen = _stub_popen(seen)
     try:
         agent.reason("classify this")
         agent.work("implement this", Path("."), **work_kwargs)
     finally:
-        CC.subprocess.run = real
-    return seen[0], seen[1]
+        CC.subprocess.Popen = real
+    return seen[0][0], seen[1][0]
 
 def _flag(cmd, name):
     return cmd[cmd.index(name) + 1] if name in cmd else None
@@ -554,11 +637,13 @@ class _ScriptedAgent:
     """Returns canned text per work() call, in order. Records the argv-ish kwargs."""
     def __init__(self, replies): self.replies, self.calls = list(replies), []
     def reason(self, prompt, *, max_turns=1):
-        return AgentResult(ok=True, text=self.replies.pop(0), cost_usd=0.01)
+        return AgentResult(ok=True, text=self.replies.pop(0), cost_usd=0.01,
+                           usage=TokenUsage(input_tokens=100, output_tokens=10))
     def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
         self.calls.append({"prompt": prompt, "model": model,
                            "allowed_tools": allowed_tools})
-        return AgentResult(ok=True, text=self.replies.pop(0), cost_usd=0.2)
+        return AgentResult(ok=True, text=self.replies.pop(0), cost_usd=0.2,
+                           usage=TokenUsage(input_tokens=1000, output_tokens=250))
 
 _ready = json.dumps({
     "verdict": "ready", "problem": "CSV export is missing",
@@ -569,7 +654,7 @@ _ready = json.dumps({
     "files_of_interest": ["api/reports.py — the route lives here"],
 })
 _ag = _ScriptedAgent([_ready])
-_res, _cost = AN.analyse(
+_res, _spend = AN.analyse(
     _ag, mk("T20", "Add CSV export", "button downloads a CSV"), [],
     {"key": "pulse-backend", "test": "pytest"},
     "=== REPO NOTES ===\nTests need PGHOST.\n", ["csv downloads"],
@@ -577,7 +662,7 @@ _res, _cost = AN.analyse(
 
 a1 = _res.verdict == "ready"
 a2 = _res.acceptance_criteria == ["GET /reports.csv returns text/csv"]
-a3 = _cost == 0.2
+a3 = _spend.cost_usd == 0.2 and _spend.tokens == 1250
 a4 = _ag.calls[0]["model"] == "opus"
 a5 = _ag.calls[0]["allowed_tools"] == AN.PLANNER_TOOLS
 a6 = "Write" not in AN.PLANNER_TOOLS and "Edit" not in AN.PLANNER_TOOLS
@@ -647,7 +732,8 @@ _rr, _rc = RV.review(
 v1 = _rr.verdict == "approve"
 v2 = _rr.brain_notes == ["Reports tests need PGHOST=localhost."]
 v3 = _rr.criteria_results[0]["pass"] is True
-v4 = _rc == 0.2 and _rg.calls[0]["model"] == "opus"
+v4 = (_rc.cost_usd == 0.2 and _rc.tokens == 1250
+      and _rg.calls[0]["model"] == "opus")
 v5 = "Bash(pytest -q:*)" in _rg.calls[0]["allowed_tools"]
 v6 = "Write" not in RV.REVIEWER_TOOLS and "Edit" not in RV.REVIEWER_TOOLS
 v7 = "ai/t30-add-csv" in _rg.calls[0]["prompt"]
@@ -696,7 +782,7 @@ def _plan_case(name, scope, mode, expect_state):
                            "acceptance_criteria": ["csv downloads"]})
         pipe = Pipeline(cfg, src, prov, agent, store)
         pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
-        got = store.get("mycorp:T40")
+        got = store.get(rid("T40"))
         ok = got["state"] == expect_state.value
         print(f"  {'PASS' if ok else 'FAIL':<5} {name:<44} -> {got['state']}")
         results.append(ok)
@@ -753,14 +839,14 @@ with tempfile.TemporaryDirectory() as tmp:
                           # first attempt, not a retry, so it must not count
                           # against `attempts` (R6 fix).
 
-        row0 = store.get("mycorp:T50")
+        row0 = store.get(rid("T50"))
         c0 = row0["state"] == AIState.PLANNING.value and int(row0["attempts"]) == 0
         print(f"  {'PASS' if c0 else 'FAIL':<5} a crash on the first planning attempt does not count against attempts")
         results.append(c0)
 
         pipe.tick(when)   # planning attempt 1 (retry): analyst raises
 
-        row1 = store.get("mycorp:T50")
+        row1 = store.get(rid("T50"))
         c1 = row1["state"] == AIState.PLANNING.value and int(row1["attempts"]) == 1
         print(f"  {'PASS' if c1 else 'FAIL':<5} an ordinary exception in planning increments attempts")
         results.append(c1)
@@ -768,7 +854,7 @@ with tempfile.TemporaryDirectory() as tmp:
         pipe.tick(when)   # planning attempt 2: analyst raises again
         pipe.tick(when)   # planning attempt 3: exceeds max_fix_attempts -> escalate
 
-        row2 = store.get("mycorp:T50")
+        row2 = store.get(rid("T50"))
         c2 = row2["state"] == AIState.BLOCKED.value
         print(f"  {'PASS' if c2 else 'FAIL':<5} exceeding max_fix_attempts escalates planning to blocked")
         results.append(c2)
@@ -796,10 +882,13 @@ with tempfile.TemporaryDirectory() as tmp:
     pipe = Pipeline(cfg, src, prov, _BadReasonAgent(), store)
     pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
 
+    # A triage crash means no repo was ever chosen, so the error belongs on
+    # the unrouted placeholder row -- there is no per-repo row to put it on.
     row = store.get("mycorp:T51")
     e1 = row is not None and bool(row.get("last_error"))
     e2 = store.get("T51") is None   # no unnamespaced row created
-    print(f"  {'PASS' if e1 else 'FAIL':<5} triage failure records last_error on the namespaced row")
+    e3 = store.get(rid("T51")) is None   # and no repo row was invented
+    print(f"  {'PASS' if e1 and e3 else 'FAIL':<5} triage failure records last_error on the unrouted row")
     print(f"  {'PASS' if e2 else 'FAIL':<5} triage failure creates no unnamespaced row")
     results += [e1, e2]
 
@@ -847,7 +936,7 @@ def _review_flow(verdicts, *, cycles=2, ticks=10):
     finally:
         for n, f in real.items():
             setattr(vcs, n, f)
-    return store.get("mycorp:T50"), prov, Path(f"{tmp}/b"), len(made)
+    return store.get(rid("T50")), prov, Path(f"{tmp}/b"), len(made)
 
 _approve_v = {"verdict": "approve",
               "criteria_results": [{"criterion": "footer reads Copyright",
@@ -981,7 +1070,7 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         vcs.ensure_worktree = _real_ew
 
-    _healthy_plan = store.get("mycorp:T57")
+    _healthy_plan = store.get(rid("T57"))
     c15 = (_healthy_plan["state"] == AIState.AWAITING_PLAN_OK.value
           and int(_healthy_plan["attempts"]) == 0)
 
@@ -1061,7 +1150,7 @@ with tempfile.TemporaryDirectory() as tmp:
         pipe.tick(when)   # triage -> planning
         pipe.tick(when)   # planning -> plan-review (first plan posted)
         n1 = len([c for c in prov.comments["T82"] if "**Plan**" in c.text])
-        state1_ok = store.get("mycorp:T82")["state"] == AIState.AWAITING_PLAN_OK.value
+        state1_ok = store.get(rid("T82"))["state"] == AIState.AWAITING_PLAN_OK.value
 
         prov.human_reply("T82", "no, that's not what I meant, please redo this")
         pipe.tick(when)   # plan-review -> new (rejected), then re-triage -> planning, same tick
@@ -1069,7 +1158,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
         n2 = len([c for c in prov.comments["T82"] if "**Plan**" in c.text])
         k1_ok = n2 == n1 + 1     # a genuinely new plan comment appeared
-        state2_ok = store.get("mycorp:T82")["state"] == AIState.AWAITING_PLAN_OK.value
+        state2_ok = store.get(rid("T82"))["state"] == AIState.AWAITING_PLAN_OK.value
 
         pipe.tick(when)   # re-run the same tick: no third plan comment
         n3 = len([c for c in prov.comments["T82"] if "**Plan**" in c.text])
@@ -1116,7 +1205,7 @@ def _approval_case(name, reply_text, expect_state):
         finally:
             vcs.ensure_worktree = _real_ew
 
-        got = store.get("mycorp:T83")["state"]
+        got = store.get(rid("T83"))["state"]
         ok = got == expect_state.value
         print(f"  {'PASS' if ok else 'FAIL':<5} {name:<58} -> {got}")
         results.append(ok)
@@ -1221,7 +1310,7 @@ with tempfile.TemporaryDirectory() as tmp:
     # The row passes through `new` on its way back into planning: 7am
     # Monday is also inside the triage window, so the very same tick that
     # processes the rejection re-triages it straight back into planning.
-    h2 = store.get("mycorp:T87")["state"] == AIState.PLANNING.value
+    h2 = store.get(rid("T87"))["state"] == AIState.PLANNING.value
 
 for label, ok in [("rejecting a plan removes its worktree", h1),
                   ("the row re-triages back into planning afterward", h2)]:
@@ -1341,7 +1430,7 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         vcs.ensure_worktree = _real_ew
 
-    row = store.get("mycorp:T89")
+    row = store.get(rid("T89"))
     e1 = row["state"] == AIState.AWAITING_PLAN_OK.value
     e2 = int(row["attempts"]) == 0
 
@@ -1456,7 +1545,7 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         vcs.ensure_worktree = _real_ew
 
-    rows = [store.get("mycorp:T90"), store.get("mycorp:T91")]
+    rows = [store.get(rid("T90")), store.get(rid("T91"))]
     advanced = [r for r in rows if r["state"] != AIState.PLANNING.value]
     skipped = [r for r in rows if r["state"] == AIState.PLANNING.value]
 
@@ -1565,13 +1654,790 @@ with tempfile.TemporaryDirectory() as tmp:
         vcs.ensure_worktree = _real_ew
 
     j4 = store.spend_since(0) >= 0.66   # the failed run's cost reached the total
-    row = store.get("mycorp:T99")
+    row = store.get(rid("T99"))
     j5 = row["state"] == AIState.PLANNING.value   # crash-recovery still owns the retry path
     j6 = bool(row.get("last_error"))
 
 for label, ok in [("a failed analyst run's cost reaches the daily spend total", j4),
                   ("the existing crash-recovery path still owns escalation", j5),
                   ("the failure is still recorded as last_error on the row", j6)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# ---------------------------------------------------------------------------
+# One ticket, several repos (cross-repo fan-out)
+# ---------------------------------------------------------------------------
+print("\none ticket spanning two repos")
+
+
+def _two_repo_cfg(tmp):
+    """mycorp, but with both repos behind the SAME container id.
+
+    That is the Jira shape: one project covering a backend and a frontend, with
+    nothing in the ticket metadata to tell them apart. ClickUp lists map 1:1 so
+    the shipped example config cannot express it.
+    """
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    for repo in src.repos:
+        repo["containers"] = ["901100000001"]
+    return cfg, src
+
+
+_SPAN = {"decision": "execute", "confidence": 0.95, "scope": "m",
+         "plan": ["add endpoint", "call it from the UI"],
+         "acceptance_criteria": ["export works end to end"],
+         "repos": ["pulse-backend", "pulse-frontend"]}
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T200", "CSV export", "endpoint plus a download button")])
+    store = Store(f"{tmp}/s.db")
+    Pipeline(cfg, src, prov, FakeAgent(_SPAN), store).tick(dt.datetime(2026, 8, 10, 7, 0))
+
+    rows = store.rows_for_task("mycorp", "T200")
+    f1 = len(rows) == 2
+    f2 = sorted(r["repo_key"] for r in rows) == ["pulse-backend", "pulse-frontend"]
+    f3 = sorted(r["task_id"] for r in rows) == [rid("T200", "pulse-backend"),
+                                                rid("T200", "pulse-frontend")]
+    # The pre-triage placeholder must not survive routing, or `rows_for_task`
+    # would report a third, repo-less row forever.
+    f4 = store.get("mycorp:T200") is None
+    f5 = all(r["state"] == AIState.PLANNING.value for r in rows)
+    # One remote state field, and it is the least advanced of the two rows.
+    f6 = prov.states["T200"] == AIState.PLANNING
+
+for label, ok in [("an execute decision naming two repos creates two rows", f1),
+                  ("each row owns exactly one repo", f2),
+                  ("row ids carry the repo segment", f3),
+                  ("the unrouted placeholder row is retired", f4),
+                  ("both rows advance to planning", f5),
+                  ("the ticket's single AI State field reflects both", f6)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\nrouting is the model's choice, but only within the offered repos")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T201", "Backend only", "just the endpoint")])
+    store = Store(f"{tmp}/s.db")
+    one = dict(_SPAN, repos=["pulse-backend"])
+    Pipeline(cfg, src, prov, FakeAgent(one), store).tick(dt.datetime(2026, 8, 10, 7, 0))
+    g1 = [r["repo_key"] for r in store.rows_for_task("mycorp", "T201")] == ["pulse-backend"]
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T202", "Hallucinated repo", "x")])
+    store = Store(f"{tmp}/s.db")
+    bogus = dict(_SPAN, repos=["pulse-backend", "some-repo-that-does-not-exist"])
+    Pipeline(cfg, src, prov, FakeAgent(bogus), store).tick(dt.datetime(2026, 8, 10, 7, 0))
+    g2 = [r["repo_key"] for r in store.rows_for_task("mycorp", "T202")] == ["pulse-backend"]
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T203", "No usable repo", "x")])
+    store = Store(f"{tmp}/s.db")
+    none = dict(_SPAN, repos=["nope"])
+    Pipeline(cfg, src, prov, FakeAgent(none), store).tick(dt.datetime(2026, 8, 10, 7, 0))
+    # Nothing routable left, so this must not silently pick one -- it asks.
+    g3 = store.get("mycorp:T203")["state"] == AIState.NEEDS_INPUT.value
+
+with tempfile.TemporaryDirectory() as tmp:
+    # Single candidate: the model is not consulted, so a junk `repos` value
+    # must not turn a perfectly routable ticket into a spurious clarify.
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    prov = FakeProvider([mk("T204", "Only one repo maps here", "x")])
+    store = Store(f"{tmp}/s.db")
+    junk = dict(_SPAN, repos=["not-a-repo"])
+    Pipeline(cfg, src, prov, FakeAgent(junk), store).tick(dt.datetime(2026, 8, 10, 7, 0))
+    g4 = [r["repo_key"] for r in store.rows_for_task("mycorp", "T204")] == ["pulse-backend"]
+
+for label, ok in [("a one-repo answer routes to one row", g1),
+                  ("a repo key the model invented is dropped", g2),
+                  ("no valid repo left downgrades execute to clarify", g3),
+                  ("a single candidate ignores the model's repo answer", g4)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\nthe shared remote fields are aggregated, not raced")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T205", "Two repos", "x")])
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, FakeAgent(_SPAN), store)
+    a, b = rid("T205", "pulse-backend"), rid("T205", "pulse-frontend")
+    for r, rk in ((a, "pulse-backend"), (b, "pulse-frontend")):
+        store.upsert(r, source="mycorp", provider_task_id="T205",
+                     task_key="T205", repo_key=rk, state=AIState.QUEUED.value)
+
+    store.set_state(a, AIState.PR_OPEN)
+    h1 = pipe._remote_state(a) == AIState.QUEUED       # least advanced wins
+
+    # The first repo to merge must not close the ticket out from under the
+    # second, still-open PR.
+    pipe._set_status_when(a, AIState.DONE, "done_status", "done")
+    h2 = "T205" not in prov.statuses
+
+    store.set_state(a, AIState.DONE)
+    store.set_state(b, AIState.DONE)
+    pipe._set_status_when(a, AIState.DONE, "done_status", "done")
+    h3 = prov.statuses.get("T205") == src.provider["done_status"]
+
+    # Anything needing a human outranks progress on the other row.
+    store.set_state(b, AIState.BLOCKED)
+    h4 = pipe._remote_state(a) == AIState.BLOCKED
+
+with tempfile.TemporaryDirectory() as tmp:
+    # A single-repo ticket must behave exactly as it did before fan-out
+    # existed: the aggregate of one row is that row.
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T206", "One repo", "x")])
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, FakeAgent(_SPAN), store)
+    solo = rid("T206", "pulse-backend")
+    store.upsert(solo, source="mycorp", provider_task_id="T206",
+                 task_key="T206", repo_key="pulse-backend", state=AIState.PR_OPEN.value)
+    h5 = pipe._remote_state(solo) == AIState.PR_OPEN
+
+for label, ok in [("the remote AI State is the least advanced row", h1),
+                  ("one repo merging does not set the done status", h2),
+                  ("the done status lands once every repo is done", h3),
+                  ("a blocked row outranks the other repo's progress", h4),
+                  ("a single-repo ticket aggregates to itself", h5)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\nre-triage keeps a ticket's repos")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    task = mk("T207", "Needs an answer", "x")
+    prov = FakeProvider([task])
+    store = Store(f"{tmp}/s.db")
+    # Already routed to the frontend and sitting in needs-input.
+    fe = rid("T207", "pulse-frontend")
+    store.upsert(fe, source="mycorp", provider_task_id="T207", task_key="T207",
+                 repo_key="pulse-frontend", state=AIState.NEW.value)
+    pipe = Pipeline(cfg, src, prov, FakeAgent(_SPAN), store)
+    # The agent answers "both repos", but the ticket is already routed: honouring
+    # that would strand the branch and worktree the frontend row may already own.
+    i1 = [r["key"] for r in pipe._candidate_repos(task)] == ["pulse-frontend"]
+    pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    i2 = [r["repo_key"] for r in store.rows_for_task("mycorp", "T207")] == ["pulse-frontend"]
+
+for label, ok in [("an already-routed ticket only offers triage its own repos", i1),
+                  ("re-triage does not add a second repo behind a live branch", i2)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\ncomments stay idempotent and say which repo they are about")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg, src = _two_repo_cfg(tmp)
+    prov = FakeProvider([mk("T208", "CSV export", "x")])
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, FakeAgent(_SPAN), store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+    pipe.tick(when)
+    pipe.tick(when)          # a rerun of the same tick must not double-post
+    bodies = [c.text for c in prov.comments["T208"]]
+    j1 = len(bodies) == len(set(bodies))
+    a = rid("T208", "pulse-backend")
+    j2 = pipe._repo_tag(a).startswith("`pulse-backend`")
+
+with tempfile.TemporaryDirectory() as tmp:
+    # A single-repo ticket gets no prefix -- naming the only repo is noise.
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    src = cfg.sources(only=["mycorp"])[0]
+    prov = FakeProvider([mk("T209", "One repo", "x")])
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, FakeAgent(dict(_SPAN, repos=["pulse-backend"])), store)
+    pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    j3 = pipe._repo_tag(rid("T209")) == ""
+
+for label, ok in [("re-running a tick posts no duplicate comments", j1),
+                  ("a cross-repo comment names its repo", j2),
+                  ("a single-repo ticket gets no repo prefix", j3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+# --- execution hardening ---------------------------------------------------
+# 1. a timeout kills the agent's children, not just the agent
+# 2. token usage reaches the store and gates the tick
+# 3. the run is recorded to disk while it is still running
+# 4. the child inherits a sanitised environment
+print("\nagent process supervision")
+
+import signal as _signal
+import subprocess as _sp
+import textwrap as _tw
+
+_hard = []
+
+# A parent that spawns a child writing a pidfile, then sleeps past the timeout.
+# The child is the thing `subprocess.run(timeout=...)` used to leak: it is not
+# the process being waited on, so killing the parent left it running.
+with tempfile.TemporaryDirectory() as tmp:
+    marker = Path(tmp) / "child.pid"
+    script = _tw.dedent(f"""
+        import os, subprocess, sys, time
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os,time;open({str(marker)!r},'w').write(str(os.getpid()));"
+             "time.sleep(120)"])
+        time.sleep(120)
+    """)
+    agent = CC.ClaudeCodeAgent({"binary": sys.executable, "timeout_minutes": 45})
+    real_popen = CC.subprocess.Popen
+    launched = {}
+
+    def _slow_popen(cmd, **kw):
+        proc = real_popen([sys.executable, "-c", script], **kw)
+        launched["proc"] = proc
+        return proc
+
+    CC.subprocess.Popen = _slow_popen
+    CC.TERM_GRACE_SECONDS = 1          # keep the test quick
+    try:
+        res = agent._run([sys.executable, "-p", "x"], cwd=None, timeout=3,
+                         stream=False)
+    finally:
+        CC.subprocess.Popen = real_popen
+        CC.TERM_GRACE_SECONDS = 10
+
+    k1 = res.timed_out and not res.ok
+    # The grandchild had 3s to write its pidfile; if it never started there is
+    # nothing to prove and the test would pass vacuously.
+    k2 = marker.exists()
+    child_pid = int(marker.read_text()) if k2 else 0
+    deadline = time.time() + 5
+    alive = True
+    while time.time() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except (ProcessLookupError, PermissionError):
+            alive = False
+            break
+        time.sleep(0.1)
+    k3 = k2 and not alive
+
+for label, ok in [("a timed-out run reports timed_out", k1),
+                  ("the agent's grandchild actually started", k2),
+                  ("the whole process group is killed, not just the agent", k3)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\ntoken usage and the event log")
+with tempfile.TemporaryDirectory() as tmp:
+    logp = Path(tmp) / "run.jsonl"
+    seen = []
+    agent = CC.ClaudeCodeAgent({"binary": sys.executable, "model": "sonnet"})
+    real = CC.subprocess.Popen
+    CC.subprocess.Popen = _stub_popen(seen)
+    try:
+        w = agent.work("implement", Path("."), log_path=logp)
+        r = agent.reason("classify")
+    finally:
+        CC.subprocess.Popen = real
+
+    # 10 in + 5 out + 2 cache-write + 3 cache-read
+    t1 = w.usage.total == 20 and w.usage.input_tokens == 10
+    t2 = w.ok and w.cost_usd == 0.0 and w.num_turns == 1
+    t3 = r.usage.total == 20            # the blob path parses usage too
+
+    lines = [json.loads(x) for x in logp.read_text().splitlines()]
+    kinds = [e["type"] for e in lines]
+    t4 = kinds[0] == "run_started" and kinds[-1] == "run_finished"
+    t5 = [e["seq"] for e in lines] == list(range(1, len(lines) + 1))
+    t6 = lines[-1]["tokens"] == 20
+    # The prompt is huge and already recorded by the station that built it.
+    t7 = not any("implement" in json.dumps(e) for e in lines if e["type"] == "run_started")
+    t8 = any(e["type"] == "output" for e in lines)
+
+    # work() must ask for a stream, or none of the above can be written live.
+    argv = seen[0][0]
+    t9 = (argv[argv.index("--output-format") + 1] == "stream-json"
+          and "--verbose" in argv)
+    # ...and the child must lead its own process group.
+    t10 = seen[0][1].get("start_new_session") is True
+
+for label, ok in [("work() reports token usage", t1),
+                  ("work() still reports cost and turns", t2),
+                  ("reason() reports token usage too", t3),
+                  ("the event log brackets the run", t4),
+                  ("event sequence numbers are gapless", t5),
+                  ("the final event carries the token total", t6),
+                  ("the prompt is not copied into the log", t7),
+                  ("agent output is recorded", t8),
+                  ("work() asks for a streamed result", t9),
+                  ("the agent leads its own process group", t10)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+with tempfile.TemporaryDirectory() as tmp:
+    logp = Path(tmp) / "big.jsonl"
+    log = CC._EventLog(logp, max_bytes=400)
+    for i in range(200):
+        log.output("stdout", "x" * 100)
+    log.close()
+    lines = [json.loads(x) for x in logp.read_text().splitlines()]
+    t11 = lines[-1]["type"] == "log_truncated"
+    t12 = logp.stat().st_size < 1000      # the cap actually held
+    t13 = len(lines) < 200                # ...by dropping events, not the file
+
+for label, ok in [("the event log stops at its cap", t11),
+                  ("the capped log stays small", t12),
+                  ("the cap drops events rather than the whole file", t13)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\nthe agent's environment is sanitised")
+_env = CC._sanitized_env("run123")
+e1 = CC.RUN_ID_ENV in _env and _env[CC.RUN_ID_ENV] == "run123"
+_saved = {k: os.environ.get(k) for k in ("GIT_DIR", "GIT_INDEX_FILE")}
+os.environ["GIT_DIR"] = "/somewhere/else/.git"
+os.environ["GIT_INDEX_FILE"] = "/somewhere/else/index"
+try:
+    _dirty = CC._sanitized_env("run456")
+    e2 = "GIT_DIR" not in _dirty and "GIT_INDEX_FILE" not in _dirty
+    e3 = "PATH" in _dirty          # ...without throwing the rest away
+finally:
+    for k, v in _saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+e4 = CC._env_secrets({"GH_TOKEN_ACME": "ghp_" + "a" * 36}) == ["ghp_" + "a" * 36]
+e5 = CC._env_secrets({"GH_TOKEN_PATH": "/home/me/.token"}) == []
+e6 = CC._env_secrets({"HOME": "/home/me", "EDITOR": "vim"}) == []
+e7 = CC._env_secrets({"JIRA_API_TOKEN": "short"}) == []
+
+for label, ok in [("the child is told it is inside a runner run", e1),
+                  ("inherited GIT_DIR/GIT_INDEX_FILE are stripped", e2),
+                  ("the rest of the environment survives", e3),
+                  ("a custom token env var is treated as a secret", e4),
+                  ("a *_PATH var is not treated as a secret", e5),
+                  ("ordinary env vars are left alone", e6),
+                  ("a too-short value is not redacted", e7)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\ncredentials never reach a ticket")
+from runner.redact import redact as _redact
+
+_tok = "ghp_" + "A" * 36
+d1 = _tok not in _redact(f"remote: Bad credentials ({_tok})")
+d2 = "[REDACTED]" in _redact("git push https://x-access-token:secret123@github.com/a/b")
+d3 = "github.com/a/b" in _redact("git push https://x-access-token:secret123@github.com/a/b")
+d4 = _redact("Authorization: Bearer " + "z" * 40).startswith("Authorization: Bearer [RED")
+d5 = _redact("nothing secret here") == "nothing secret here"
+# An exact value the caller knows beats any pattern: this one matches nothing.
+d6 = "hunter2hunter2" not in _redact("failed: hunter2hunter2", ["hunter2hunter2"])
+d7 = _redact("branch ai/DEV-1-add-csv-export") == "branch ai/DEV-1-add-csv-export"
+
+# vcs.run() scrubs before the message is ever raised.
+try:
+    vcs.run([sys.executable, "-c",
+             "import sys; sys.stderr.write('fatal: bad token ' + "
+             "__import__('os').environ['GH_TOKEN']); sys.exit(1)"],
+            env={"GH_TOKEN": "ghp_" + "B" * 36})
+    d8 = False
+except vcs.CommandError as exc:
+    d8 = "ghp_" not in str(exc) and "[REDACTED]" in str(exc)
+
+for label, ok in [("a GitHub token is redacted", d1),
+                  ("credentials in a remote URL are redacted", d2),
+                  ("...but the remote is still named", d3),
+                  ("a bearer token is redacted, the header kept", d4),
+                  ("ordinary text is untouched", d5),
+                  ("a known literal secret is redacted by value", d6),
+                  ("branch names are not mistaken for secrets", d7),
+                  ("vcs.run scrubs the token out of CommandError", d8)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\nthe daily token cap gates the tick")
+with tempfile.TemporaryDirectory() as tmp:
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b")
+    cfg.data["runner"]["limits"]["daily_tokens"] = 1000
+    src = cfg.sources(only=["mycorp"])[0]
+    store = Store(f"{tmp}/s.db")
+    prov = FakeProvider([mk("T300", "Add a thing", "x")])
+    pipe = Pipeline(cfg, src, prov, FakeAgent(dict(_SPAN, repos=["pulse-backend"])), store)
+    now = dt.datetime(2026, 8, 10, 7, 0)
+
+    g1 = pipe._limits_exceeded(now) is None
+    store.record("implement", None, "burned it", 0.0, 1200)
+    g2 = "token" in (pipe._limits_exceeded(now) or "")
+    pipe.tick(now)
+    g3 = store.rows_for_task("mycorp", "T300") == []     # never triaged
+
+    # A cap of 0 means "no token limit", so the dollar limit alone applies.
+    cfg.data["runner"]["limits"]["daily_tokens"] = 0
+    g4 = pipe._limits_exceeded(now) is None
+    # ...and tokens still accumulate onto the row for reporting.
+    store.upsert("mycorp:T301", source="mycorp", provider_task_id="T301")
+    store.record("implement", "mycorp:T301", "x", 0.5, 42)
+    g5 = (store.get("mycorp:T301") or {}).get("tokens") == 42
+    g6 = store.tokens_since(0) == 1242
+
+for label, ok in [("an empty ledger passes the token gate", g1),
+                  ("exceeding daily_tokens is reported as a token limit", g2),
+                  ("a tick over the token cap triages nothing", g3),
+                  ("daily_tokens: 0 disables the token gate", g4),
+                  ("tokens accumulate onto the task row", g5),
+                  ("tokens_since sums the ledger", g6)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+print("\nan old database gains the new columns")
+with tempfile.TemporaryDirectory() as tmp:
+    import sqlite3 as _sq
+    old = Path(tmp) / "old.db"
+    conn = _sq.connect(old)
+    # The pre-token schema, as shipped before token accounting existed.
+    conn.executescript("""
+        CREATE TABLE tasks (task_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                            source TEXT, provider_task_id TEXT,
+                            cost_usd REAL NOT NULL DEFAULT 0,
+                            updated_at INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER,
+                             task_id TEXT, kind TEXT NOT NULL, detail TEXT,
+                             cost_usd REAL NOT NULL DEFAULT 0);
+        INSERT INTO tasks (task_id, state, source, provider_task_id, cost_usd)
+        VALUES ('acme:T1#api', 'in-progress', 'acme', 'T1', 1.5);
+    """)
+    conn.commit(); conn.close()
+
+    st = Store(old)
+    m1 = (st.get("acme:T1#api") or {}).get("tokens") == 0     # column exists
+    m2 = (st.get("acme:T1#api") or {}).get("cost_usd") == 1.5  # row survived
+    st.record("implement", "acme:T1#api", "ok", 0.25, 500)
+    m3 = (st.get("acme:T1#api") or {}).get("tokens") == 500
+    m4 = st.tokens_since(0) == 500
+    Store(old)          # re-opening must not fail on the already-added column
+    m5 = True
+
+for label, ok in [("an old DB gains the tokens column", m1),
+                  ("existing rows survive the migration", m2),
+                  ("token accounting works after migration", m3),
+                  ("the migrated ledger sums", m4),
+                  ("the migration is idempotent", m5)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+
+# --- triage runs nowhere in particular, on purpose -------------------------
+print("\ntriage is isolated from the launch directory")
+with tempfile.TemporaryDirectory() as tmp:
+    tdir = Path(tmp) / "triage"
+    seen = []
+    agent = CC.ClaudeCodeAgent({"binary": sys.executable, "model": "sonnet",
+                                "triage_dir": str(tdir)})
+    real = CC.subprocess.Popen
+    CC.subprocess.Popen = _stub_popen(seen)
+    try:
+        agent.reason("classify this")
+        agent.work("implement this", Path("/some/worktree"))
+    finally:
+        CC.subprocess.Popen = real
+    (r_cmd, r_kw), (w_cmd, w_kw) = seen
+
+    i1 = r_kw["cwd"] == str(tdir) and tdir.is_dir()
+    i2 = all(f in r_cmd for f in ("--strict-mcp-config", "--disable-slash-commands"))
+    i3 = r_cmd[r_cmd.index("--setting-sources") + 1] == ""
+    # work() must NOT be isolated: the target repo's own CLAUDE.md is exactly
+    # the context the implementer is supposed to have.
+    i4 = w_kw["cwd"] == "/some/worktree"
+    i5 = not any(f in w_cmd for f in
+                 ("--strict-mcp-config", "--disable-slash-commands", "--setting-sources"))
+    # `claude -p` appends a non-TTY stdin to the prompt.
+    i6 = r_kw["stdin"] is CC.subprocess.DEVNULL and w_kw["stdin"] is CC.subprocess.DEVNULL
+    # The triage cwd is fixed, not per-call: the cwd is in the system prompt,
+    # and a path that changes every call misses the prompt cache every call.
+    seen2 = []
+    CC.subprocess.Popen = _stub_popen(seen2)
+    try:
+        agent.reason("classify again")
+    finally:
+        CC.subprocess.Popen = real
+    i7 = seen2[0][1]["cwd"] == r_kw["cwd"]
+
+for label, ok in [("triage runs in its own empty directory", i1),
+                  ("triage disables MCP servers and skills", i2),
+                  ("triage loads no settings or CLAUDE.md", i3),
+                  ("work() still runs in the worktree", i4),
+                  ("work() keeps the repo's own context", i5),
+                  ("stdin is closed so it cannot become prompt", i6),
+                  ("the triage directory is stable across calls", i7)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# Opt-out, and the failure mode of an unwritable directory.
+with tempfile.TemporaryDirectory() as tmp:
+    seen = []
+    agent = CC.ClaudeCodeAgent({"binary": sys.executable, "model": "sonnet",
+                                "isolate_triage": False})
+    real = CC.subprocess.Popen
+    CC.subprocess.Popen = _stub_popen(seen)
+    try:
+        agent.reason("classify this")
+    finally:
+        CC.subprocess.Popen = real
+    i8 = seen[0][1]["cwd"] is None and "--strict-mcp-config" not in seen[0][0]
+
+    # A triage dir that cannot be created must degrade, not strand triage.
+    blocker = Path(tmp) / "afile"
+    blocker.write_text("not a directory")
+    agent2 = CC.ClaudeCodeAgent({"binary": sys.executable,
+                                 "triage_dir": str(blocker / "under-a-file")})
+    seen2 = []
+    CC.subprocess.Popen = _stub_popen(seen2)
+    try:
+        r = agent2.reason("classify this")
+    finally:
+        CC.subprocess.Popen = real
+    i9 = seen2[0][1]["cwd"] is None and r.ok      # fell back, still ran
+
+for label, ok in [("isolate_triage: false restores the old behaviour", i8),
+                  ("an unusable triage dir degrades instead of failing", i9)]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+
+
+# --- prompt payload ceiling -------------------------------------------------
+print("\nprompt payload ceiling")
+import logging
+
+# The prompt travels in argv (`cmd = [binary, "-p", prompt, ...]`), so a ticket
+# carrying a pasted stack trace can push the command line past ARG_MAX and die
+# as a raw OSError. The guard lives in `_run`, the one funnel both seams pass
+# through, so a future seam cannot be added that skips it.
+_p_checks = []
+
+
+def _guard_run(prompt, cfg=None, seam="work"):
+    """Run one seam with Popen stubbed; return (result, popen_calls)."""
+    seen = []
+    agent = CC.ClaudeCodeAgent({"binary": sys.executable, **(cfg or {})})
+    real = CC.subprocess.Popen
+    CC.subprocess.Popen = _stub_popen(seen)
+    try:
+        res = (agent.work(prompt, Path(".")) if seam == "work"
+               else agent.reason(prompt))
+    finally:
+        CC.subprocess.Popen = real
+    return res, seen
+
+
+_big = "x" * 200_000
+
+res, seen = _guard_run(_big, {"max_prompt_bytes": 1000})
+_p_checks += [
+    ("an oversize prompt fails the run", not res.ok),
+    ("...without starting a process", seen == []),
+    ("...naming the size and the ceiling",
+     "200000" in (res.error or "") and "1000" in (res.error or "")),
+    ("...and recording no spend", res.cost_usd == 0.0 and res.usage.total == 0),
+]
+
+res, seen = _guard_run("implement this", {"max_prompt_bytes": 1000})
+_p_checks.append(("a prompt under the ceiling still runs", res.ok and len(seen) == 1))
+
+res, seen = _guard_run(_big, {"max_prompt_bytes": 1000}, seam="reason")
+_p_checks.append(("the ceiling covers reason() too", not res.ok and seen == []))
+
+# `len(prompt)` instead of `len(prompt.encode())` would let a multibyte prompt
+# through at ~3x the ceiling -- exactly the case a stack trace full of unicode
+# arrives as.
+res, _ = _guard_run("é" * 600, {"max_prompt_bytes": 1000})
+_p_checks.append(("the ceiling counts bytes, not characters", not res.ok))
+
+res, _ = _guard_run("y" * 50_000)
+_p_checks.append(("a 50k prompt fits the default ceiling", res.ok))
+
+for label, ok in _p_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- which model actually answered ------------------------------------------
+print("\nmodel verification")
+
+# `--model` is a request, not a guarantee. The result payload reports what ran
+# in `modelUsage`; a mismatch is worth a warning and nothing more, because a
+# `work()` run legitimately shows extra models (subagents bill separately) and
+# a schema change upstream must not fail every ticket.
+_m_checks = []
+
+
+class _CaptureLog(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def _model_run(requested, model_usage):
+    """Run work() against a payload reporting `model_usage`; return warnings."""
+    payload = {k: v for k, v in _RESULT.items()}
+    if model_usage is not None:
+        payload["modelUsage"] = model_usage
+
+    def stdout_for(cmd):
+        return (json.dumps({"type": "system", "subtype": "init"}) + "\n"
+                + json.dumps(payload) + "\n")
+
+    cap = _CaptureLog()
+    CC.log.addHandler(cap)
+    real = CC.subprocess.Popen
+    CC.subprocess.Popen = _stub_popen([], stdout_for=stdout_for)
+    try:
+        cfg = {"binary": sys.executable}
+        if requested:
+            cfg["model"] = requested
+        res = CC.ClaudeCodeAgent(cfg).work("do it", Path("."))
+    finally:
+        CC.subprocess.Popen = real
+        CC.log.removeHandler(cap)
+    return res, [m for m in cap.messages if "model" in m.lower()]
+
+_sonnet = {"claude-sonnet-5": {"canonicalModel": "claude-sonnet-5"}}
+
+res, warns = _model_run("opus", _sonnet)
+_m_checks += [
+    ("a model mismatch warns", len(warns) == 1),
+    ("...naming both the wanted and the actual model",
+     bool(warns) and "opus" in warns[0] and "claude-sonnet-5" in warns[0]),
+    ("...but does not fail the run", res.ok),
+]
+
+_m_checks += [
+    ("an exact match is silent", _model_run("claude-sonnet-5", _sonnet)[1] == []),
+    ("an alias matching the canonical id is silent",
+     _model_run("sonnet", _sonnet)[1] == []),
+    ("a payload with no modelUsage is silent", _model_run("sonnet", None)[1] == []),
+    ("an empty modelUsage is silent", _model_run("sonnet", {})[1] == []),
+    ("subagent models alongside the requested one are silent",
+     _model_run("sonnet", {**_sonnet, "claude-haiku-4-5-20251001": {}})[1] == []),
+    ("no requested model means nothing to verify",
+     _model_run(None, _sonnet)[1] == []),
+]
+
+for label, ok in _m_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- doctor: the triage isolation canary ------------------------------------
+print("\ndoctor isolation canary")
+
+# `_triage_cwd` falls back to the launch directory when the triage dir cannot
+# be created, which is the silent failure this canary exists to catch: triage
+# then reads whatever repo cron happened to start in. Reporting "ok" for a
+# check that never ran would hide the same thing, so an unusable answer is
+# `unverified`, and doctor treats that as a failure.
+from runner.cli import _isolation_status, CANARY_PROMPT, CANARY_SENTINEL
+
+
+def _canary(text, ok=True, timed_out=False):
+    return AgentResult(ok=ok, text=text, timed_out=timed_out)
+
+
+_named = _canary("You are in the ai-task-runner repository.")
+_c_checks = [
+    ("the sentinel means isolated",
+     _isolation_status(True, _canary(CANARY_SENTINEL))[0] == "ok"),
+    ("a named project means not isolated", _isolation_status(True, _named)[0] == "broken"),
+    ("...and the detail quotes what it saw",
+     "ai-task-runner" in _isolation_status(True, _named)[1]),
+    ("isolate_triage: false is skipped, not passed",
+     _isolation_status(False, _canary(CANARY_SENTINEL))[0] == "skipped"),
+    ("a failed canary call is unverified, not passed",
+     _isolation_status(True, _canary("", ok=False))[0] == "unverified"),
+    ("a timed-out canary is unverified",
+     _isolation_status(True, _canary("", ok=False, timed_out=True))[0] == "unverified"),
+    ("an empty reply is unverified", _isolation_status(True, _canary("   "))[0] == "unverified"),
+]
+
+# A canary nobody calls proves nothing, so assert the wiring separately.
+# The agent class is stubbed rather than Popen: `_doctor` also shells out
+# through `vcs.run`, and `runner.vcs` and `runner.agents.claude_code` share
+# one `subprocess` module, so stubbing Popen would hijack both.
+_made = []
+
+
+class _CanaryAgent:
+    def __init__(self, cfg):
+        self.binary = str(cfg["binary"])
+        self.isolate_triage = True
+        self.prompts = []
+        _made.append(self)
+
+    def reason(self, prompt, *, max_turns=1):
+        self.prompts.append(prompt)
+        return AgentResult(ok=True, text=CANARY_SENTINEL)
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    # doctor only spends the canary once `claude auth status` is clean, so the
+    # stand-in binary has to exit 0.
+    fake_claude = Path(tmp) / "claude"
+    fake_claude.write_text("#!/bin/sh\nexit 0\n")
+    fake_claude.chmod(0o755)
+    # `type: none` is unknown to the registry, so providers.build raises before
+    # any HTTP call -- doctor records that as a problem and moves on, which is
+    # all this test needs from the source.
+    cfgfile = Path(tmp) / "canary.yaml"
+    cfgfile.write_text(
+        "runner:\n"
+        "  mode: shadow\n"
+        f"  log_dir: {tmp}/logs\n"
+        f"  brain_dir: {tmp}/brain\n"
+        "sources:\n"
+        "  - key: canary\n"
+        "    provider:\n"
+        "      type: none\n"
+        "vcs_profiles: {}\n"
+        "agent:\n"
+        f"  binary: {fake_claude}\n"
+    )
+    from runner import cli as CLI
+    _real_agent = CLI.ClaudeCodeAgent
+    CLI.ClaudeCodeAgent = _CanaryAgent
+    try:
+        CLI._doctor(Config.load(str(cfgfile)))
+    finally:
+        CLI.ClaudeCodeAgent = _real_agent
+
+_c_checks.append(("doctor actually runs the canary",
+                  bool(_made) and CANARY_PROMPT in _made[0].prompts))
+
+for label, ok in _c_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 

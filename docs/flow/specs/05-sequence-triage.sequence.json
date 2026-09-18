@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Sequence: Ticket to Approved Plan",
+    "quality_profile": "showcase",
+    "viewBox": [1200, 610],
+    "column_fit": "spread",
+    "views": [
+      { "id": "triage-tick", "label": "Triage tick", "focus": ["pipeline", "tracker", "agent", "store"], "note": "One tool-less call decides the bucket, the scope and the repos." },
+      { "id": "analyst-tick", "label": "Analyst tick", "focus": ["pipeline", "git", "agent"], "note": "The plan is written after reading the real repository, read-only." },
+      { "id": "human-gate", "label": "Human gate", "focus": ["human", "tracker", "pipeline"], "note": "Approval is an ordinary comment, matched on whole words." }
+    ]
+  },
+  "participants": [
+    { "id": "human", "type": "security", "label": "Developer" },
+    { "id": "tracker", "type": "external", "label": "ClickUp / Jira" },
+    { "id": "pipeline", "type": "backend", "label": "Pipeline" },
+    { "id": "store", "type": "database", "label": "SQLite" },
+    { "id": "agent", "type": "messagebus", "label": "Claude Code" },
+    { "id": "git", "type": "cloud", "label": "Worktree" }
+  ],
+  "segments": [
+    { "from": 160, "to": 300, "label": "Tick 1 — triage and route" },
+    { "from": 312, "to": 425, "label": "Tick 2 — the analyst reads the repo" },
+    { "from": 437, "to": 495, "label": "A later tick — the human has replied" }
+  ],
+  "messages": [
+    { "id": "fetch", "from": "pipeline", "to": "tracker", "y": 170, "label": "fetch_candidates()", "variant": "default" },
+    { "id": "ticket", "from": "tracker", "to": "pipeline", "y": 199, "label": "ticket + comment thread", "variant": "return" },
+    { "id": "triage", "from": "pipeline", "to": "agent", "y": 228, "label": "reason(): 1 turn, no tools, empty dir", "variant": "emphasis" },
+    { "id": "verdict", "from": "agent", "to": "pipeline", "y": 257, "label": "execute, scope m, repo keys", "variant": "return" },
+    { "id": "rows", "from": "pipeline", "to": "store", "y": 286, "label": "one row per repo, plan in meta", "variant": "dashed" },
+    { "id": "worktree", "from": "pipeline", "to": "git", "y": 324, "label": "ensure_worktree(branch)", "variant": "default" },
+    { "id": "analyst", "from": "pipeline", "to": "agent", "y": 353, "label": "work(): read-only planner tools", "variant": "emphasis" },
+    { "id": "plan", "from": "agent", "to": "pipeline", "y": 382, "label": "problem, approach, steps, criteria, risks", "variant": "return" },
+    { "id": "postplan", "from": "pipeline", "to": "tracker", "y": 411, "label": "plan comment, AI State plan-review", "variant": "security" },
+    { "id": "approve", "from": "human", "to": "tracker", "y": 449, "label": "replies: approved", "variant": "emphasis" },
+    { "id": "queued", "from": "tracker", "to": "pipeline", "y": 478, "label": "non-bot reply detected, row goes queued", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "pipeline", "from": 165, "to": 291, "type": "backend" },
+    { "participant": "agent", "from": 223, "to": 262, "type": "messagebus" },
+    { "participant": "pipeline", "from": 319, "to": 416, "type": "backend" },
+    { "participant": "agent", "from": 348, "to": 387, "type": "messagebus" },
+    { "participant": "pipeline", "from": 444, "to": 483, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Each band is a separate process",
+      "items": [
+        "Between bands the runner is not running at all",
+        "Resuming is reading one SQLite row, not rebuilding a session",
+        "Triage is capped per run; the analyst runs once per repo"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Two different model calls",
+      "items": [
+        "reason() judges the ticket text and cannot open the repo",
+        "work() with planner_tools reads the repo but cannot write",
+        "That is why planning is safe to run even in shadow mode"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Approval is just a comment",
+      "items": [
+        "Bot comments carry a marker, so replies are told apart from our own",
+        "Keywords are matched on whole words, so no does not fire inside now",
+        "A rejection sends the row back to new, keeping the same repo set"
+      ]
+    }
+  ]
+}

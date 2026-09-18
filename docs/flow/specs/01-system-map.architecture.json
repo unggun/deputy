@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ai-task-runner — System Map",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1200,
+      560
+    ],
+    "views": [
+      {
+        "id": "ticket-seam",
+        "label": "Ticket seam",
+        "focus": [
+          "pipeline",
+          "provider",
+          "tracker"
+        ],
+        "note": "How the runner reads tickets and writes state back to the board."
+      },
+      {
+        "id": "agent-seam",
+        "label": "Agent seam",
+        "focus": [
+          "pipeline",
+          "agent",
+          "claude"
+        ],
+        "note": "Every model call leaves through one two-method adapter."
+      },
+      {
+        "id": "durable-state",
+        "label": "Durable state",
+        "focus": [
+          "pipeline",
+          "store",
+          "brain"
+        ],
+        "note": "What survives a closed laptop, and what stays local."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "tracker",
+      "type": "external",
+      "label": "ClickUp / Jira",
+      "sublabel": "tickets, AI State, comments",
+      "pos": [
+        330,
+        36
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "claude",
+      "type": "external",
+      "label": "Claude Code CLI",
+      "sublabel": "claude -p subprocess",
+      "pos": [
+        616,
+        36
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "github",
+      "type": "external",
+      "label": "GitHub",
+      "sublabel": "branches, PRs, CI",
+      "pos": [
+        902,
+        36
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "provider",
+      "type": "backend",
+      "label": "TaskProvider",
+      "sublabel": "7 abstract methods",
+      "tag": "clickup.py / jira.py",
+      "pos": [
+        330,
+        172
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "agent",
+      "type": "backend",
+      "label": "CodingAgent",
+      "sublabel": "reason() and work()",
+      "tag": "claude_code.py",
+      "pos": [
+        616,
+        172
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "vcs",
+      "type": "backend",
+      "label": "vcs.py",
+      "sublabel": "worktrees, git, gh",
+      "tag": "one profile per repo",
+      "pos": [
+        902,
+        172
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "cron",
+      "type": "external",
+      "label": "Cron / launchd",
+      "sublabel": "ai-task-runner run",
+      "pos": [
+        44,
+        172
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "security",
+      "label": "CLI",
+      "sublabel": "doctor, run, daemon, status",
+      "pos": [
+        44,
+        304
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "pipeline",
+      "type": "backend",
+      "label": "Pipeline.tick()",
+      "sublabel": "one step per row, then exit",
+      "tag": "graph.check() guards writes",
+      "pos": [
+        616,
+        299
+      ],
+      "size": [
+        230,
+        72
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "SQLite Store",
+      "sublabel": "rows, leases, spend ledger",
+      "pos": [
+        330,
+        436
+      ],
+      "size": [
+        230,
+        62
+      ]
+    },
+    {
+      "id": "brain",
+      "type": "database",
+      "label": "Brain",
+      "sublabel": "per-repo markdown notes",
+      "pos": [
+        902,
+        436
+      ],
+      "size": [
+        230,
+        62
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "one developer laptop — no server, no daemon required",
+      "wraps": [
+        "cron",
+        "cli",
+        "pipeline",
+        "provider",
+        "agent",
+        "vcs",
+        "store",
+        "brain"
+      ],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {
+      "id": "cron-cli",
+      "from": "cron",
+      "to": "cli",
+      "label": "scheduled tick",
+      "labelDy": 24
+    },
+    {
+      "id": "cli-pipeline",
+      "from": "cli",
+      "to": "pipeline",
+      "label": "one Pipeline per source"
+    },
+    {
+      "id": "pipeline-provider",
+      "from": "pipeline",
+      "to": "provider",
+      "label": "redacted comments, AI State",
+      "variant": "security"
+    },
+    {
+      "id": "provider-tracker",
+      "from": "provider",
+      "to": "tracker",
+      "label": "REST",
+      "variant": "emphasis"
+    },
+    {
+      "id": "pipeline-agent",
+      "from": "pipeline",
+      "to": "agent",
+      "label": "4 model seams",
+      "variant": "emphasis"
+    },
+    {
+      "id": "agent-claude",
+      "from": "agent",
+      "to": "claude",
+      "label": "NDJSON stream",
+      "variant": "emphasis"
+    },
+    {
+      "id": "pipeline-vcs",
+      "from": "pipeline",
+      "to": "vcs",
+      "label": "worktree, commit, push, PR"
+    },
+    {
+      "id": "vcs-github",
+      "from": "vcs",
+      "to": "github",
+      "label": "git + gh CLI",
+      "variant": "emphasis"
+    },
+    {
+      "id": "pipeline-store",
+      "from": "pipeline",
+      "to": "store",
+      "label": "state, leases, cost + tokens"
+    },
+    {
+      "id": "pipeline-brain",
+      "from": "pipeline",
+      "to": "brain",
+      "label": "read into prompts, append on approval",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Layered seams",
+      "items": [
+        "pipeline.py names no tracker, no agent and no host",
+        "A new tracker is 7 methods in providers/base.py",
+        "A new agent is 2 methods in agents/base.py"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "State lives in two places",
+      "items": [
+        "SQLite is per-laptop: rows, leases, attempts, spend",
+        "The ticket AI State field is the only shared state",
+        "In-flight remotely with no local row means orphan — never adopt"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Nothing leaves unredacted",
+      "items": [
+        "redact() scrubs every comment, error and agent event log",
+        "Exact injected token values are matched, not only shapes",
+        "Agent runs use dontAsk with an explicit tool allowlist"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,330 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Zoom: New Ticket to Queued",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "judge",
+        "label": "Judging the ticket",
+        "focus": [
+          "ticket",
+          "denylist",
+          "llm",
+          "human_only",
+          "needs_input"
+        ],
+        "note": "Hard rules run before the model and can overrule it."
+      },
+      {
+        "id": "routing",
+        "label": "Routing to repos",
+        "focus": [
+          "llm",
+          "route",
+          "gate",
+          "queued"
+        ],
+        "note": "Triage decides which repositories need a change, one row each."
+      },
+      {
+        "id": "approval",
+        "label": "Plan approval loop",
+        "focus": [
+          "gate",
+          "planning",
+          "plan_review",
+          "human_reply",
+          "ticket"
+        ],
+        "note": "A rejected plan re-triages without re-routing the ticket."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "Triage and routing"
+    },
+    {
+      "id": "plan",
+      "label": "Analyst station (reads the repo)"
+    },
+    {
+      "id": "wait",
+      "label": "Waiting on a human",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "judge_phase",
+      "label": "Judge the ticket",
+      "fromCol": 0,
+      "toCol": 2
+    },
+    {
+      "id": "approve_phase",
+      "label": "Route, then approve",
+      "fromCol": 3,
+      "toCol": 5,
+      "variant": "emphasis"
+    }
+  ],
+  "groups": [
+    {
+      "id": "hard_first",
+      "label": "hard rules run before the model",
+      "lane": "main",
+      "fromCol": 1,
+      "toCol": 2,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "ticket",
+    "denylist",
+    "llm",
+    "route",
+    "gate",
+    "queued"
+  ],
+  "nodes": [
+    {
+      "id": "ticket",
+      "lane": "main",
+      "col": 0,
+      "type": "external",
+      "label": "new",
+      "sublabel": "assigned, untriaged",
+      "width": 148
+    },
+    {
+      "id": "denylist",
+      "lane": "main",
+      "col": 1,
+      "type": "security",
+      "label": "Denylist",
+      "sublabel": "ticket + comments",
+      "tag": "overrides the model",
+      "width": 148
+    },
+    {
+      "id": "llm",
+      "lane": "main",
+      "col": 2,
+      "type": "backend",
+      "label": "Triage call",
+      "sublabel": "1 turn, no tools",
+      "tag": "isolated triage_dir",
+      "width": 148
+    },
+    {
+      "id": "route",
+      "lane": "main",
+      "col": 3,
+      "type": "messagebus",
+      "label": "Route to repos",
+      "sublabel": "one row per repo",
+      "tag": "no invented keys",
+      "width": 148
+    },
+    {
+      "id": "gate",
+      "lane": "main",
+      "col": 4,
+      "type": "security",
+      "label": "Approval gate",
+      "sublabel": "scope vs policy",
+      "width": 148
+    },
+    {
+      "id": "queued",
+      "lane": "main",
+      "col": 5,
+      "type": "backend",
+      "label": "queued",
+      "sublabel": "waiting for a slot",
+      "width": 148
+    },
+    {
+      "id": "planning",
+      "lane": "plan",
+      "col": 4,
+      "type": "backend",
+      "label": "planning",
+      "sublabel": "read-only worktree",
+      "width": 148
+    },
+    {
+      "id": "plan_review",
+      "lane": "plan",
+      "col": 5,
+      "type": "security",
+      "label": "plan-review",
+      "sublabel": "plan posted",
+      "width": 148
+    },
+    {
+      "id": "human_reply",
+      "lane": "wait",
+      "col": 0,
+      "type": "external",
+      "label": "Human replies",
+      "sublabel": "non-bot comment",
+      "width": 148
+    },
+    {
+      "id": "human_only",
+      "lane": "wait",
+      "col": 2,
+      "type": "security",
+      "label": "human-only",
+      "sublabel": "terminal",
+      "width": 148
+    },
+    {
+      "id": "needs_input",
+      "lane": "wait",
+      "col": 3,
+      "type": "security",
+      "label": "needs-input",
+      "sublabel": "questions posted",
+      "width": 148
+    }
+  ],
+  "edges": [
+    {
+      "id": "ticket-denylist",
+      "from": "ticket",
+      "to": "denylist",
+      "variant": "emphasis"
+    },
+    {
+      "id": "denylist-llm",
+      "from": "denylist",
+      "to": "llm",
+      "label": "clean",
+      "variant": "emphasis"
+    },
+    {
+      "id": "denylist-humanonly",
+      "from": "denylist",
+      "to": "human_only",
+      "label": "hard rule hit",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "llm-humanonly",
+      "from": "llm",
+      "to": "human_only",
+      "label": "human_only",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "llm-needsinput",
+      "from": "llm",
+      "to": "needs_input",
+      "label": "clarify",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "llm-route",
+      "from": "llm",
+      "to": "route",
+      "label": "execute",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route-gate",
+      "from": "route",
+      "to": "gate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gate-queued",
+      "from": "gate",
+      "to": "queued",
+      "label": "below the gate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gate-planning",
+      "from": "gate",
+      "to": "planning",
+      "label": "sign-off needed",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "planning-planreview",
+      "from": "planning",
+      "to": "plan_review",
+      "variant": "default"
+    },
+    {
+      "id": "planreview-queued",
+      "from": "plan_review",
+      "to": "queued",
+      "label": "approved",
+      "variant": "emphasis"
+    },
+    {
+      "id": "needsinput-reply",
+      "from": "needs_input",
+      "to": "human_reply",
+      "label": "answer posted",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "planreview-reply",
+      "from": "plan_review",
+      "to": "human_reply",
+      "label": "plan rejected",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "reply-ticket",
+      "from": "human_reply",
+      "to": "ticket",
+      "label": "re-triage",
+      "variant": "default",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Hard rules beat the model",
+      "items": [
+        "Prod data, migrations, auth, payments, secrets and infra go to human-only",
+        "Prompt-injection shapes in a ticket body are treated the same way",
+        "Human comment text is scanned too; bot comments are not"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Triage never reads the repo",
+      "items": [
+        "reason() runs one turn with an empty tool allowlist",
+        "It runs in a fixed empty triage_dir, so no repo CLAUDE.md leaks in",
+        "doctor proves the isolation with a canary prompt, and fails if unverified"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Routing and the gate",
+      "items": [
+        "One ticket can need two repos, and gets one independent row each",
+        "With a single candidate repo the model is not consulted at all",
+        "Re-triage keeps the existing repo set so no branch is stranded"
+      ]
+    }
+  ]
+}

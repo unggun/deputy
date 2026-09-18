@@ -36,6 +36,12 @@ class TaskProvider(ABC):
     def set_status(self, task_id: str, status: str) -> None:
         ...
 
+    # Optional. The ticket identifier that goes into the branch name. Override
+    # when the provider's integration only recognises the id in a decorated
+    # form (ClickUp wants `CU-<id>`); `task.key` is right for everyone else.
+    def branch_key(self, task: Task) -> str:
+        return task.key
+
     # Optional. Providers that expose a native dependency graph should override.
     # Return [{"key": str, "closed": bool}, ...] for tickets this one waits on.
     def blocked_by(self, task_id: str) -> list[dict[str, Any]]:
