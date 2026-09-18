@@ -375,6 +375,7 @@ class Pipeline:
             if attempts > int(self.limits.get("max_fix_attempts", 3)):
                 self._escalate(task_id, "Execution crashed repeatedly; needs a human.")
             else:
+                self._record_transition(task_id, AIState.QUEUED)
                 self.store.set_state(task_id, AIState.QUEUED, attempts=attempts)
             return
 
@@ -491,6 +492,7 @@ class Pipeline:
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
         revision = meta.get("revision")
 
+        self._record_transition(rid, AIState.IN_PROGRESS)
         self.store.set_state(rid, AIState.IN_PROGRESS, branch=branch)
         self._push_remote_state(rid)
         # Only claim "in progress" on the board once no repo on this ticket is
@@ -612,6 +614,7 @@ class Pipeline:
             body=_pr_body(task, meta, result, vcs.diff_stat(impl_wt, base)),
             base=base, draft=bool(self.cfg.get("vcs.draft_prs", True)), env=env,
         )
+        self._record_transition(rid, AIState.PR_OPEN)
         self.store.set_state(rid, AIState.PR_OPEN, pr_number=number,
                              pr_url=url, attempts=0)
         self._push_remote_state(rid)
@@ -889,14 +892,23 @@ class Pipeline:
         row = self.store.get(rid) or {}
         return f"`{row.get('repo_key') or '?'}` — " if row.get("repo_key") else ""
 
+    def _record_transition(self, rid: str, new_state: AIState) -> None:
+        """Ledger line for one state change.
+
+        Called from every `store.set_state` site. The ledger otherwise holds
+        agent runs only, so there is no history of when a row reached pr-open
+        or done, and throughput cannot be reconstructed. `_set` is not the
+        single funnel it looks like: three stations write state directly.
+        """
+        row = self.store.get(rid)
+        if row:
+            self.store.record("state", rid, f"{row['state']}->{new_state.value}")
+
     def _set(self, rid: str, state: AIState) -> None:
         row = self.store.get(rid)
         if row:
             graph.check(AIState(row["state"]), state)
-            # The ledger otherwise holds agent runs only, so there is no
-            # history of when a row reached pr-open or done. Throughput and
-            # cycle time are reconstructed from these rows.
-            self.store.record("state", rid, f"{row['state']}->{state.value}")
+        self._record_transition(rid, state)
         self.store.set_state(rid, state)
         self._push_remote_state(rid)
 
@@ -915,10 +927,7 @@ class Pipeline:
 
     def _escalate(self, rid: str, reason: str) -> None:
         reason = self._clean(reason)
-        row = self.store.get(rid)
-        if row:
-            self.store.record("state", rid,
-                              f"{row['state']}->{AIState.BLOCKED.value}")
+        self._record_transition(rid, AIState.BLOCKED)
         self.store.set_state(rid, AIState.BLOCKED, last_error=reason[:1000])
         pid = self._pid(rid)
         self._push_remote_state(rid)

@@ -2471,6 +2471,21 @@ with tempfile.TemporaryDirectory() as _tmp:
                       _store.conn.execute("PRAGMA journal_mode").fetchone()[0]
                       .lower() == "wal"))
 
+    # Direct test: _record_transition for pr-open state (one of the three
+    # bypass sites that _set() doesn't funnel through). Seed a row at
+    # IN_PROGRESS state and call _record_transition directly to verify the
+    # pr-open transition reaches the ledger.
+    _test_rid = "mycorp:T999#repo-core"
+    _store.upsert(_test_rid, source="mycorp", provider_task_id="T999",
+                  task_key="T999", title="test", state=AIState.IN_PROGRESS.value,
+                  repo_key="repo-core")
+    _pipe._record_transition(_test_rid, AIState.PR_OPEN)
+    _pr_rows = _store.conn.execute(
+        "SELECT detail FROM events WHERE kind = 'state' AND task_id = ?",
+        (_test_rid,)).fetchall()
+    _c_checks.append(("_record_transition for pr-open reaches ledger",
+                      any("->pr-open" in r["detail"] for r in _pr_rows)))
+
 for label, ok in _c_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
