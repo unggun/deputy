@@ -1,0 +1,128 @@
+"""Offline tests for the dashboard read layer. No HTTP, no network.
+
+Plain PASS/FAIL script in the style of tests_smoke.py -- not pytest.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import sqlite3
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from runner.state import Store
+from runner.web.db import Reader
+
+results: list[bool] = []
+
+
+def check(label: str, ok: bool) -> None:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(bool(ok))
+
+
+def seed(tmp: str) -> tuple[str, Store]:
+    """A store with one healthy row and one of each stuck condition."""
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    now = int(time.time())
+    st.upsert("acme:1#api", source="acme", provider_task_id="1",
+              task_key="DEV-1", title="healthy", state="in-progress",
+              repo_key="api", attempts=0, lease_until=now + 600)
+    st.upsert("acme:2#api", source="acme", provider_task_id="2",
+              task_key="DEV-2", title="waiting", state="needs-input",
+              repo_key="api", attempts=0)
+    st.upsert("acme:3#api", source="acme", provider_task_id="3",
+              task_key="DEV-3", title="dead lease", state="in-progress",
+              repo_key="api", attempts=1, lease_until=now - 60)
+    st.upsert("acme:4#api", source="acme", provider_task_id="4",
+              task_key="DEV-4", title="exhausted", state="queued",
+              repo_key="api", attempts=3)
+    st.upsert("acme:5#api", source="acme", provider_task_id="5",
+              task_key="DEV-5", title="errored", state="queued",
+              repo_key="api", attempts=0,
+              last_error="push failed: token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    return path, st
+
+
+print("dashboard read layer")
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    rdr = Reader(path, secrets=[], limits={"max_fix_attempts": 3,
+                                           "max_active_tasks": 3,
+                                           "daily_budget_usd": 15,
+                                           "daily_tokens": 0})
+    now = int(time.time())
+    stuck = {r["task_key"]: r["reason"] for r in rdr.stuck(now)}
+
+    check("healthy row is not stuck", "DEV-1" not in stuck)
+    check("needs-input is stuck", "waiting on a human" in stuck.get("DEV-2", ""))
+    check("expired lease is stuck", "lease expired" in stuck.get("DEV-3", ""))
+    check("exhausted attempts is stuck", "attempts" in stuck.get("DEV-4", ""))
+    check("last_error is stuck", "error" in stuck.get("DEV-5", ""))
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    rdr = Reader(path, secrets=["ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+                 limits={"max_fix_attempts": 3})
+    row = rdr.task("acme:5#api")
+    check("last_error is redacted on egress",
+          row is not None and "ghp_" not in (row["last_error"] or ""))
+    check("row id containing '#' round-trips", row is not None
+          and row["task_id"] == "acme:5#api")
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    rdr = Reader(path, limits={})
+    wrote = True
+    try:
+        rdr.conn.execute("UPDATE tasks SET title = 'x' WHERE task_id = 'acme:1#api'")
+        rdr.conn.commit()
+    except sqlite3.OperationalError:
+        wrote = False
+    check("the reader's connection cannot write", wrote is False)
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    # 23:30 local yesterday and 00:30 local today must land in different
+    # buckets; UTC bucketing (ts/86400) would merge or split them wrongly.
+    today = dt.datetime.now().replace(hour=0, minute=30, second=0, microsecond=0)
+    yesterday = today - dt.timedelta(hours=1)
+    for when, tok in ((yesterday, 100), (today, 200)):
+        st.conn.execute(
+            "INSERT INTO events (ts, task_id, kind, detail, cost_usd, tokens)"
+            " VALUES (?,?,?,?,?,?)",
+            (int(when.timestamp()), "acme:1#api", "implement", "ok", 0.5, tok))
+    st.conn.commit()
+    rdr = Reader(path, limits={})
+    days = {d["day"]: d for d in rdr.spend_by_day(7)}
+    check("spend buckets on local midnight, not UTC", len(days) == 2)
+    check("spend sums tokens per day",
+          sum(d["tokens"] for d in days.values()) == 300)
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    base = int(dt.datetime.now().replace(hour=9, minute=0, second=0,
+                                         microsecond=0).timestamp())
+    for off, detail in ((0, "new->queued"), (60, "queued->in-progress"),
+                        (120, "in-progress->pr-open"), (180, "pr-open->done")):
+        st.conn.execute(
+            "INSERT INTO events (ts, task_id, kind, detail) VALUES (?,?,?,?)",
+            (base + off, "acme:1#api", "state", detail))
+    st.conn.commit()
+    rdr = Reader(path, limits={})
+    tp = rdr.throughput_by_day(7)
+    check("throughput counts transitions into done",
+          sum(d["done"] for d in tp) == 1)
+    check("throughput counts transitions into pr-open",
+          sum(d["pr_open"] for d in tp) == 1)
+    cycles = rdr.cycle_times(7)
+    check("cycle time measured from first event to done",
+          len(cycles) == 1 and cycles[0]["seconds"] == 180)
+
+print(f"\n{sum(results)}/{len(results)} passed")
+sys.exit(0 if all(results) else 1)
