@@ -148,5 +148,50 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cycle time is not clamped to the reporting window",
           cycles.get("acme:1#api", 0) > 35 * 86400)
 
+# --- agent log discovery and tail ------------------------------------------
+import json as _json
+from runner.web import logs as weblogs
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "DEV-1__api__implement.log").write_text(
+        _json.dumps({"seq": 1, "type": "output", "stream": "stdout",
+                     "text": "using token ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}) + "\n"
+        + _json.dumps({"seq": 2, "type": "result", "num_turns": 3}) + "\n",
+        encoding="utf-8")
+    (root / "DEV-1__api__review.log").write_text(
+        _json.dumps({"seq": 1, "type": "result"}) + "\n", encoding="utf-8")
+    (root / "DEV-1__web__implement.log").write_text(
+        _json.dumps({"seq": 1, "type": "result"}) + "\n", encoding="utf-8")
+
+    found = weblogs.stations(root, "DEV-1", "api")
+    check("stations lists only this repo's logs",
+          sorted(found) == ["implement", "review"])
+
+    got = weblogs.tail(root, "DEV-1", "api", "implement", 0,
+                       secrets=["ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"])
+    check("tail returns parsed JSONL records", len(got["lines"]) == 2)
+    check("tail redacts secrets in log text",
+          "ghp_" not in _json.dumps(got["lines"]))
+    check("tail reports eof at the end of the file", got["eof"] is True)
+
+    more = weblogs.tail(root, "DEV-1", "api", "implement", got["next_offset"])
+    check("tail from the returned offset yields nothing new",
+          more["lines"] == [] and more["eof"] is True)
+
+    check("a missing log is reported, not raised",
+          weblogs.tail(root, "DEV-9", "api", "implement", 0)["missing"] is True)
+
+    # A run written before Task 3 keeps its old name; an in-flight row should
+    # still show something rather than an empty tab.
+    (root / "DEV-2-implement.log").write_text(
+        _json.dumps({"seq": 1, "type": "result"}) + "\n", encoding="utf-8")
+    check("legacy per-ticket log names still resolve",
+          weblogs.tail(root, "DEV-2", "api", "implement", 0)["missing"] is False)
+
+    # A path traversal attempt must not escape the log root.
+    check("station names cannot escape the log root",
+          weblogs.tail(root, "DEV-1", "api", "../../etc/passwd", 0)["missing"] is True)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
