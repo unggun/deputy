@@ -13,7 +13,7 @@ from . import analyst, brain, graph, review, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
 from .jsonio import StationError
-from .models import AIState, AnalysisResult, ReviewResult, Task, TriageResult
+from .models import AIState, AnalysisResult, ReviewResult, Task, TriageResult, agent_log_name
 from .providers.base import TaskProvider
 from .redact import redact
 from .state import Store
@@ -450,7 +450,7 @@ class Pipeline:
                 cwd=wt,
                 model=self.acfg.get("model"),
                 tools=self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS,
-                log_path=self.log_root / f"{task.key}-plan.log",
+                log_path=self.log_root / agent_log_name(task.key, repo["key"], "plan"),
             )
         except StationError as exc:
             self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
@@ -513,7 +513,7 @@ class Pipeline:
         else:
             prompt = _work_prompt(task, repo, meta, brain_block)
         res = self.agent.work(prompt, wt,
-                              log_path=self.log_root / f"{task.key}-implement.log")
+                              log_path=self.log_root / agent_log_name(task.key, repo["key"], "implement"))
         self.store.record("implement", rid, res.error or "ok", res.cost_usd,
                           res.usage.total)
 
@@ -563,7 +563,7 @@ class Pipeline:
                 cwd=wt,
                 model=self.acfg.get("reviewer_model") or self.acfg.get("model"),
                 tools=review.tools_for(repo, self.acfg.get("reviewer_tools")),
-                log_path=self.log_root / f"{task.key}-review.log",
+                log_path=self.log_root / agent_log_name(task.key, repo["key"], "review"),
             )
         except StationError as exc:
             self.store.record("review", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
@@ -709,7 +709,7 @@ class Pipeline:
         prompt = _fix_prompt(row["task_key"], st, feedback, logs,
                              self._brain_block(repo["key"]))
         res = self.agent.work(prompt, wt,
-                              log_path=self.log_root / f"{row['task_key']}-fix-{attempts}.log")
+                              log_path=self.log_root / agent_log_name(row["task_key"], repo["key"], f"fix-{attempts}"))
         self.store.record("fix", rid, res.error or "ok", res.cost_usd,
                           res.usage.total)
         # Second-precision and Z-suffixed to match GitHub's `createdAt`: these

@@ -2486,9 +2486,30 @@ with tempfile.TemporaryDirectory() as _tmp:
     _c_checks.append(("_record_transition for pr-open reaches ledger",
                       any("->pr-open" in r["detail"] for r in _pr_rows)))
 
+# --- agent logs are per repo, not per ticket -------------------------------
+# _EventLog opens with "w", so two rows of a cross-repo ticket writing the
+# same filename means the second run truncates the first run's evidence.
+from runner.models import agent_log_name as _aln
+
+_c_checks.append(("log name includes the repo key",
+                  _aln("DEV-1", "api", "implement")
+                  == "DEV-1__api__implement.log"))
+_c_checks.append(("two repos of one ticket get different log names",
+                  _aln("DEV-1", "api", "implement")
+                  != _aln("DEV-1", "web", "implement")))
+
+import inspect as _inspect
+_src = _inspect.getsource(Pipeline)
+_c_checks.append(("pipeline builds log paths through agent_log_name",
+                  "agent_log_name(" in _src
+                  and "-implement.log" not in _src
+                  and "-plan.log" not in _src
+                  and "-review.log" not in _src))
+
 for label, ok in _c_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
+

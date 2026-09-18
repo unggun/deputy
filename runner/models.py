@@ -211,3 +211,17 @@ class ReviewResult:
     suggestions: list[str] = field(default_factory=list)
     summary: str = ""
     brain_notes: list[str] = field(default_factory=list)
+
+def agent_log_name(task_key: str, repo_key: str, station: str) -> str:
+    """Filename for one station's JSONL run log.
+
+    The repo key is part of the name because a ticket routed to two repos has
+    two independent rows, and `_EventLog` opens its file with "w". Without the
+    repo key the second repo's run truncates the first repo's evidence.
+
+    `__` separates the fields, matching `brain.py`'s `{source}__{repo}`, and
+    because `-` appears inside both ticket keys (DEV-1234) and repo keys
+    (pulse-backend) and so cannot be parsed back out.
+    """
+    safe = repo_key.replace("/", "_")
+    return f"{task_key}__{safe}__{station}.log"
