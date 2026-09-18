@@ -2,6 +2,8 @@
 config.yaml
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 .ai-runner/
 
 # Python

@@ -66,6 +66,10 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        # WAL lets the read-only dashboard query this file while a tick is
+        # writing. Without it a reader hits SQLITE_BUSY against the writer's
+        # lock. Persistent once set; harmless for the single-writer cron path.
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._migrate()

@@ -2437,6 +2437,40 @@ with tempfile.TemporaryDirectory() as tmp:
 _c_checks.append(("doctor actually runs the canary",
                   bool(_made) and CANARY_PROMPT in _made[0].prompts))
 
+# --- state transitions reach the ledger ------------------------------------
+# Throughput charts reconstruct history from these rows. _escalate() writes
+# state directly rather than through _set(), so it needs its own line or every
+# escalation is invisible to the dashboard.
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg = Config.load("config.example.yaml")
+    _cfg.data["runner"]["db_path"] = f"{_tmp}/s.db"
+    _cfg.data["runner"]["work_dir"] = f"{_tmp}/w"
+    _cfg.data["runner"]["log_dir"] = f"{_tmp}/l"
+    _src = _cfg.sources(only=["mycorp"])[0]
+    _task = mk("T90", "Add pagination to /users", "add ?page and ?limit")
+    _prov = FakeProvider([_task])
+    _store = Store(f"{_tmp}/s.db")
+    _pipe = Pipeline(_cfg, _src, _prov, FakeAgent(
+        {"decision": "clarify", "confidence": 0.4, "scope": "s",
+         "questions": ["Which endpoint?"]}), _store)
+    _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+
+    _state_rows = _store.conn.execute(
+        "SELECT detail FROM events WHERE kind = 'state'").fetchall()
+    _c_checks.append(("_set() records a state transition",
+                      any("->needs-input" in r["detail"] for r in _state_rows)))
+
+    _rid = [r["task_id"] for r in _store.in_flight()][0]
+    _pipe._escalate(_rid, "boom")
+    _esc_rows = _store.conn.execute(
+        "SELECT detail FROM events WHERE kind = 'state'").fetchall()
+    _c_checks.append(("_escalate() records a state transition",
+                      any("->blocked" in r["detail"] for r in _esc_rows)))
+
+    _c_checks.append(("store is in WAL mode",
+                      _store.conn.execute("PRAGMA journal_mode").fetchone()[0]
+                      .lower() == "wal"))
+
 for label, ok in _c_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)

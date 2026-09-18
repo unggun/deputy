@@ -893,6 +893,10 @@ class Pipeline:
         row = self.store.get(rid)
         if row:
             graph.check(AIState(row["state"]), state)
+            # The ledger otherwise holds agent runs only, so there is no
+            # history of when a row reached pr-open or done. Throughput and
+            # cycle time are reconstructed from these rows.
+            self.store.record("state", rid, f"{row['state']}->{state.value}")
         self.store.set_state(rid, state)
         self._push_remote_state(rid)
 
@@ -911,6 +915,10 @@ class Pipeline:
 
     def _escalate(self, rid: str, reason: str) -> None:
         reason = self._clean(reason)
+        row = self.store.get(rid)
+        if row:
+            self.store.record("state", rid,
+                              f"{row['state']}->{AIState.BLOCKED.value}")
         self.store.set_state(rid, AIState.BLOCKED, last_error=reason[:1000])
         pid = self._pid(rid)
         self._push_remote_state(rid)
