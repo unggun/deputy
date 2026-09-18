@@ -3,14 +3,12 @@ import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip,
 import { useSpend } from "@/lib/api";
 import { ChartFrame } from "@/components/ChartFrame";
 import { GRID, MUTED, SERIES, STATIONS, SURFACE } from "@/lib/palette";
-
-const mode = () =>
-  window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+import { useColorMode } from "@/lib/useColorMode";
 
 export function Spend() {
   const { data } = useSpend(30);
+  const m = useColorMode();
   if (!data) return <div className="p-6 text-muted-foreground">loading…</div>;
-  const m = mode();
 
   // One row per day, one numeric field per station kind. Days with no work are
   // absent rather than zero-filled -- an absent bar reads as "nothing ran",

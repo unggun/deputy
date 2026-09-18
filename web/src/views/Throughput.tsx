@@ -3,9 +3,7 @@ import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip,
 import { useThroughput } from "@/lib/api";
 import { ChartFrame } from "@/components/ChartFrame";
 import { GRID, MUTED, STATUS, SURFACE } from "@/lib/palette";
-
-const mode = () =>
-  window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+import { useColorMode } from "@/lib/useColorMode";
 
 /** Bucket cycle times into human-sized bands rather than raw seconds. */
 function histogram(seconds: number[]): { band: string; n: number }[] {
@@ -21,8 +19,8 @@ function histogram(seconds: number[]): { band: string; n: number }[] {
 
 export function Throughput() {
   const { data } = useThroughput(30);
+  const m = useColorMode();
   if (!data) return <div className="p-6 text-muted-foreground">loading…</div>;
-  const m = mode();
   const axis = { stroke: MUTED, fontSize: 11, tickLine: false, axisLine: false };
   const days = data.days.map((d: any) => ({ ...d, day: d.day.slice(5) }));
   const hist = histogram(data.cycle_times.map((c: any) => c.seconds));
