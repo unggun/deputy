@@ -20,3 +20,6 @@ venv/
 
 # SDD scratch — ledger, briefs, review packages
 .superpowers/
+
+# Isolated worktrees — scratch, never committed
+.claude/worktrees/
