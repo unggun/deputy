@@ -14,10 +14,12 @@ PR through CI/review until merge.
 ```
 runner/
   __init__.py  cli.py  config.py  graph.py  models.py  pipeline.py  state.py  triage.py  vcs.py
-  analyst.py  review.py  brain.py  jsonio.py
+  analyst.py  review.py  brain.py  jsonio.py  redact.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
   providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
-tests_smoke.py  README.md  config.example.yaml
+  web/       __init__.py  api.py  db.py  logs.py  static/ (committed build output)
+web/           frontend source (Vite + React); `npm run build` writes into runner/web/static/
+tests_smoke.py  tests_web.py  README.md  config.example.yaml
 ```
 
 Note the two unrelated `base.py` files: `providers/base.py` defines `TaskProvider`
@@ -25,10 +27,16 @@ Note the two unrelated `base.py` files: `providers/base.py` defines `TaskProvide
 (`reason` for tool-less classification, `work` for agentic runs). Confusing one for
 the other imports cleanly and only fails at the consumer, so check which you have open.
 
-Packaging is `pyproject.toml` at the root with setuptools flat-layout auto-discovery —
-it picks up `runner` and its two sub-packages and excludes `tests_smoke.py` and
-`config.example.yaml`. The console script is `ai-task-runner = runner.cli:main`, so
-`pyproject.toml` must stay at the repo root, not inside `runner/`.
+Packaging is `pyproject.toml` at the root. It does **not** use plain setuptools
+flat-layout auto-discovery: `packages = { find = { include = ["runner*"] } }` is
+explicit, because the top-level `web/` frontend source is a sibling directory at
+the repo root and auto-discovery would try to treat it as a package too. A
+`[tool.setuptools.package-data]` entry separately ships `runner/web/static/**/*`
+— auto-discovery finds Python packages and carries no other files, so without
+that entry the built dashboard assets would be silently absent from the wheel
+while the package still imported cleanly. The console script is
+`ai-task-runner = runner.cli:main`, so `pyproject.toml` must stay at the repo
+root, not inside `runner/`.
 
 ## Commands
 
@@ -379,6 +387,13 @@ Invariants, each easy to undo by accident:
   a missing database surfaces as a generic `OperationalError`; `Reader.__init__`
   turns that into `FileNotFoundError` when the path truly doesn't exist, which
   is what lets `_serve` tell "no database yet" apart from "database is broken".
+- **`Store.__init__` sets `PRAGMA journal_mode=WAL`.** This is what makes the
+  read-only reader and the writing tick safe to run at once: without WAL, a
+  dashboard query issued while a tick holds the write lock hits `SQLITE_BUSY`
+  instead of an answer. It has nothing to do with the dashboard's own code —
+  it is set on the *writer* side, in `state.py`, so it is the invariant most
+  likely to be deleted by someone tidying `Store.__init__` who has never had
+  reason to open `runner/web/`.
 - **`_serve` probes before it binds a port.** It opens a `Reader` and runs
   `SELECT 1 FROM tasks`, and refuses to start on `FileNotFoundError` (missing
   db) or `sqlite3.Error` (a directory, a corrupt file, the wrong schema).
@@ -415,8 +430,10 @@ Invariants, each easy to undo by accident:
   showing $0 there would disagree with the gate it exists to report on.
 
 `_record_transition()` — not `_set()` — is the single funnel for the `events`
-ledger's `kind = "state"` rows. `grep -n "store.set_state" runner/pipeline.py`
-finds five call sites, and `_record_transition` runs immediately before
+ledger's `kind = "state"` rows. `grep -n "self\.store\.set_state" runner/pipeline.py`
+finds five call sites (a plain `grep -n "store.set_state"` also matches
+`_record_transition`'s own docstring, which mentions the string — a sixth,
+spurious hit), and `_record_transition` runs immediately before
 `store.set_state` at every one of them: one is inside `_set()` (the general
 case, which also does `graph.check()` and pushes remote state), one is inside
 `_escalate()` (the transition to `blocked`), and three write state directly,

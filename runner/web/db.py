@@ -167,8 +167,10 @@ class Reader:
     def throughput_by_day(self, days: int = 30) -> list[dict[str, Any]]:
         """Transitions into pr-open / done / blocked, per local day.
 
-        Reads the `state` events written by pipeline._set and _escalate,
-        whose detail is exactly "<old>-><new>".
+        Reads the `state` events written by `Pipeline._record_transition`,
+        called from all five `store.set_state` sites in pipeline.py -- not
+        just `_set`/`_escalate`, which are two of the five. Each row's detail
+        is exactly "<old>-><new>".
         """
         rows = self.conn.execute(
             "SELECT date(ts,'unixepoch','localtime') day, detail FROM events"
