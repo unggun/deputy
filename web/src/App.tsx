@@ -5,16 +5,17 @@ import { Overview } from "@/views/Overview";
 import { Board } from "@/views/Board";
 import { Spend } from "@/views/Spend";
 import { Throughput } from "@/views/Throughput";
+import { GraphTab } from "@/views/GraphTab";
+import { TaskSheet } from "@/views/TaskSheet";
 
 const qc = new QueryClient();
 
 export default function App() {
   const [tab, setTab] = useState("overview");
-  // Which task's detail sheet is open. Task 9 fills in the sheet itself;
-  // Overview and Board both hand it their row's task_id via onOpen. Read
-  // here only via `void` until Task 9 renders the sheet from it.
+  // Which task's detail sheet is open. Overview and Board both hand it their
+  // row's task_id via onOpen; TaskSheet is mounted outside <Tabs> below so it
+  // opens the same way from any view.
   const [openId, setOpenId] = useState<string | null>(null);
-  void openId;
   return (
     <QueryClientProvider client={qc}>
       <div className="min-h-screen bg-background text-foreground p-4 md:p-6">
@@ -30,8 +31,9 @@ export default function App() {
           <TabsContent value="board"><Board onOpen={setOpenId} /></TabsContent>
           <TabsContent value="spend"><Spend /></TabsContent>
           <TabsContent value="throughput"><Throughput /></TabsContent>
-          <TabsContent value="graph">{/* Task 9 */}</TabsContent>
+          <TabsContent value="graph"><GraphTab /></TabsContent>
         </Tabs>
+        <TaskSheet id={openId} onClose={() => setOpenId(null)} />
       </div>
     </QueryClientProvider>
   );

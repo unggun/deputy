@@ -61,5 +61,8 @@ export const useThroughput = (days = 30) =>
              queryFn: () => get<any>(`/api/throughput?days=${days}`),
              refetchInterval: 15000 });
 
+export type GraphTransition = { from: string; to: string; label: string };
+
 export const useGraph = () =>
-  useQuery({ queryKey: ["graph"], queryFn: () => get<{ mermaid: string }>("/api/graph") });
+  useQuery({ queryKey: ["graph"],
+             queryFn: () => get<{ transitions: GraphTransition[]; mermaid: string }>("/api/graph") });

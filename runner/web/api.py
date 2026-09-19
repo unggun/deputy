@@ -137,8 +137,18 @@ def build_app(cfg: Config) -> FastAPI:
             r.close()
 
     @app.get("/api/graph")
-    def state_graph() -> dict[str, str]:
-        return {"mermaid": graph.to_mermaid()}
+    def state_graph() -> dict[str, Any]:
+        # Structured, so the UI can render a table without a diagram engine.
+        # The mermaid source rides along for pasting into anything that does
+        # render it -- both come from graph.TRANSITIONS, so neither can drift.
+        return {
+            "transitions": [
+                {"from": src.value, "to": dst.value, "label": label}
+                for src, targets in graph.TRANSITIONS.items()
+                for dst, label in targets.items()
+            ],
+            "mermaid": graph.to_mermaid(),
+        }
 
     @app.get("/api/config")
     def config_summary() -> dict[str, Any]:
