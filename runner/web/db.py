@@ -16,6 +16,16 @@ _WAITING = (AIState.BLOCKED.value, AIState.HUMAN_ONLY.value,
 _ACTIVE = (AIState.IN_PROGRESS.value, AIState.REVIEW.value,
            AIState.PR_OPEN.value)
 _TERMINAL = tuple(s.value for s in AIState if s.is_terminal)
+# Terminal, but terminal *because a human has to act* -- that is the entire
+# point of these two states, so they stay in the stuck list even though
+# nothing will move them on its own. Every other terminal state (`done`) is
+# finished, not wedged, and must never appear there.
+_ATTENTION = (AIState.BLOCKED.value, AIState.HUMAN_ONLY.value)
+# `state` rows are transition markers written by Pipeline._record_transition;
+# they carry no cost and no tokens. One definition, used by every spend sum,
+# so the "today" figure on the overview and the per-day chart cannot drift
+# apart the day a state row starts carrying a number.
+_SPEND_ONLY = "kind != 'state'"
 
 
 def _midnight_epoch(now: dt.datetime) -> int:
@@ -108,11 +118,32 @@ class Reader:
 
         Each row carries a `reason` so the UI renders an explanation rather
         than a color.
+
+        Two rules keep this list emptiable, which is the only thing that makes
+        it worth reading:
+
+        * **The scan skips finished rows.** A `done` row is not stuck no
+          matter what happened on the way there. `blocked` and `human-only`
+          are terminal too, but they are terminal *because* a human has to
+          act, so they stay. Written as "non-terminal, plus the two attention
+          states" rather than "not `done`": a terminal state added later is
+          excluded by default, which is the safe direction.
+        * **`last_error` counts only on a non-terminal row.** Nothing in this
+          codebase ever clears `last_error` -- one transient `gh` timeout
+          during the implement pass is still on the row weeks later. On a row
+          that has since moved on it is history, not a symptom. On a `blocked`
+          row it is the escalation reason, already said by the waiting reason
+          and rendered underneath it, so repeating it adds nothing. Only a
+          row that is still supposed to be moving gets flagged for it.
         """
         cap = int(self.limits.get("max_fix_attempts", 3) or 3)
+        sql = ("SELECT * FROM tasks WHERE state NOT IN (%s) OR state IN (%s)"
+               % (",".join("?" * len(_TERMINAL)),
+                  ",".join("?" * len(_ATTENTION))))
         out: list[dict[str, Any]] = []
-        for row in self.conn.execute("SELECT * FROM tasks"):
+        for row in self.conn.execute(sql, [*_TERMINAL, *_ATTENTION]):
             r = self._row(row)
+            live = r["state"] not in _TERMINAL
             reasons: list[str] = []
             if r["state"] in _WAITING:
                 reasons.append(f"waiting on a human ({r['state']})")
@@ -121,7 +152,7 @@ class Reader:
                 reasons.append("lease expired -- the run that held it is gone")
             if int(r["attempts"] or 0) >= cap:
                 reasons.append(f"attempts exhausted ({r['attempts']}/{cap})")
-            if r["last_error"]:
+            if live and r["last_error"]:
                 reasons.append("last run recorded an error")
             if reasons:
                 r["reason"] = "; ".join(reasons)
@@ -144,7 +175,7 @@ class Reader:
         rows = self.conn.execute(
             "SELECT date(ts,'unixepoch','localtime') day, kind,"
             "       SUM(cost_usd) cost_usd, SUM(tokens) tokens"
-            "  FROM events WHERE ts >= ? AND kind != 'state'"
+            f"  FROM events WHERE ts >= ? AND {_SPEND_ONLY}"
             " GROUP BY day, kind ORDER BY day ASC", (self._since(days),))
         by_day: dict[str, dict[str, Any]] = {}
         for r in rows:
@@ -235,7 +266,8 @@ class Reader:
             "SELECT state, COUNT(*) n FROM tasks GROUP BY state")}
         spent = self.conn.execute(
             "SELECT COALESCE(SUM(cost_usd),0) c, COALESCE(SUM(tokens),0) t"
-            " FROM events WHERE ts >= ?", (midnight,)).fetchone()
+            f" FROM events WHERE ts >= ? AND {_SPEND_ONLY}",
+            (midnight,)).fetchone()
         last = self.conn.execute(
             "SELECT COALESCE(MAX(ts), 0) ts FROM events").fetchone()
         return {

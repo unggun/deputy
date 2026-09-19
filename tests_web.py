@@ -65,6 +65,72 @@ with tempfile.TemporaryDirectory() as tmp:
     check("exhausted attempts is stuck", "attempts" in stuck.get("DEV-4", ""))
     check("last_error is stuck", "error" in stuck.get("DEV-5", ""))
 
+# --- stuck() must be emptiable ---------------------------------------------
+# `last_error` is never cleared anywhere in the codebase (pipeline.py writes
+# it, nothing wipes it), so without a terminal filter the "Needs a human"
+# list and the red KPI tile degrade into a permanent record of every error
+# the runner ever hit -- "Nothing is stuck" becomes unreachable after the
+# first escalation, and the dashboard disagrees with `ai-task-runner status`,
+# which does filter terminals.
+with tempfile.TemporaryDirectory() as tmp:
+    path, st = seed(tmp)
+    now = int(time.time())
+    st.upsert("acme:6#api", source="acme", provider_task_id="6",
+              task_key="DEV-6", title="finished, but hit a blip on the way",
+              state="done", repo_key="api", attempts=2,
+              last_error="gh: timed out waiting for checks")
+    st.upsert("acme:7#api", source="acme", provider_task_id="7",
+              task_key="DEV-7", title="escalated", state="blocked",
+              repo_key="api", attempts=3, last_error="boom")
+    st.upsert("acme:8#api", source="acme", provider_task_id="8",
+              task_key="DEV-8", title="denylisted", state="human-only",
+              repo_key="api", attempts=0)
+    rdr = Reader(path, secrets=[], limits={"max_fix_attempts": 3})
+    stuck = {r["task_key"]: r["reason"] for r in rdr.stuck(now)}
+
+    check("a done row with a stale last_error is NOT stuck",
+          "DEV-6" not in stuck)
+    check("a blocked row is still stuck -- that is what blocked means",
+          "waiting on a human (blocked)" in stuck.get("DEV-7", ""))
+    check("a human-only row is still stuck",
+          "waiting on a human (human-only)" in stuck.get("DEV-8", ""))
+    check("a non-terminal row with last_error is still stuck",
+          "last run recorded an error" in stuck.get("DEV-5", ""))
+    check("a terminal row is not flagged for a stale last_error",
+          "last run recorded an error" not in stuck.get("DEV-7", ""))
+
+    # The headline claim: with nothing in flight and nothing waiting, the
+    # banner can reach "Nothing is stuck" again.
+    st.conn.execute("DELETE FROM tasks")
+    st.conn.commit()
+    st.upsert("acme:9#api", source="acme", provider_task_id="9",
+              task_key="DEV-9", title="shipped", state="done", repo_key="api",
+              attempts=1, last_error="a transient failure, long since past")
+    rdr2 = Reader(path, secrets=[], limits={"max_fix_attempts": 3})
+    check("the stuck list empties once the work is done",
+          rdr2.stuck(now) == []
+          and rdr2.overview(dt.datetime.now())["stuck"] == 0)
+
+# --- the two _midnight_epoch definitions must agree -------------------------
+# db.py duplicates pipeline's definition rather than importing it (importing
+# `pipeline` would pull the providers, the agent adapter and `requests` into
+# a process whose only job is to read a file). Its docstring says "a test
+# pins it"; this is that test.
+from runner.pipeline import _midnight_epoch as _pipeline_midnight
+from runner.web.db import _midnight_epoch as _web_midnight
+
+_agree = all(
+    _web_midnight(when) == _pipeline_midnight(when)
+    for when in (
+        dt.datetime(2026, 1, 1, 0, 0, 0),
+        dt.datetime(2026, 3, 29, 2, 30, 0),    # spring DST boundary (EU)
+        dt.datetime(2026, 6, 15, 12, 0, 1),
+        dt.datetime(2026, 10, 25, 2, 30, 0),   # autumn DST boundary (EU)
+        dt.datetime(2026, 12, 31, 23, 59, 59),
+        dt.datetime.now(),
+    ))
+check("db._midnight_epoch agrees with pipeline._midnight_epoch", _agree)
+
 with tempfile.TemporaryDirectory() as tmp:
     path, st = seed(tmp)
     rdr = Reader(path, secrets=["ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
