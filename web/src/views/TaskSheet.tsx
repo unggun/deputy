@@ -28,7 +28,10 @@ function LogTail({ id, station }: { id: string; station: string }) {
   const [chunks, setChunks] = useState<Record<number, any[]>>({});
   const { data } = useTaskLog(id, station, offset);
 
-  useEffect(() => { setOffset(0); setChunks({}); }, [id, station]);
+  // No reset-on-[id, station] effect here: `TaskSheet` mounts this component
+  // with `key={`${id}:${station}`}`, so a row or station switch remounts it
+  // from scratch (fresh `offset`/`chunks`) rather than updating it in place --
+  // those deps can never change within one instance's lifetime.
 
   useEffect(() => {
     if (!data || data.missing) return;
@@ -91,7 +94,16 @@ export function TaskSheet({ id, onClose }: { id: string | null; onClose: () => v
               <span>{row.tokens.toLocaleString()} tok · ${row.cost_usd.toFixed(2)}</span>
             </div>
 
-            <Tabs defaultValue="timeline" className="mt-4">
+            {/* Keyed on `id`: the Sheet's `open` prop never passes through
+                `false` when the row switches (Board/Overview hand `onOpen` a
+                new id directly), so Dialog.Content never unmounts and this
+                uncontrolled Tabs would otherwise keep whatever value was
+                selected on the PREVIOUS row. If that value has no matching
+                trigger/content on the new row (e.g. "error" when the new row
+                has no last_error), nothing renders as active -- a blank pane
+                instead of falling back to Timeline. Keying on `id` forces a
+                remount on every row switch, same as `LogTail` already does. */}
+            <Tabs key={id ?? undefined} defaultValue="timeline" className="mt-4">
               <TabsList>
                 <TabsTrigger value="timeline">Timeline</TabsTrigger>
                 <TabsTrigger value="logs">Logs</TabsTrigger>
