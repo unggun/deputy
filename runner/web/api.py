@@ -68,6 +68,13 @@ def build_app(cfg: Config) -> FastAPI:
             out["runner_id"] = cfg.get("runner.id", "runner")
             out["mode"] = cfg.get("runner.mode", "shadow")
             out["windows"] = cfg.get("runner.windows", {}) or {}
+            # `days` rides along with `windows` because the last-tick
+            # indicator has to reproduce `Pipeline.tick`'s gate exactly, and
+            # that gate is day-of-week AND window. Same default as the
+            # pipeline's, so an unset key does not make the tile disagree
+            # with what the runner actually does.
+            out["days"] = cfg.get("runner.days",
+                                  ["mon", "tue", "wed", "thu", "fri"])
             return out
         finally:
             r.close()

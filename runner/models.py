@@ -223,6 +223,11 @@ def agent_log_name(task_key: str, repo_key: str, station: str) -> str:
     `__` separates the fields, matching `brain.py`'s `{source}__{repo}`, and
     because `-` appears inside both ticket keys (DEV-1234) and repo keys
     (pulse-backend) and so cannot be parsed back out.
+
+    Both fields are sanitised, not just the repo key: a ClickUp Custom Task
+    ID is whatever the workspace typed, and a `/` in either one would put the
+    log somewhere other than `runner.log_dir`.
     """
-    safe = repo_key.replace("/", "_")
-    return f"{task_key}__{safe}__{station}.log"
+    safe_key = task_key.replace("/", "_")
+    safe_repo = repo_key.replace("/", "_")
+    return f"{safe_key}__{safe_repo}__{station}.log"

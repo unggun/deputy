@@ -314,6 +314,19 @@ with tempfile.TemporaryDirectory() as tmp:
           "fix-1" in weblogs.stations(root, "DEV-2", "api"))
 
 with tempfile.TemporaryDirectory() as tmp:
+    # A ClickUp Custom Task ID is whatever the workspace typed. Glob
+    # metacharacters in it must not be read as wildcards: unescaped, "CU-[1]"
+    # is a character class matching "CU-1", so this row would list the wrong
+    # row's stations (or, more often, none of its own).
+    root = Path(tmp)
+    (root / "CU-[1]__api__implement.log").write_text("{}\n", encoding="utf-8")
+    (root / "CU-1__api__review.log").write_text("{}\n", encoding="utf-8")
+    check("glob metacharacters in a task key are matched literally",
+          weblogs.stations(root, "CU-[1]", "api") == ["implement"])
+    check("a literal task key does not pick up another row's logs",
+          weblogs.stations(root, "CU-1", "api") == ["review"])
+
+with tempfile.TemporaryDirectory() as tmp:
     # A record larger than a whole read window must not livelock: the reader
     # has to advance past it, not spin forever returning the same offset.
     root = Path(tmp)
@@ -410,6 +423,42 @@ else:
             check("tasks route responses have no meta key",
                   r.status_code == 200
                   and all("meta" not in t for t in r.json()["tasks"]))
+
+            # The last-tick indicator has to reproduce Pipeline.tick's gate,
+            # which is day-of-week AND advance window. Both have to be on the
+            # wire or the tile falls back to a flat threshold that warns all
+            # night and stays quiet through a real outage.
+            r = client.get("/api/overview")
+            check("overview carries the windows and days the tile gates on",
+                  r.status_code == 200
+                  and isinstance(r.json().get("windows"), dict)
+                  and isinstance(r.json().get("days"), list))
+
+            # Route-level provenance. The traversal test above calls
+            # weblogs.tail directly, so it would stay green if the route
+            # started taking task_key/repo_key off the query string. What
+            # actually keeps a caller from naming its own log file is that
+            # both come from a store lookup on the row id -- assert that, at
+            # the route, with hostile query params present and ignored.
+            _seen: list[tuple] = []
+            _real_tail = weblogs.tail
+
+            def _spy(log_root, task_key, repo_key, station, offset=0, **kw):
+                _seen.append((task_key, repo_key, station))
+                return _real_tail(log_root, task_key, repo_key, station,
+                                  offset, **kw)
+
+            weblogs.tail = _spy
+            try:
+                r = client.get("/api/task/log", params={
+                    "id": "acme:1#api", "station": "implement",
+                    "task_key": "escaped", "repo_key": "escaped"})
+                ok = (r.status_code == 200
+                      and _seen == [("DEV-1", "api", "implement")])
+            finally:
+                weblogs.tail = _real_tail
+            check("log route takes task_key/repo_key from the store, never "
+                  "from the query string", ok)
         finally:
             web_api.STATIC = original_static
 

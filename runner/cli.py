@@ -207,15 +207,24 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
     Imports are local on purpose: FastAPI is an optional extra and `run` --
     the cron entrypoint -- must keep starting without it.
     """
+    import sqlite3
+
+    # Only the two optional third-party packages are probed here. Wrapping
+    # the `runner.web.*` imports in the same `except ImportError` reported an
+    # unrelated ImportError *inside* our own modules -- a typo'd import, a
+    # missing sibling -- as "install the web extra", sending an operator to
+    # reinstall a dependency that was never the problem. Those imports are
+    # left bare, so a real breakage arrives as its own traceback.
     try:
-        import sqlite3
+        import fastapi  # noqa: F401
         import uvicorn
-        from runner.web.api import build_app
-        from runner.web.db import Reader
     except ImportError:
         print("the dashboard needs its optional dependencies:\n"
               "    pip install -e '.[web]'", file=sys.stderr)
         return 1
+
+    from runner.web.api import build_app
+    from runner.web.db import Reader
 
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"WARNING: binding {host} exposes ticket titles, PR URLs and "

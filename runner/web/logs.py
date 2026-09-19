@@ -6,6 +6,7 @@ previous poll returned and gets only what was appended since.
 """
 from __future__ import annotations
 
+import glob as _glob
 import json
 import re
 from pathlib import Path
@@ -33,10 +34,17 @@ def _candidates(log_root: Path, task_key: str, repo_key: str,
 
 
 def stations(log_root: Path, task_key: str, repo_key: str) -> list[str]:
-    """Which station logs exist for this row."""
+    """Which station logs exist for this row.
+
+    The prefix is glob-escaped before it goes into a pattern: a ClickUp
+    Custom Task ID is whatever the workspace typed, and a `[`, `*` or `?` in
+    it would be read as a wildcard and match the wrong row's logs (or none).
+    Only the pattern is escaped -- the slicing below still uses the raw
+    prefix, because that is what the matched filenames literally contain.
+    """
     out: list[str] = []
     prefix = agent_log_name(task_key, repo_key, "")[:-len(".log")]
-    for path in sorted(log_root.glob(f"{prefix}*.log")):
+    for path in sorted(log_root.glob(f"{_glob.escape(prefix)}*.log")):
         name = path.name[len(prefix):-len(".log")]
         if _STATION.match(name):
             out.append(name)
@@ -45,7 +53,7 @@ def stations(log_root: Path, task_key: str, repo_key: str) -> list[str]:
     # writes those), and a fixed ("plan", "implement", "review") loop would
     # leave it readable via tail() but never listed here for the UI to ask for.
     legacy_prefix = f"{task_key}-"
-    for path in sorted(log_root.glob(f"{legacy_prefix}*.log")):
+    for path in sorted(log_root.glob(f"{_glob.escape(legacy_prefix)}*.log")):
         name = path.name[len(legacy_prefix):-len(".log")]
         if _STATION.match(name) and name not in out:
             out.append(name)
