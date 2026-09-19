@@ -3,7 +3,8 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { StateBadge } from "@/components/StateBadge";
-import { useTask, useTaskLog } from "@/lib/api";
+import { FetchError } from "@/components/FetchError";
+import { useTask, useTaskLog, type LogLine } from "@/lib/api";
 
 function LogTail({ id, station }: { id: string; station: string }) {
   // Poll forward from the offset the last read returned rather than
@@ -25,8 +26,8 @@ function LogTail({ id, station }: { id: string; station: string }) {
   // case above -- a slot that was empty while a record was mid-write gets
   // overwritten with real content once it completes, never duplicated.
   const [offset, setOffset] = useState(0);
-  const [chunks, setChunks] = useState<Record<number, any[]>>({});
-  const { data } = useTaskLog(id, station, offset);
+  const [chunks, setChunks] = useState<Record<number, LogLine[]>>({});
+  const { data, isError, error } = useTaskLog(id, station, offset);
 
   // No reset-on-[id, station] effect here: `TaskSheet` mounts this component
   // with `key={`${id}:${station}`}`, so a row or station switch remounts it
@@ -51,6 +52,7 @@ function LogTail({ id, station }: { id: string; station: string }) {
     [chunks],
   );
 
+  if (isError) return <FetchError what="this station's log" error={error} />;
   if (data?.missing) {
     return <div className="p-4 text-sm text-muted-foreground">
       This station has not run for this row.</div>;
@@ -70,13 +72,16 @@ function LogTail({ id, station }: { id: string; station: string }) {
 }
 
 export function TaskSheet({ id, onClose }: { id: string | null; onClose: () => void }) {
-  const { data: row } = useTask(id);
+  const { data: row, isError, error } = useTask(id);
   const [station, setStation] = useState<string | null>(null);
   useEffect(() => { setStation(row?.stations?.[0] ?? null); }, [row?.task_id]);
 
   return (
     <Sheet open={!!id} onOpenChange={(o) => !o && onClose()}>
       <SheetContent className="w-full sm:max-w-3xl">
+        {/* A sheet that opens onto nothing is the same ambiguity the rest of
+            the dashboard refuses: say the row could not be fetched. */}
+        {isError && <FetchError what="this row" error={error} />}
         {row && (
           <>
             <SheetHeader>

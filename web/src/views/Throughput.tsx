@@ -2,6 +2,7 @@ import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip,
          XAxis, YAxis } from "recharts";
 import { useThroughput } from "@/lib/api";
 import { ChartFrame } from "@/components/ChartFrame";
+import { FetchError } from "@/components/FetchError";
 import { GRID, MUTED, STATUS, SURFACE } from "@/lib/palette";
 import { useColorMode } from "@/lib/useColorMode";
 
@@ -26,12 +27,15 @@ function histogram(seconds: number[]): { band: string; n: number }[] {
 }
 
 export function Throughput() {
-  const { data } = useThroughput(30);
+  const { data, isError, error } = useThroughput(30);
   const m = useColorMode();
+  // React Query leaves `data` undefined once its retries are exhausted, so
+  // without this branch a dead API spins on "loading…" forever.
+  if (isError) return <FetchError what="throughput" error={error} />;
   if (!data) return <div className="p-6 text-muted-foreground">loading…</div>;
   const axis = { stroke: MUTED, fontSize: 11, tickLine: false, axisLine: false };
-  const days = data.days.map((d: any) => ({ ...d, day: d.day.slice(5) }));
-  const hist = histogram(data.cycle_times.map((c: any) => c.seconds));
+  const days = data.days.map((d) => ({ ...d, day: d.day.slice(5) }));
+  const hist = histogram(data.cycle_times.map((c) => c.seconds));
 
   const cycles: Record<number, number> = {};
   for (const r of data.review_cycles) cycles[r.cycles] = (cycles[r.cycles] ?? 0) + 1;
@@ -50,7 +54,7 @@ export function Throughput() {
           palette -- with names in the legend, never color alone. */}
       <ChartFrame title="Outcomes per day"
         columns={["day", "pr-open", "done", "blocked"]}
-        rows={days.map((d: any) => [d.day, d.pr_open, d.done, d.blocked])}>
+        rows={days.map((d) => [d.day, d.pr_open, d.done, d.blocked])}>
         <ResponsiveContainer width="100%" height={240}>
           <BarChart data={days}>
             <CartesianGrid stroke={GRID[m]} vertical={false} />

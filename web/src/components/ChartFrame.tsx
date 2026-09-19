@@ -7,9 +7,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow }
 /** Every chart owes a table view.
  *
  * The validated light palette carries a contrast WARN on three of five slots
- * (2.11-2.74:1 against #fcfcfb). That warning is not dismissable: it obligates
- * relief, and a table is the relief. It is also simply the fastest way to read
- * an exact number off a chart.
+ * (2.82 / 2.17 / 2.69:1), measured against the surface these charts are
+ * actually drawn on -- the card, `#ffffff`, not the shell background. That
+ * warning is not dismissable: it obligates relief, and a table is the relief.
+ * It is also simply the fastest way to read an exact number off a chart.
  */
 export function ChartFrame({ title, columns, rows, children }: {
   title: string;

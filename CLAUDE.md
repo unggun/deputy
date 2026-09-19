@@ -405,7 +405,11 @@ Invariants, each easy to undo by accident:
   uvicorn are the optional `.[web]` extra; the cron entrypoint (`run`,
   `daemon`) keeps starting on `requests` + `pyyaml` alone. `_serve` imports
   them lazily and turns `ImportError` into an install hint instead of crashing
-  every other subcommand on an unrelated missing dependency.
+  every other subcommand on an unrelated missing dependency. Only `fastapi`
+  and `uvicorn` are inside that `try` — the `runner.web.*` imports sit outside
+  it, because wrapping them too reported a typo'd import inside our own
+  modules as "install the web extra" and sent the operator to reinstall a
+  dependency that was never the problem.
 - **Everything egressing goes through `redact()`.** `db.Reader._row` scrubs
   `last_error`, `detail` and `title` on every row; `web/logs.py::tail` scrubs
   agent log lines the same way. Both take the exact secret values gathered
@@ -428,6 +432,41 @@ Invariants, each easy to undo by accident:
   `pipeline._limits_exceeded`'s own default for the same reason: with the key
   unset in config, the pipeline still enforces a $20 cap, and a dashboard
   showing $0 there would disagree with the gate it exists to report on.
+- **`db.stuck()` must be able to return nothing.** Its scan is "non-terminal,
+  plus `blocked`/`human-only`" — those two are terminal *because* a human has
+  to act, which is what the list is for, while `done` is finished, not wedged.
+  And `last_error` only counts on a non-terminal row: nothing in this codebase
+  ever clears that column, so a `done` row that hit one transient `gh` timeout
+  on the way was reported stuck forever and "Nothing is stuck" became
+  unreachable after the first escalation. A permanently-red tile is a tile
+  nobody reads. `ai-task-runner status` filters terminals; this has to agree
+  with it. Tests in `tests_web.py` pin both halves.
+- **The last-tick indicator gates on `windows` *and* `days`.** A gap since the
+  most recent `events.ts` only means the runner is late if the runner was
+  supposed to be ticking, so `Overview.tsx` reproduces `Pipeline.tick`'s gate
+  — the day-of-week list and the `advance` window, same defaults — rather than
+  comparing against a flat threshold. A flat threshold warns all night with
+  the window shut and stays silent through a 45-minute gap at 11am, which is
+  the one failure the spec says this dashboard exists to catch. `/api/overview`
+  carries both fields for exactly this; `Overview.tsx::inWindow` deliberately
+  mirrors `pipeline._in_window` including its non-handling of ranges that wrap
+  midnight, because agreeing with the gate matters more than being cleverer
+  than it.
+- **Every view owes an error branch.** React Query leaves `data` undefined
+  once its retries are exhausted, so `if (!data) return "loading…"` spins
+  forever against an API that is down, and an empty board or empty table is
+  indistinguishable from "nothing in flight". `components/FetchError.tsx` is
+  the shared answer and `api.ts::get()` unwraps FastAPI's `{"detail": ...}`
+  so there is something worth showing in it.
+- **TypeScript runs with `strict` on** (`web/tsconfig.app.json`). The `| null`s
+  in `api.ts` are the contract with `db.py`'s columns; without `strict` they
+  are decoration and `row.title.length` compiles.
+- **`palette.ts`'s `SURFACE` tracks `--card`, not `--background`.** Every chart
+  renders inside a `<Card>`, so the card is the surface the 2px inter-segment
+  stroke has to match and the surface the palette's contrast figures are
+  measured against. `--card` is `#ffffff` light and `#171717` dark. Tracking
+  `--background` painted a near-miss stroke that showed as a seam and made the
+  asserted contrast numbers describe a surface nothing is drawn on.
 
 `_record_transition()` — not `_set()` — is the single funnel for the `events`
 ledger's `kind = "state"` rows. Grepping for `store.set_state` is what let a
@@ -464,7 +503,7 @@ diagram-layout engine was tried and dropped: `mermaid` pulled in `elk`,
 `cytoscape` and `katex` plus chunks for a dozen diagram types this dashboard
 never renders, taking the committed bundle to 5.9 MB across roughly 100 files
 for an 11-state diagram, and brought `mermaid`'s own `chevrotain`/`lodash-es`
-`npm audit` advisories along with it. The bundle is back to 896 KB across 10
+`npm audit` advisories along with it. The bundle is back to 888 KB across 9
 files with 0 vulnerabilities. Do not reintroduce a diagram library for this —
 an 11-state table earns its keep as a table.
 

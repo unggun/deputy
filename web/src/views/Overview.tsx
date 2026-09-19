@@ -1,6 +1,7 @@
-import { useOverview, useTasks } from "@/lib/api";
+import { useOverview, useTasks, type Overview as OverviewData } from "@/lib/api";
 import { StatTile } from "@/components/StatTile";
 import { StateBadge } from "@/components/StateBadge";
+import { FetchError } from "@/components/FetchError";
 import { STATUS } from "@/lib/palette";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -12,9 +13,55 @@ function ago(ts: number): string {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
+/** A gap this long inside an open advance window means the runner is late. */
+const STALE_AFTER_S = 3600;
+
+/** Mirror of `pipeline._in_window`, deliberately including its limits.
+ *
+ * `"07:00-20:00"`, inclusive at both ends, compared against local wall-clock
+ * time -- and, like the runner's own version, a range that wraps midnight
+ * (`"22:00-02:00"`) simply never matches. Reproducing the bug is the point:
+ * this indicator has to agree with the gate it reports on, and a cleverer
+ * implementation here would make the tile disagree with what the runner
+ * actually does.
+ */
+function inWindow(ranges: string[] | undefined, now: Date): boolean {
+  const mins = now.getHours() * 60 + now.getMinutes();
+  for (const range of ranges ?? []) {
+    const [from, to] = range.split("-");
+    if (!from || !to) continue;
+    const [sh, sm] = from.split(":").map(Number);
+    const [eh, em] = to.split(":").map(Number);
+    if ([sh, sm, eh, em].some((n) => !Number.isFinite(n))) continue;
+    const start = sh * 60 + sm;
+    const end = eh * 60 + em;
+    if (start <= mins && mins <= end) return true;
+  }
+  return false;
+}
+
+const DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+
+/** Is the runner supposed to be ticking right now?
+ *
+ * Both halves of `Pipeline.tick`'s gate: the day-of-week list and the
+ * `advance` window, with the same defaults the pipeline applies to an unset
+ * key (`runner.days` -> Mon-Fri, `advance` -> all day). Without the day
+ * check a Saturday would be graded as an outage every time; without the
+ * window check the tile is a flat threshold that cries all night and stays
+ * silent through a 45-minute gap at 11am, which is the one failure this
+ * dashboard exists to catch.
+ */
+function advanceOpen(o: OverviewData, now: Date): boolean {
+  const days = (o.days ?? []).map((d) => d.toLowerCase().slice(0, 3));
+  if (days.length > 0 && !days.includes(DAYS[now.getDay()])) return false;
+  return inWindow(o.windows?.advance ?? ["00:00-23:59"], now);
+}
+
 export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
   const ov = useOverview();
   const tasks = useTasks();
+  if (ov.isError) return <FetchError what="the overview" error={ov.error} />;
   if (!ov.data) return <div className="p-6 text-muted-foreground">loading…</div>;
   const o = ov.data;
   const stuck = tasks.data?.stuck ?? [];
@@ -23,7 +70,21 @@ export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
   // tick that finds no work records nothing, so a healthy-but-idle runner and
   // a dead one look identical past the threshold. The tile is labelled and
   // worded to match what it actually measures.
-  const silent = Math.floor(Date.now() / 1000) - o.last_event_ts > 3600;
+  //
+  // But a gap only means anything while the runner is supposed to be ticking.
+  // Graded against the advance gate, the tile is quiet outside working hours
+  // (where a gap is expected) and speaks up inside them (where it is the
+  // failure this dashboard exists to catch).
+  const now = new Date();
+  const open = advanceOpen(o, now);
+  const gap = Math.floor(now.getTime() / 1000) - o.last_event_ts;
+  const stale = open && gap > STALE_AFTER_S;
+
+  const lastActivitySub = stale
+    ? "stale — no activity in over 1h with the advance window open"
+    : open
+      ? `advance window open · ${o.runner_id} · ${o.mode}`
+      : `advance window closed · ${o.runner_id} · ${o.mode}`;
 
   return (
     <div className="space-y-4 pt-4">
@@ -40,14 +101,23 @@ export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
                   sub={o.daily_budget_usd ? `budget $${o.daily_budget_usd.toFixed(2)}` : "no budget set"}
                   tone={o.daily_budget_usd && o.today.cost_usd >= o.daily_budget_usd ? STATUS.critical : undefined} />
         <StatTile label="Last activity" value={ago(o.last_event_ts)}
-                  sub={silent ? "stale — no activity in over 1h" : `${o.runner_id} · ${o.mode}`}
-                  tone={silent ? STATUS.warning : undefined} />
+                  sub={lastActivitySub}
+                  tone={stale ? STATUS.warning : undefined} />
       </div>
 
       <Card>
         <CardHeader className="pb-2"><CardTitle className="text-base">Needs a human</CardTitle></CardHeader>
         <CardContent>
-          {stuck.length === 0 ? (
+          {tasks.isError ? (
+            // Not "nothing is stuck" -- nobody asked. Saying the good news on
+            // a failed fetch is the worst thing this card could do.
+            <div className="py-6 text-sm" style={{ color: STATUS.critical }}>
+              ✕ Could not load the task list, so this is unknown, not empty.
+              <div className="mt-1 font-mono text-xs text-muted-foreground">
+                {tasks.error instanceof Error ? tasks.error.message : String(tasks.error)}
+              </div>
+            </div>
+          ) : stuck.length === 0 ? (
             <div className="py-6 text-sm text-muted-foreground">
               Nothing is stuck. Every in-flight row is progressing on its own.
             </div>

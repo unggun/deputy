@@ -1,4 +1,5 @@
 import { useGraph } from "@/lib/api";
+import { FetchError } from "@/components/FetchError";
 import { StateBadge } from "@/components/StateBadge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
@@ -13,7 +14,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
  * below rather than thrown away.
  */
 export function GraphTab() {
-  const { data } = useGraph();
+  const { data, isError, error } = useGraph();
+  // An empty transition table would read as "the runtime has no rules",
+  // which is never true -- so say the fetch failed instead.
+  if (isError) return <FetchError what="the state graph" error={error} />;
   const transitions = data?.transitions ?? [];
 
   return (

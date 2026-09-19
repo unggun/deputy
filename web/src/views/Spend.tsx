@@ -2,6 +2,7 @@ import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip,
          XAxis, YAxis } from "recharts";
 import { useSpend } from "@/lib/api";
 import { ChartFrame } from "@/components/ChartFrame";
+import { FetchError } from "@/components/FetchError";
 import { GRID, MUTED, SERIES, STATIONS, SURFACE } from "@/lib/palette";
 import { useColorMode } from "@/lib/useColorMode";
 
@@ -10,16 +11,22 @@ import { useColorMode } from "@/lib/useColorMode";
 // tooltip.
 const round2 = (v: number) => Math.round(v * 100) / 100;
 
+/** One chart row: the day label plus one numeric field per station kind. */
+type SpendRow = Record<string, string | number>;
+
 export function Spend() {
-  const { data } = useSpend(30);
+  const { data, isError, error } = useSpend(30);
   const m = useColorMode();
+  // React Query leaves `data` undefined once its retries are exhausted, so
+  // without this branch a dead API spins on "loading…" forever.
+  if (isError) return <FetchError what="spend" error={error} />;
   if (!data) return <div className="p-6 text-muted-foreground">loading…</div>;
 
   // One row per day, one numeric field per station kind. Days with no work are
   // absent rather than zero-filled -- an absent bar reads as "nothing ran",
   // which is the truth.
-  const rows = data.days.map((d: any) => {
-    const out: any = { day: d.day.slice(5) };
+  const rows: SpendRow[] = data.days.map((d) => {
+    const out: SpendRow = { day: d.day.slice(5) };
     for (const s of STATIONS) {
       out[`${s}_tok`] = d.kinds?.[s]?.tokens ?? 0;
       out[`${s}_usd`] = round2(d.kinds?.[s]?.cost_usd ?? 0);
@@ -44,7 +51,7 @@ export function Spend() {
           never one chart with two y-axes. */}
       <ChartFrame title="Tokens per day, by station"
         columns={["day", ...STATIONS]}
-        rows={rows.map((r: any) => [r.day, ...STATIONS.map((s) => r[`${s}_tok`])])}>
+        rows={rows.map((r) => [r.day, ...STATIONS.map((s) => r[`${s}_tok`])])}>
         <ResponsiveContainer width="100%" height={240}>
           <BarChart data={rows}>
             <CartesianGrid stroke={GRID[m]} vertical={false} />
@@ -59,7 +66,8 @@ export function Spend() {
 
       <ChartFrame title="Spend per day, by station"
         columns={["day", ...STATIONS]}
-        rows={rows.map((r: any) => [r.day, ...STATIONS.map((s) => r[`${s}_usd`].toFixed(2))])}>
+        rows={rows.map((r) => [r.day,
+                               ...STATIONS.map((s) => Number(r[`${s}_usd`]).toFixed(2))])}>
         <ResponsiveContainer width="100%" height={240}>
           <BarChart data={rows}>
             <CartesianGrid stroke={GRID[m]} vertical={false} />
@@ -77,7 +85,7 @@ export function Spend() {
           tokens, and the table view carries the exact figures. */}
       <ChartFrame title="Most expensive rows"
         columns={["ticket", "repo", "tokens", "usd"]}
-        rows={data.by_task.map((t: any) =>
+        rows={data.by_task.map((t) =>
           [t.task_key, t.repo_key ?? "", t.tokens.toLocaleString(), t.cost_usd.toFixed(2)])}>
         <ResponsiveContainer width="100%" height={Math.max(160, data.by_task.length * 28)}>
           <BarChart data={data.by_task} layout="vertical">

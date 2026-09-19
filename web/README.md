@@ -1,32 +1,38 @@
-# React + TypeScript + Vite
+# ai-task-runner dashboard (frontend)
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The React/TypeScript source for the read-only monitoring dashboard served by
+`ai-task-runner serve`. It talks to the FastAPI routes in `runner/web/api.py`
+and renders nothing it cannot get from them.
 
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev     # vite dev server; proxies /api to a running `serve`
+npm run build   # tsc -b && vite build
+npm run lint    # oxlint
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+`npm run build` writes into **`../runner/web/static/`**, which is committed:
+the Python package ships the built assets so `pip install` plus
+`ai-task-runner serve` works without Node. Any change under `web/src` has to
+be rebuilt and the rebuilt `runner/web/static/` committed alongside it, or the
+served dashboard silently stays on the previous version.
+
+Things worth knowing before editing:
+
+- **TypeScript runs in `strict` mode.** The `| null`s in `src/lib/api.ts` are
+  the cross-layer contract with `runner/web/db.py`; they are load-bearing, not
+  decoration. Do not reach for `any` or `!` to get past one.
+- **Every view owes an error branch.** React Query leaves `data` undefined
+  once retries are exhausted, so `if (!data)` alone spins on "loading…"
+  against a dead API, and an empty board reads as "nothing in flight".
+  `src/components/FetchError.tsx` is the shared answer.
+- **Colors come from `src/lib/palette.ts`.** Station kinds use the categorical
+  `SERIES` ramp, task states the reserved `STATUS` ramp, and the two must not
+  overlap. `SURFACE` tracks `--card` — the surface charts are actually drawn
+  on — not `--background`.
+- **Every chart owes a table view**, via `src/components/ChartFrame.tsx`. That
+  is what relieves the light palette's known contrast warning.
+
+`src/components/ui/*` is vendored shadcn. `tooltip.tsx` and `separator.tsx`
+are currently unused; they are kept because they are cheap and re-adding a
+primitive by hand is not.

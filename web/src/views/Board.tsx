@@ -1,12 +1,20 @@
 import { useTasks, type TaskRow } from "@/lib/api";
+import { FetchError } from "@/components/FetchError";
 import { Card, CardContent } from "@/components/ui/card";
 
 // Graph order, so the board reads left to right the way the pipeline runs.
-const COLUMNS = ["new", "planning", "plan-review", "queued",
+// `needs-input` belongs here: it is non-terminal, so /api/tasks returns those
+// rows, and without a column to land in a ticket waiting on a human answer
+// vanished from "what is it doing right now" and the column counts silently
+// stopped summing to the in-flight total.
+const COLUMNS = ["new", "planning", "needs-input", "plan-review", "queued",
                  "in-progress", "review", "pr-open"] as const;
 
 export function Board({ onOpen }: { onOpen: (id: string) => void }) {
-  const { data } = useTasks();
+  const { data, isError, error } = useTasks();
+  // An empty board and a failed fetch look identical, and only one of them
+  // means "nothing in flight".
+  if (isError) return <FetchError what="the board" error={error} />;
   const rows = data?.tasks ?? [];
   // A repo with an active row is locked: graph.repo_is_free made visible
   // rather than inferred. The marker belongs on the OTHER cards in that
