@@ -1,8 +1,16 @@
+// Validated with the dataviz skill's scripts/validate_palette.js against the
+// card surface (see SURFACE below): light #ffffff carries a known contrast
+// WARN on three of five slots (2.82 / 2.17 / 2.69:1), relieved by
+// ChartFrame's mandatory table view; dark #171717 passes all five slots at
+// >= 3:1. Do not substitute hues without re-running the validator.
 export const SERIES = {
   light: ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"],
   dark: ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"],
 } as const;
 
+// Reserved. Never reused as a series color -- a status hue must not
+// impersonate a station, and `fix` must never render in the red that means
+// `blocked`.
 export const STATUS = {
   good: "#0ca30c",
   warning: "#fab219",
@@ -10,9 +18,13 @@ export const STATUS = {
   critical: "#d03b3b",
 } as const;
 
+// Station kinds, in fixed slot order. Never cycled: a sixth kind would take a
+// named slot or fold into "Other", never a generated hue.
 export const STATIONS = ["triage", "plan", "implement", "review", "fix"] as const;
 export type Station = (typeof STATIONS)[number];
 
+// Every state carries an icon and a word alongside this color -- color alone
+// never conveys state. See StateBadge.
 export const STATE_STATUS: Record<string, keyof typeof STATUS | null> = {
   "done": "good",
   // `serious`, not `good`. Green is reserved for `done`: at `pr-open` the

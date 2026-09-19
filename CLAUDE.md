@@ -439,8 +439,12 @@ Invariants, each easy to undo by accident:
   ever clears that column, so a `done` row that hit one transient `gh` timeout
   on the way was reported stuck forever and "Nothing is stuck" became
   unreachable after the first escalation. A permanently-red tile is a tile
-  nobody reads. `ai-task-runner status` filters terminals; this has to agree
-  with it. Tests in `tests_web.py` pin both halves.
+  nobody reads. `ai-task-runner status` deliberately uses a different filter —
+  it calls `store.in_flight()`, which excludes *all* terminal states, `blocked`
+  and `human-only` included. `stuck()` keeps those two on purpose: they are
+  terminal precisely because a human must act, which is what this list exists
+  to surface. The two lists are meant to diverge; tests in `tests_web.py` pin
+  both halves.
 - **The last-tick indicator gates on `windows` *and* `days`.** A gap since the
   most recent `events.ts` only means the runner is late if the runner was
   supposed to be ticking, so `Overview.tsx` reproduces `Pipeline.tick`'s gate

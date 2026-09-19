@@ -74,6 +74,9 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Row ids contain '#'. encodeURIComponent is not optional: an unencoded id is
+// truncated at the '#' by the browser before the request leaves, and every
+// routed row collapses onto its placeholder.
 const qid = (id: string) => encodeURIComponent(id);
 
 export const useOverview = () =>
