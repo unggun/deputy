@@ -430,16 +430,25 @@ Invariants, each easy to undo by accident:
   showing $0 there would disagree with the gate it exists to report on.
 
 `_record_transition()` — not `_set()` — is the single funnel for the `events`
-ledger's `kind = "state"` rows. `grep -n "self\.store\.set_state" runner/pipeline.py`
-finds five call sites (a plain `grep -n "store.set_state"` also matches
-`_record_transition`'s own docstring, which mentions the string — a sixth,
-spurious hit), and `_record_transition` runs immediately before
-`store.set_state` at every one of them: one is inside `_set()` (the general
-case, which also does `graph.check()` and pushes remote state), one is inside
-`_escalate()` (the transition to `blocked`), and three write state directly,
-bypassing both `_set()` and `_escalate()` — the crash-retry back to `queued`,
-the start of `in-progress` execution, and the transition to `pr-open`. Without
-`_record_transition` at those three sites, the ledger would be blind to them.
+ledger's `kind = "state"` rows. Grepping for `store.set_state` is what let a
+site slip through once: `_orphan()` writes `state=blocked` through
+`store.upsert`, not `set_state`, so it never appeared in that list and an
+orphan→blocked never reached `throughput_by_day`. The recipe that finds every
+site is `grep -nE "self\.store\.(set_state|upsert)\(" runner/pipeline.py`
+read against `grep -n "self\._record_transition(" runner/pipeline.py` — most
+`upsert` hits write no `state=` and need no ledger line, so read the hits, do
+not count them. There are **six** state-write sites, and `_record_transition`
+runs immediately before the write at every one: one inside `_set()` (the
+general case, which also does `graph.check()` and pushes remote state), one
+inside `_escalate()` (the transition to `blocked`), and four that write state
+directly, bypassing both — the crash-retry back to `queued`, the start of
+`in-progress` execution, the transition to `pr-open`, and `_orphan()`.
+`_orphan()` is the odd one: it *creates* a row at `blocked`, so `store.get()`
+inside `_record_transition` finds nothing to read an origin from, and it
+passes the remote state it found the ticket in as an explicit `old=`. Without
+`_record_transition` at those four sites, the ledger would be blind to them.
+`tests_smoke.py` asserts the call-site count against `Pipeline`'s own source,
+so deleting one fails the suite.
 Before this ledger existed, `events` held agent runs only, with no record of
 when a row actually changed state; `db.py::throughput_by_day` and
 `cycle_times` read these rows to reconstruct throughput and cycle time,

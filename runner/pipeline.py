@@ -164,6 +164,13 @@ class Pipeline:
         Ask a human, once.
         """
         rid = self._row_id(task.id)
+        # Recorded before the upsert, like every other state-write site. This
+        # is the one place a row is *created* straight at `blocked`, so there
+        # is no stored state for `_record_transition` to read -- hence the
+        # explicit origin, which is the remote state the ticket was found in.
+        # Without this line an orphan->blocked never reaches the `events`
+        # ledger and the dashboard's throughput chart is blind to it.
+        self._record_transition(rid, AIState.BLOCKED, old=task.ai_state.value)
         self.store.upsert(rid, source=self.source.key, provider_task_id=task.id,
                           task_key=task.key, title=task.title,
                           state=AIState.BLOCKED.value,
@@ -892,17 +899,27 @@ class Pipeline:
         row = self.store.get(rid) or {}
         return f"`{row.get('repo_key') or '?'}` — " if row.get("repo_key") else ""
 
-    def _record_transition(self, rid: str, new_state: AIState) -> None:
+    def _record_transition(self, rid: str, new_state: AIState, *,
+                           old: str | None = None) -> None:
         """Ledger line for one state change.
 
-        Called from every `store.set_state` site. The ledger otherwise holds
-        agent runs only, so there is no history of when a row reached pr-open
-        or done, and throughput cannot be reconstructed. `_set` is not the
-        single funnel it looks like: three stations write state directly.
+        Called from every site that writes a row's state -- six of them, not
+        the one `_set()` looks like. The ledger otherwise holds agent runs
+        only, so there is no history of when a row reached pr-open or done,
+        and throughput cannot be reconstructed.
+
+        `old` names the origin for a row that does not exist yet. `_orphan()`
+        creates its row directly at `blocked`, so `store.get` returns None
+        there and the transition would otherwise be dropped in silence. A
+        caller that knows the origin passes it; a caller that does not, and
+        whose row is missing, still records nothing, because `store.set_state`
+        on a missing row is a create, not a transition.
         """
         row = self.store.get(rid)
-        if row:
-            self.store.record("state", rid, f"{row['state']}->{new_state.value}")
+        if row is None and old is None:
+            return
+        origin = row["state"] if row else old
+        self.store.record("state", rid, f"{origin}->{new_state.value}")
 
     def _set(self, rid: str, state: AIState) -> None:
         row = self.store.get(rid)

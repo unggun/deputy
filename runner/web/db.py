@@ -199,9 +199,12 @@ class Reader:
         """Transitions into pr-open / done / blocked, per local day.
 
         Reads the `state` events written by `Pipeline._record_transition`,
-        called from all five `store.set_state` sites in pipeline.py -- not
-        just `_set`/`_escalate`, which are two of the five. Each row's detail
-        is exactly "<old>-><new>".
+        called from all six state-write sites in pipeline.py -- not just
+        `_set`/`_escalate`, which are two of them. The other four write state
+        directly: the crash-retry back to `queued`, the start of
+        `in-progress`, the move to `pr-open`, and `_orphan()`, which is the
+        only one that *creates* a row at `blocked` rather than moving one.
+        Each row's detail is exactly "<old>-><new>".
         """
         rows = self.conn.execute(
             "SELECT date(ts,'unixepoch','localtime') day, detail FROM events"

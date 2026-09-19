@@ -2486,6 +2486,50 @@ with tempfile.TemporaryDirectory() as _tmp:
     _c_checks.append(("_record_transition for pr-open reaches ledger",
                       any("->pr-open" in r["detail"] for r in _pr_rows)))
 
+# The check above calls the helper directly, so it passes just as happily
+# with the pr-open call site deleted from _ship(). Guard the call sites
+# themselves, the way the log-name block below guards agent_log_name():
+# six state-write sites, six _record_transition calls, and removing one
+# fails here rather than silently going missing from throughput_by_day.
+import inspect as _inspect_rt
+_rt_src = _inspect_rt.getsource(Pipeline)
+_c_checks.append(("every state-write site calls _record_transition",
+                  _rt_src.count("self._record_transition(") == 6))
+
+# --- _orphan() is the sixth site, and it creates its row at blocked --------
+# It writes state through store.upsert, not store.set_state, so the original
+# five-site audit (which grepped for set_state) missed it entirely. And
+# because it CREATES the row, store.get() inside _record_transition finds
+# nothing to read an origin from -- a silent `return` there would drop the
+# transition rather than record it.
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg = Config.load("config.example.yaml")
+    _cfg.data["runner"]["db_path"] = f"{_tmp}/s.db"
+    _cfg.data["runner"]["work_dir"] = f"{_tmp}/w"
+    _cfg.data["runner"]["log_dir"] = f"{_tmp}/l"
+    _osrc = _cfg.sources(only=["mycorp"])[0]
+    _otask = mk("T91", "Started somewhere else", "another laptop owns this")
+    _otask.ai_state = AIState.IN_PROGRESS
+    _oprov = FakeProvider([_otask])
+    _ostore = Store(f"{_tmp}/s.db")
+    _opipe = Pipeline(_cfg, _osrc, _oprov, FakeAgent(
+        {"decision": "execute", "confidence": 0.9, "scope": "s",
+         "plan": ["x"]}), _ostore)
+    _opipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+
+    # Queried straight off `tasks`: `blocked` is terminal, so in_flight()
+    # (correctly) does not return the row this test is about.
+    _orows = [r["state"] for r in _ostore.conn.execute(
+        "SELECT state FROM tasks").fetchall()]
+    _oevents = [r["detail"] for r in _ostore.conn.execute(
+        "SELECT detail FROM events WHERE kind = 'state'").fetchall()]
+    _c_checks.append(("_orphan() marks the row blocked",
+                      _orows == [AIState.BLOCKED.value]))
+    _c_checks.append(("_orphan() reaches the ledger",
+                      any(d.endswith("->blocked") for d in _oevents)))
+    _c_checks.append(("_orphan()'s ledger line names the remote origin",
+                      "in-progress->blocked" in _oevents))
+
 # --- agent logs are per repo, not per ticket -------------------------------
 # _EventLog opens with "w", so two rows of a cross-repo ticket writing the
 # same filename means the second run truncates the first run's evidence.
