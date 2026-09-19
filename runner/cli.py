@@ -177,6 +177,22 @@ def _doctor(cfg: Config) -> int:
             "ANTHROPIC_API_KEY (and CLAUDE_CODE_SIMPLE=1) in the cron "
             "environment to bill this to pay-as-you-go credits instead.")
 
+    # Dashboard: the two halves can be missing independently -- the optional
+    # extra may be uninstalled, or a wheel may have been built without the
+    # frontend's static assets. Neither is a problem: a runner with no
+    # dashboard is a valid, supported configuration.
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+        log.info("dashboard: web extra installed")
+    except ImportError:
+        log.warning("dashboard: not installed (pip install -e '.[web]')")
+    index = Path(__file__).parent / "web" / "static" / "index.html"
+    if index.exists():
+        log.info("dashboard: assets present (%s)", index)
+    else:
+        log.warning("dashboard: assets MISSING -- run `npm run build` in web/")
+
     if problems:
         for p in problems:
             log.error("%s", p)

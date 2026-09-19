@@ -363,3 +363,104 @@ Agent runs use `permission_mode: dontAsk` with an explicit `allowed_tools` allow
 under `runner.work_dir`, never in the developer's own checkout. Secrets come from env
 vars referenced as `${VAR}` in `config.yaml` — never inline, and `config.yaml` itself is
 not committed (`config.example.yaml` is the template).
+
+### Dashboard
+
+`runner/web/` is a read-only HTTP view over the same SQLite file and log
+directory the cron tick writes. It is a separate process, started by
+`ai-task-runner serve`; nothing was added to a tick, and the runner does not
+know the dashboard exists.
+
+Invariants, each easy to undo by accident:
+
+- **`db.Reader` opens SQLite with `mode=ro`.** Read-only is enforced at the
+  storage layer, not by convention, so a convenience helper cannot quietly gain
+  a write path. `sqlite3.connect(f"file:{path}?mode=ro", uri=True)` also means
+  a missing database surfaces as a generic `OperationalError`; `Reader.__init__`
+  turns that into `FileNotFoundError` when the path truly doesn't exist, which
+  is what lets `_serve` tell "no database yet" apart from "database is broken".
+- **`_serve` probes before it binds a port.** It opens a `Reader` and runs
+  `SELECT 1 FROM tasks`, and refuses to start on `FileNotFoundError` (missing
+  db) or `sqlite3.Error` (a directory, a corrupt file, the wrong schema).
+  `db.exists()` was not enough — true for a directory too — and a dashboard
+  that bound the port anyway would render an all-zeros board indistinguishable
+  from a runner that ran and genuinely found nothing to do, which is exactly
+  the ambiguity this dashboard exists to remove.
+- **`cli.py` must never import `runner.web` at module level.** FastAPI and
+  uvicorn are the optional `.[web]` extra; the cron entrypoint (`run`,
+  `daemon`) keeps starting on `requests` + `pyyaml` alone. `_serve` imports
+  them lazily and turns `ImportError` into an install hint instead of crashing
+  every other subcommand on an unrelated missing dependency.
+- **Everything egressing goes through `redact()`.** `db.Reader._row` scrubs
+  `last_error`, `detail` and `title` on every row; `web/logs.py::tail` scrubs
+  agent log lines the same way. Both take the exact secret values gathered
+  from `vcs_profiles` by env var name (`web/api.py::_secrets`), matching how
+  `Pipeline._known_secrets` does it for provider comments — a web endpoint is
+  an outward path exactly like a ticket comment, so it gets the same treatment
+  as a second layer on top of the redaction already done at log-write time.
+- **Row ids travel as query parameters, never path segments.** `/api/task` and
+  `/api/task/log` take `id` as a query param because ids contain `#`
+  (`"{source}:{provider_task_id}#{repo_key}"`); a browser would otherwise
+  strip everything from `#` onward before the request left the tab, and a
+  routed row's id would collapse onto its pre-triage placeholder.
+- **Day buckets use local midnight**, `date(ts,'unixepoch','localtime')` in
+  `db.py`, matching `pipeline._midnight_epoch`. The two are duplicated rather
+  than shared by import — importing `pipeline` would pull providers, the agent
+  adapter and `requests` into a process whose only job is to read a file — so
+  a test pins them to the same definition. `ts / 86400` would bucket on UTC
+  and disagree with the cap the runner actually enforced. `db.py`'s
+  `daily_budget_usd` default (20) is kept equal to
+  `pipeline._limits_exceeded`'s own default for the same reason: with the key
+  unset in config, the pipeline still enforces a $20 cap, and a dashboard
+  showing $0 there would disagree with the gate it exists to report on.
+
+`_record_transition()` — not `_set()` — is the single funnel for the `events`
+ledger's `kind = "state"` rows. `grep -n "store.set_state" runner/pipeline.py`
+finds five call sites, and `_record_transition` runs immediately before
+`store.set_state` at every one of them: one is inside `_set()` (the general
+case, which also does `graph.check()` and pushes remote state), one is inside
+`_escalate()` (the transition to `blocked`), and three write state directly,
+bypassing both `_set()` and `_escalate()` — the crash-retry back to `queued`,
+the start of `in-progress` execution, and the transition to `pr-open`. Without
+`_record_transition` at those three sites, the ledger would be blind to them.
+Before this ledger existed, `events` held agent runs only, with no record of
+when a row actually changed state; `db.py::throughput_by_day` and
+`cycle_times` read these rows to reconstruct throughput and cycle time,
+splitting each `detail` string on `->`.
+
+The graph tab does not render a diagram. `/api/graph` returns
+`{"transitions": [...], "mermaid": "..."}`, both derived from the same
+`graph.TRANSITIONS` object that backs `ai-task-runner graph`, so neither the
+table nor the pasted-out text can drift from the runtime's own rules. The
+frontend (`GraphTab.tsx`) renders `transitions` as a plain table and tucks the
+`mermaid` string in a `<details>` for copy-out elsewhere. A real
+diagram-layout engine was tried and dropped: `mermaid` pulled in `elk`,
+`cytoscape` and `katex` plus chunks for a dozen diagram types this dashboard
+never renders, taking the committed bundle to 5.9 MB across roughly 100 files
+for an 11-state diagram, and brought `mermaid`'s own `chevrotain`/`lodash-es`
+`npm audit` advisories along with it. The bundle is back to 896 KB across 10
+files with 0 vulnerabilities. Do not reintroduce a diagram library for this —
+an 11-state table earns its keep as a table.
+
+Agent log filenames come from `models.agent_log_name(task_key, repo_key,
+station)`. The repo key is load-bearing: `_EventLog` opens with `"w"`, so a
+cross-repo ticket without it had two rows truncating each other's evidence.
+`web/logs.py` looks for the current name first and falls back to the
+pre-per-repo `{task_key}-{station}.log` name, so a row that was mid-flight
+when per-repo names shipped still has a readable log instead of an empty tab.
+
+`runner/web/static/` is committed build output, not source. `web/vite.config.ts`
+points `build.outDir` at it directly rather than the default `web/dist`,
+because `.gitignore` has an unanchored `dist/` that would otherwise swallow
+the built assets the wheel needs (`pyproject.toml`'s
+`[tool.setuptools.package-data]` entry for `runner.web` is what actually ships
+them). `runner/web/static/assets` only exists after `npm run build` has run at
+least once, and `api.py` guards on that directory rather than on `STATIC`
+itself (which always exists in the source tree): mounting `StaticFiles`
+against a directory that isn't there yet raises at startup. A fresh checkout
+with no frontend build is a supported state — `serve` still answers the JSON
+routes, and with no `assets/` directory it never registers the SPA catch-all
+at all, so an unbuilt dashboard's non-API paths get a plain 404, not a 500.
+The 500 is for the narrower, unlikely case where `assets/` exists but
+`index.html` was removed out from under it — the catch-all route notices that
+specifically and names the missing build rather than serving a blank page.

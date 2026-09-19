@@ -298,6 +298,33 @@ ai-task-runner status                       # what is in flight, across sources
 python3 tests_smoke.py                      # offline state-machine tests
 ```
 
+## Dashboard
+
+```bash
+pip install -e '.[web]'
+ai-task-runner serve            # http://127.0.0.1:8787
+```
+
+A read-only view of this laptop's runner: what is stuck, what is running,
+what it cost, and whether the work landed. It opens the SQLite store with
+`mode=ro`, so it cannot write to the database, the tickets or the repos —
+acting on the runner stays in the task manager and the CLI.
+
+`serve` refuses to start against a missing or unusable database rather than
+serving a dashboard full of zeros — those are indistinguishable from a runner
+that ran and found nothing to do, which is exactly the ambiguity the
+dashboard exists to remove. Run `ai-task-runner run` at least once first.
+
+It binds loopback by default. `--host` accepts anything, and warns, because
+the page carries ticket titles, PR URLs and error text.
+
+To change the UI you need Node:
+
+```bash
+cd web && npm install && npm run dev    # proxies /api to :8787
+cd web && npm run build                 # writes runner/web/static/, which is committed
+```
+
 ## Schedule
 
 One job every 15 minutes. Phase gating lives in `config.yaml`, not in the
