@@ -38,7 +38,6 @@ function LogTail({ id, station }: { id: string; station: string }) {
     if (data.next_offset !== offset) setOffset(data.next_offset);
     // `offset` is intentionally a dependency: `data` alone does not tell us
     // which offset it was fetched from, and that offset is the overwrite key.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, offset]);
 
   const lines = useMemo(
