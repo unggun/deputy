@@ -12,18 +12,32 @@ import yaml
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _expand(value: Any) -> Any:
+def _expand(value: Any, *, require_env: bool = True) -> Any:
+    """Substitute ${VAR} from the environment.
+
+    `require_env=False` leaves an unset reference as the literal `${VAR}`
+    instead of raising. That exists for `serve`: the dashboard reads the
+    local SQLite file and the log directory and talks to no provider, so
+    demanding a ClickUp or Jira token before it will render a read-only page
+    is a credential requirement with nothing behind it. The literal is left
+    in place rather than substituting an empty string, so a value that does
+    reach something later is obviously an unresolved placeholder rather than
+    a plausible-looking empty token.
+    """
     if isinstance(value, str):
         def sub(m: re.Match[str]) -> str:
             got = os.environ.get(m.group(1))
             if got is None:
-                raise RuntimeError(f"Config references unset env var {m.group(1)}")
+                if require_env:
+                    raise RuntimeError(
+                        f"Config references unset env var {m.group(1)}")
+                return m.group(0)
             return got
         return _ENV_RE.sub(sub, value)
     if isinstance(value, dict):
-        return {k: _expand(v) for k, v in value.items()}
+        return {k: _expand(v, require_env=require_env) for k, v in value.items()}
     if isinstance(value, list):
-        return [_expand(v) for v in value]
+        return [_expand(v, require_env=require_env) for v in value]
     return value
 
 
@@ -74,11 +88,11 @@ class Config:
     source_path: Path
 
     @classmethod
-    def load(cls, path: str | Path) -> "Config":
+    def load(cls, path: str | Path, *, require_env: bool = True) -> "Config":
         p = Path(path).expanduser()
         with p.open("r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
-        cfg = cls(_expand(raw), p)
+        cfg = cls(_expand(raw, require_env=require_env), p)
         cfg.validate()
         return cfg
 

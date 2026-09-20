@@ -291,7 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         print(graph.to_mermaid())
         return 0
 
-    cfg = Config.load(args.config)
+    # `serve` renders a read-only view of the local SQLite file and log
+    # directory; it never calls a provider. Requiring the provider tokens to
+    # be exported before it will start is a credential demand with nothing
+    # behind it, and it blocks the dashboard in exactly the interactive shell
+    # where cron's environment is absent.
+    cfg = Config.load(args.config, require_env=(args.cmd != "serve"))
     _logging(cfg, args.verbose)
     log = logging.getLogger("cli")
 

@@ -462,5 +462,40 @@ else:
         finally:
             web_api.STATIC = original_static
 
+# --- serve must not demand provider credentials -----------------------------
+# The dashboard reads the local SQLite file and log directory and talks to no
+# provider, so requiring CLICKUP_TOKEN/JIRA_TOKEN to be exported before it will
+# render a read-only page is a credential demand with nothing behind it. It also
+# breaks precisely where it matters: cron has those vars, an interactive shell
+# does not. `run` and `doctor` must still refuse, since they really do call out.
+import os as _os
+from runner.config import Config as _Config, _expand as _cfg_expand
+
+_saved = {k: _os.environ.pop(k, None)
+          for k in ("CLICKUP_TOKEN", "JIRA_TOKEN", "GH_TOKEN_WORK")}
+try:
+    _raw = {"provider": {"token": "${CLICKUP_TOKEN}"}, "db": "~/x.db"}
+
+    _strict_raised = False
+    try:
+        _cfg_expand(_raw)
+    except RuntimeError:
+        _strict_raised = True
+    check("strict expansion still refuses an unset env var", _strict_raised)
+
+    _lenient = _cfg_expand(_raw, require_env=False)
+    check("lenient expansion leaves the reference as a literal",
+          _lenient["provider"]["token"] == "${CLICKUP_TOKEN}")
+    check("lenient expansion leaves other values untouched",
+          _lenient["db"] == "~/x.db")
+
+    _cfg = _Config.load("config.example.yaml", require_env=False)
+    check("a config full of unset vars still loads for serve",
+          _cfg.get("runner.db_path") is not None)
+finally:
+    for _k, _v in _saved.items():
+        if _v is not None:
+            _os.environ[_k] = _v
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
