@@ -12,16 +12,22 @@ from typing import Any
 import requests
 
 from ..models import AIState, Comment, Task
+from . import clickup_format
 from .base import TaskProvider
 
 log = logging.getLogger(__name__)
 API = "https://api.clickup.com/api/v2"
+# Shown in place of an HTML-comment marker, which ClickUp renders literally.
+FOOTER_DEFAULT = "🤖 posted by ai-task-runner"
 
 
 class ClickUpProvider(TaskProvider):
     def __init__(self, cfg: dict[str, Any], bot_marker: str, dry_run: bool = False) -> None:
         self.cfg = cfg
         self.marker = bot_marker
+        # The marker still identifies our comments, but it has to be readable
+        # text here. A custom non-HTML marker is used as the footer verbatim.
+        self.footer = FOOTER_DEFAULT if bot_marker.lstrip().startswith("<!--") else bot_marker
         self.dry_run = dry_run
         self.team_id = str(cfg["team_id"])
         self.ready_status = str(cfg.get("ready_status", "to do")).lower()
@@ -78,19 +84,32 @@ class ClickUpProvider(TaskProvider):
                 author_id=str((c.get("user") or {}).get("id", "")),
                 text=text,
                 created_at=int(c.get("date", 0)),
-                is_bot=self.marker in text,
+                # The raw marker still matches comments posted before the
+                # footer existed; losing that would read the runner's own old
+                # questions as human replies.
+                is_bot=self.marker in text or self.footer in text,
             ))
         out.sort(key=lambda c: c.created_at)
         return out
 
     # --- writes -------------------------------------------------------
     def add_comment(self, task_id: str, markdown: str) -> str:
-        body = f"{self.marker}\n{markdown}"
+        md = f"{markdown.rstrip()}\n\n_{self.footer}_"
         if self.dry_run:
-            log.info("[dry-run] comment on %s:\n%s", task_id, markdown)
+            log.info("[dry-run] comment on %s:\n%s", task_id, md)
             return "dry-run"
-        res = self._req("POST", f"/task/{task_id}/comment",
-                        json={"comment_text": body, "notify_all": False})
+        try:
+            res = self._req("POST", f"/task/{task_id}/comment",
+                            json={"comment": clickup_format.to_ops(md), "notify_all": False})
+        except RuntimeError as exc:
+            # A 400 means ClickUp rejected the rich-text shape itself; the
+            # comment was not posted, so plain text is a safe retry. Anything
+            # else (auth, rate limit, 5xx) is not ours to paper over.
+            if "-> 400:" not in str(exc):
+                raise
+            log.warning("rich-text comment rejected, posting plain text: %s", exc)
+            res = self._req("POST", f"/task/{task_id}/comment",
+                            json={"comment_text": md, "notify_all": False})
         return str(res.get("id", ""))
 
     def set_ai_state(self, task_id: str, state: AIState) -> None:

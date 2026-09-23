@@ -158,6 +158,11 @@ whatever branch and worktree the dropped row already owned.
   comments (there is a smoke test for this). Always pass a stable, meaningful key.
 - **Bot detection** is marker-based: `runner.bot_marker` (default `<!-- ai-runner -->`)
   is prepended to every comment; providers set `Comment.is_bot` by searching for it.
+  ClickUp is the exception on the write side: its `comment_text` renders markdown and
+  HTML comments literally, so `clickup.py` posts Quill-style rich-text ops
+  (`providers/clickup_format.py`) ending in a visible footer (`FOOTER_DEFAULT`) and
+  detects bot comments by footer *or* legacy marker. Dropping the legacy match would
+  read every pre-footer bot question as a human reply.
   Human-reply detection depends on this, so never post via a raw provider call.
 - **Budget** — daily spend is checked against `limits.daily_budget_usd` before any work;
   every LLM step records cost via `store.record(...)`.
@@ -306,7 +311,22 @@ the triage `scope` (`xs < s < m < l`); shadow mode always gates.
 
 `triage.py`'s denylist **overrides the model** — prod data, migrations, auth, payments,
 secrets, infra go to `human-only` regardless of what the LLM decided. Keep it that way;
-a smoke test asserts it.
+a smoke test asserts it. The one exception is a *human* waiver: `policy.override_tag`
+(default `ai-override`) on the ticket skips the denylist for that ticket, and
+`TriageResult.policy_override` then forces the plan-approval gate at any scope. Never
+let a comment or the model's output grant the waiver — comment text is exactly what
+the denylist scans, and the tag is the only signal that a person read the ticket.
+
+**A remote `new` is a human reset.** `_triage_new` used to skip any ticket with a
+non-`new` local row, so resetting a `human-only`/`blocked` ticket to `new` (the
+handover `_orphan()`'s own comment tells people to do) was ignored forever.
+`_reset_by_human()` now deletes the parked rows and their comment claims
+(`store.forget_comments`) so the fresh verdict gets posted. It refuses while the
+earlier attempt's branch survives locally or on origin — `ensure_worktree` reuses an
+existing branch, so a restart would silently build on old, possibly unpushed work —
+and it never touches a row that is mid-flight here. The reset writes no `state=`
+(rows are deleted, the new placeholder is born `new`), so it is not a seventh
+state-write site.
 
 ### Brain
 

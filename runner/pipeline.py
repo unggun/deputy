@@ -133,6 +133,9 @@ class Pipeline:
             # depend on a routing decision triage has not made yet -- so this
             # has to be a lookup by ticket, not by row id.
             rows = self.store.rows_for_task(self.source.key, task.id)
+            if task.ai_state == AIState.NEW and rows and not self._reset_by_human(task, rows):
+                continue
+            rows = self.store.rows_for_task(self.source.key, task.id)
             if any(r["state"] != AIState.NEW.value for r in rows):
                 continue
             if task.ai_state != AIState.NEW:
@@ -155,6 +158,57 @@ class Pipeline:
             except Exception as exc:  # noqa: BLE001
                 log.exception("triage failed for %s", task.key)
                 self.store.upsert(row_id, last_error=self._clean(str(exc))[:1000])
+
+    def _reset_by_human(self, task: Task, rows: list[dict[str, Any]]) -> bool:
+        """The remote says `new` but this machine still has rows for the ticket.
+
+        That is how a human asks for a do-over: they set AI State back to
+        `new` on a ticket the runner parked at `human-only` or `blocked`
+        (often after adding the override tag). Without this the local rows
+        win forever and the reset is silently ignored.
+
+        Only parked rows are cleared, and only once no earlier attempt's
+        branch survives: re-triage routes into the same deterministic branch
+        name and `ensure_worktree` reuses an existing branch (and worktree),
+        so a fresh run would silently build on the old attempt -- possibly on
+        unpushed work a human still wants. Deleting the branch is the human's
+        call; deleting the head branch on GitHub also closes its PR.
+
+        Returns True when the ticket is clear to triage from scratch.
+        """
+        parked = (AIState.HUMAN_ONLY.value, AIState.BLOCKED.value)
+        if all(r["state"] == AIState.NEW.value for r in rows):
+            return True             # a placeholder from a crashed triage
+        if any(r["state"] not in parked + (AIState.NEW.value,) for r in rows):
+            return False            # mid-flight here; the remote is just behind
+        owned = [(r, repo) for r in rows if r.get("branch")
+                 for repo in [self.source.repo_by_key(r.get("repo_key") or "")]
+                 if repo and self._branch_survives(repo, r["branch"])]
+        if owned:
+            steps = "\n".join(
+                f"- `{r['branch']}` in `{repo['path']}`"
+                + (f" (PR #{r['pr_number']})" if r.get("pr_number") else "")
+                for r, repo in owned)
+            self._comment(
+                owned[0][0]["task_id"], "reset-refused",
+                f"**I can't start this over yet.**\n\n"
+                f"An earlier attempt still has a branch:\n{steps}\n\n"
+                f"Delete it locally and on GitHub (remove its worktree under "
+                f"`{self.work_root}` first), then set AI State back to `new` again.")
+            return False
+        for r in rows:
+            self.store.forget_comments(r["task_id"])
+            self.store.delete(r["task_id"])
+        log.info("[%s] AI State reset to new by a human; re-triaging", task.key)
+        return True
+
+    def _branch_survives(self, repo: dict[str, Any], branch: str) -> bool:
+        main = Path(str(repo["path"])).expanduser()
+        if not (main / ".git").exists():
+            return False
+        env = self._env_for(repo)
+        return (vcs.branch_exists(main, branch, env=env)
+                or vcs.remote_branch_exists(main, branch, env=env))
 
     def _orphan(self, task: Task) -> None:
         """A ticket mid-flight on a machine that has no local state for it.
@@ -271,7 +325,10 @@ class Pipeline:
         if len(result.repo_keys) > 1:
             log.info("[%s] spans %d repos: %s", task.key,
                      len(result.repo_keys), ", ".join(result.repo_keys))
-        if self.mode == "shadow" or order.get(result.scope, 2) >= order.get(gate, 2):
+        # An override waived the denylist, the one check the model cannot
+        # talk its way past; a human reads the plan before any code instead.
+        if (self.mode == "shadow" or result.policy_override
+                or order.get(result.scope, 2) >= order.get(gate, 2)):
             # Mark this as a fresh entry into PLANNING so the arm below does
             # not mistake a healthy first run for a crash recovery. Each repo
             # gets its own analyst pass: the plan for the backend is not the
@@ -997,9 +1054,9 @@ def _fmt_questions(r: TriageResult) -> str:
 
 def _fmt_human_only(r: TriageResult) -> str:
     hints = "\n".join(f"- {h}" for h in r.hints) or "- (no hints)"
-    flags = ", ".join(r.risk_flags) or "none"
+    flags = " ".join(f"`{f}`" for f in r.risk_flags) or "none"
     return (f"**This one needs a human.**\n\n{r.reasoning}\n\n"
-            f"Risk flags: `{flags}`\n\nWhere I'd start:\n{hints}")
+            f"**Risk flags:** {flags}\n\n**What to do next**\n{hints}")
 
 
 def _fmt_plan(r: TriageResult, shadow: bool) -> str:

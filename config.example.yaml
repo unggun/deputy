@@ -131,6 +131,10 @@ policy:
   approval_keywords: ["approved", "go ahead", "lgtm", "proceed"]
   rejection_keywords: ["no", "stop", "hold", "wait", "don't"]
   # denylist_patterns: [...]  # omit to use the built-in defaults in triage.py
+  # A human's way past a denylist false positive: add this tag (Jira: label)
+  # and set AI State back to `new`. Triage then skips the denylist for that
+  # ticket only, and the plan always waits for approval. "" disables it.
+  override_tag: ai-override
 
 # --- Sources ---------------------------------------------------------------
 sources:

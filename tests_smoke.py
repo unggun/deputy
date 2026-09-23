@@ -2580,5 +2580,151 @@ for label, ok in _c_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- a human reset and the denylist override tag ---------------------------
+print("\nhuman reset to `new`, and the policy override tag")
+
+
+class _CountingAgent(FakeAgent):
+    def __init__(self, decision):
+        super().__init__(decision)
+        self.prompts = []
+
+    def reason(self, prompt, *, max_turns=1):
+        self.prompts.append(prompt)
+        return super().reason(prompt, max_turns=max_turns)
+
+
+def _reset_env(tmp, task, decision):
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"]["db_path"] = f"{tmp}/s.db"
+    cfg.data["runner"]["work_dir"] = f"{tmp}/w"
+    cfg.data["runner"]["log_dir"] = f"{tmp}/l"
+    src = cfg.sources(only=["mycorp"])[0]
+    prov = FakeProvider([task])
+    agent = _CountingAgent(decision)
+    store = Store(f"{tmp}/s.db")
+    return Pipeline(cfg, src, prov, agent, store), prov, agent, store
+
+
+_MON = dt.datetime(2026, 8, 10, 7, 0)
+_swagger = lambda: mk("T200", "disable Swagger docs in production",
+                      "The API docs are public in production at /docs. "
+                      "The data itself stays behind auth.")
+_exec_xs = {"decision": "execute", "confidence": 0.95, "scope": "xs",
+            "plan": ["gate SwaggerModule.setup behind SWAGGER_ENABLED"],
+            "acceptance_criteria": ["/docs 404s in production"]}
+_needs_human = lambda prov, tid: [c for c in prov.comments[tid]
+                                  if "needs a human" in c.text]
+_r = []
+
+with tempfile.TemporaryDirectory() as tmp:
+    pipe, prov, agent, store = _reset_env(tmp, _swagger(), _exec_xs)
+    pipe.tick(_MON)
+    _r.append(("a denylist false positive parks the ticket at human-only",
+               prov.states.get("T200") == AIState.HUMAN_ONLY))
+    first = _needs_human(prov, "T200")[-1].text if _needs_human(prov, "T200") else ""
+    _r.append(("the human-only comment quotes the text the rule matched",
+               "production at /docs" in first))
+    _r.append(("the human-only comment says how to override",
+               "`ai-override`" in first and "`new`" in first))
+
+    # Reset without the tag: re-triaged, blocked again, and *told* again.
+    prov.tasks["T200"].ai_state = AIState.NEW
+    prov.human_reply("T200", "please go on, this needs to be done from local")
+    pipe.tick(_MON)
+    _r.append(("a reset to `new` is re-triaged, not ignored",
+               len(_needs_human(prov, "T200")) == 2))
+    _r.append(("without the tag the denylist still wins",
+               prov.states.get("T200") == AIState.HUMAN_ONLY))
+    _r.append(("the model was never consulted while the denylist held",
+               agent.prompts == []))
+
+    # Reset with the tag: the model decides, and the plan waits for a human
+    # even at scope xs, which normally goes straight to the queue.
+    prov.tasks["T200"].tags = ["ai-override"]
+    prov.tasks["T200"].ai_state = AIState.NEW
+    pipe.tick(_MON)
+    rows = store.rows_for_task("mycorp", "T200")
+    _r.append(("with the override tag the denylist is skipped",
+               len(agent.prompts) == 1 and "POLICY OVERRIDE" in agent.prompts[0]))
+    _r.append(("an overridden ticket always goes through plan approval",
+               [r["state"] for r in rows] == [AIState.PLANNING.value]))
+    _r.append(("the human-only placeholder is gone after routing",
+               all("#" in r["task_id"] for r in rows)))
+
+with tempfile.TemporaryDirectory() as tmp:
+    # Remote says `new` but this laptop has the row mid-flight: the remote is
+    # just behind (or someone fat-fingered it). Never restart real work.
+    pipe, prov, agent, store = _reset_env(tmp, mk("T201", "Fix typo", "typo"), _exec_xs)
+    store.upsert(rid("T201"), source="mycorp", provider_task_id="T201",
+                 task_key="T201", repo_key="pulse-backend", state=AIState.QUEUED.value)
+    pipe._triage_new()
+    _r.append(("a `new` remote never restarts a row that is mid-flight here",
+               agent.prompts == []
+               and store.get(rid("T201"))["state"] == AIState.QUEUED.value))
+
+with tempfile.TemporaryDirectory() as tmp:
+    pipe, prov, agent, store = _reset_env(tmp, mk("T202", "Fix typo", "typo"), _exec_xs)
+    store.upsert(rid("T202"), source="mycorp", provider_task_id="T202",
+                 task_key="T202", repo_key="pulse-backend", branch="CU-T202-fix-typo",
+                 state=AIState.BLOCKED.value)
+    survives = [True]
+    pipe._branch_survives = lambda repo, branch: survives[0]
+    pipe._triage_new()
+    refused = [c for c in prov.comments["T202"] if "start this over" in c.text]
+    _r.append(("a reset is refused while the old branch survives",
+               agent.prompts == [] and len(refused) == 1
+               and "CU-T202-fix-typo" in refused[0].text))
+    survives[0] = False
+    pipe._triage_new()
+    _r.append(("once the branch is gone the reset goes through",
+               len(agent.prompts) == 1))
+
+# ClickUp renders markdown as literal text; the provider sends rich-text ops.
+from runner.providers.clickup import ClickUpProvider, FOOTER_DEFAULT
+from runner.providers.clickup_format import plain_text, to_ops
+
+_ops = to_ops("**Plan** for `api`\n\n- one\n1. two\n```\nx = 1\n```")
+_r.append(("bold, code, lists and fences become ClickUp attributes",
+           {"text": "Plan", "attributes": {"bold": True}} in _ops
+           and {"text": "api", "attributes": {"code": True}} in _ops
+           and {"text": "\n", "attributes": {"list": {"list": "bullet"}}} in _ops
+           and {"text": "\n", "attributes": {"list": {"list": "ordered"}}} in _ops
+           and {"text": "\n", "attributes": {"code-block": {"code-block": "plain"}}} in _ops))
+_r.append(("snake_case is not read as italic",
+           {"text": "plan_pending ok"} in to_ops("plan_pending ok")))
+
+_cu = ClickUpProvider({"team_id": 1, "token": "x"}, "<!-- ai-runner -->")
+_sent = []
+_cu._req = lambda method, path, **kw: _sent.append(kw.get("json")) or {"id": "c1"}
+_cu.add_comment("T1", "**Hello**")
+_body = _sent[-1] or {}
+_r.append(("comments go out as rich text with a readable footer",
+           "comment" in _body and "comment_text" not in _body
+           and FOOTER_DEFAULT in plain_text(_body["comment"])
+           and "<!--" not in plain_text(_body["comment"])))
+_cu._req = lambda method, path, **kw: {"comments": [
+    {"id": "1", "comment_text": f"Hello\n{FOOTER_DEFAULT}\n", "date": 1, "user": {}},
+    {"id": "2", "comment_text": "<!-- ai-runner -->\nold style", "date": 2, "user": {}},
+    {"id": "3", "comment_text": "please go on", "date": 3, "user": {}}]}
+_bots = [c.is_bot for c in _cu.list_comments("T1")]
+_r.append(("both footer and legacy-marker comments count as the bot's",
+           _bots == [True, True, False]))
+
+_calls = []
+def _reject_rich(method, path, **kw):
+    _calls.append(kw.get("json") or {})
+    if "comment" in _calls[-1]:
+        raise RuntimeError("ClickUp POST /task/T1/comment -> 400: bad comment")
+    return {"id": "c2"}
+_cu._req = _reject_rich
+_cu.add_comment("T1", "**Hello**")
+_r.append(("a rejected rich-text shape falls back to plain text once",
+           len(_calls) == 2 and "comment_text" in _calls[1]))
+
+for label, ok in _r:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

@@ -69,6 +69,12 @@ stateDiagram-v2
 | `blocked` | escalated; needs a human |
 | `done` | PR merged |
 
+**Starting over.** Setting AI State back to `new` on a `human-only` or
+`blocked` ticket makes the runner re-triage it from scratch on the next run. It
+refuses (and says so, once) while a branch from the earlier attempt still
+exists locally or on GitHub — delete it first. A ticket that is mid-flight on
+this machine is never restarted by a remote `new`.
+
 `planning` and `review` are the two stations added on top of the original
 triage → execute → PR loop: `planning` runs a read-only analyst against the
 repo before a human signs off on the plan, and `review` runs an independent
@@ -667,3 +673,7 @@ picked up will not strand it — add `no-ai` or unassign it to stop one mid-flig
   command instead.
 - The denylist in `runner/triage.py` overrides the model. Nothing touching prod
   data, migrations, auth, payments, secrets or infra reaches the agent.
+  The only way past it is a human: add the `policy.override_tag` tag
+  (default `ai-override`; a label on Jira) and set AI State back to `new`. The
+  denylist is then skipped for that ticket only, the model still judges it, and
+  the plan always waits for approval whatever its scope.

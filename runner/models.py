@@ -82,6 +82,10 @@ class TriageResult:
     # a feature spanning a backend and a frontend has two, and the pipeline
     # fans out one independent row (branch, worktree, PR, review) per entry.
     repo_keys: list[str] = field(default_factory=list)
+    # A human tagged the ticket with `policy.override_tag`, so the denylist
+    # was skipped. The pipeline then always gates on plan approval: the one
+    # automatic check was waived, so a human reads the plan before code.
+    policy_override: bool = False
 
     @property
     def repo_key(self) -> str | None:

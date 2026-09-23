@@ -234,6 +234,16 @@ class Store:
         except sqlite3.IntegrityError:
             return False
 
+    def forget_comments(self, task_id: str) -> None:
+        """Release every comment claim for one row.
+
+        Only for a row a human has reset to start over: its old claims (the
+        `human_only` verdict, the plan) would otherwise silence the fresh
+        run's comments for good, and the new verdict would never be posted.
+        """
+        self.conn.execute("DELETE FROM posted_comments WHERE task_id = ?", (task_id,))
+        self.conn.commit()
+
 
 def _coerce(v: Any) -> Any:
     if isinstance(v, (dict, list)):

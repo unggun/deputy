@@ -74,8 +74,18 @@ Reply with a SINGLE JSON object and nothing else. No markdown, no prose:
 }"""
 
 
+OVERRIDE_TAG_DEFAULT = "ai-override"
+
+OVERRIDE_NOTE = """=== POLICY OVERRIDE ===
+A human reviewed this ticket's match against the runner's policy keywords
+and tagged it for automation anyway. Do not refuse it for mentioning
+production, credentials or similar words alone; still judge whether the
+actual code change is clear, scoped and doable from the repository.
+"""
+
+
 def _build_prompt(task: Task, comments: list[Comment],
-                  repos: list[dict[str, Any]]) -> str:
+                  repos: list[dict[str, Any]], override: bool = False) -> str:
     thread = "\n".join(
         f"[{'AI' if c.is_bot else c.author}] {c.text.strip()}" for c in comments[-20:]
     ) or "(no comments)"
@@ -91,6 +101,7 @@ def _build_prompt(task: Task, comments: list[Comment],
     return (
         f"{SYSTEM}\n\n=== TICKET ===\n{task.as_prompt_block()}\n"
         f"=== REPOS ===\n{repo_note}\n=== COMMENT THREAD ===\n{thread}\n\n"
+        f"{OVERRIDE_NOTE + chr(10) if override else ''}"
         "Return the JSON object now."
     )
 
@@ -138,6 +149,28 @@ def hard_rule_violation(task: Task, patterns: list[str],
     return None
 
 
+def _match_excerpt(task: Task, pattern: str,
+                   comments: list[Comment] | None = None, width: int = 40) -> str:
+    """The text a denylist rule matched, with a little context either side.
+
+    A bare regex tells the human nothing about *why*; the excerpt is what lets
+    them see at a glance whether it is a real hit or a false positive.
+    """
+    parts = [task.title, task.description]
+    parts += [c.text for c in (comments or []) if not c.is_bot]
+    blob = "\n".join(parts)             # same join as hard_rule_violation
+    m = re.search(pattern, blob.lower())
+    if not m:
+        return ""
+    lo, hi = max(0, m.start() - width), min(len(blob), m.end() + width)
+    if m.end() - m.start() > 3 * width:     # `.*` can span a whole line
+        text = f"{blob[lo:m.start() + width]} … {blob[m.end() - width:hi]}"
+    else:
+        text = blob[lo:hi]
+    text = " ".join(text.split())
+    return f"{'…' if lo else ''}{text}{'…' if hi < len(blob) else ''}"
+
+
 def triage(agent: CodingAgent, task: Task, comments: list[Comment],
            repos: list[dict[str, Any]] | dict[str, Any] | None,
            policy: dict[str, Any]) -> tuple[TriageResult, float]:
@@ -148,16 +181,29 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
     elif isinstance(repos, dict):
         repos = [repos]
     patterns = policy.get("denylist_patterns") or DEFAULT_DENYLIST
+    override_tag = str(policy.get("override_tag", OVERRIDE_TAG_DEFAULT)).lower()
+    # The only way past the denylist: a human put this tag on the ticket after
+    # reading it. The model can never waive the denylist, and neither can a
+    # comment -- comment text is exactly what the denylist scans.
+    override = bool(override_tag) and override_tag in task.tags
     hit = hard_rule_violation(task, patterns, comments)
-    if hit:
+    if hit and override:
+        log.info("[%s] denylist /%s/ waived by the %r tag", task.key, hit, override_tag)
+    elif hit:
         return TriageResult(
             decision="human_only", confidence=1.0, scope="?",
-            reasoning=f"Blocked by policy rule /{hit}/ — this class of change is never automated.",
-            hints=["A human must scope and verify this change."],
+            reasoning=(f"The ticket matched a policy rule, so I stopped before "
+                       f"doing anything.\n\nRule: `{hit}`\n"
+                       f"Matched text: \"{_match_excerpt(task, hit, comments)}\""),
+            hints=["If this is a false positive, add the "
+                   f"`{override_tag}` tag and set AI State back to `new`. "
+                   "I'll re-triage and always ask you to approve the plan before "
+                   "writing code.",
+                   "Otherwise a human needs to pick this one up."],
             risk_flags=["policy-denylist"],
         ), Spend()
 
-    res = agent.reason(_build_prompt(task, comments, repos))
+    res = agent.reason(_build_prompt(task, comments, repos, override=override))
     if not res.ok:
         raise StationError(f"triage agent failed: {res.error}", Spend.of(res))
     data = parse_json_object(res.text)
@@ -173,6 +219,7 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
         plan=[str(x) for x in data.get("plan", [])],
         acceptance_criteria=[str(x) for x in data.get("acceptance_criteria", [])],
         repo_keys=_pick_repos(data, repos),
+        policy_override=bool(hit and override),
     )
 
     # Post-conditions the model does not get to override.
