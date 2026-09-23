@@ -2726,5 +2726,22 @@ for label, ok in _r:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- a limit-terminated agent run says which limit ---------------------------
+print("\nfailed agent runs say why")
+from runner.agents.claude_code import _failure_reason
+
+for label, ok in [
+    ("a budget-exhausted run names the budget",
+     "Reached maximum budget ($2)" in _failure_reason(
+         {"subtype": "error_max_budget_usd", "is_error": True,
+          "errors": ["Reached maximum budget ($2)"]}, "")),
+    ("a plain error still reports its result text",
+     _failure_reason({"subtype": "error", "result": "boom"}, "") == "boom"),
+    ("nothing to go on is said out loud, never blank",
+     _failure_reason({}, "") == "no reason reported"),
+]:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

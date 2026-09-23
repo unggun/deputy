@@ -452,8 +452,7 @@ class ClaudeCodeAgent(CodingAgent):
             num_turns=int(payload.get("num_turns") or 0),
             duration_ms=int(payload.get("duration_ms") or 0),
             usage=usage,
-            error=None if ok else self._clean(
-                str(payload.get("result") or stderr_text))[:1000],
+            error=None if ok else self._clean(_failure_reason(payload, stderr_text))[:1000],
             raw=payload,
         )
 
@@ -555,3 +554,20 @@ class ClaudeCodeAgent(CodingAgent):
 
     def _clean(self, text: str) -> str:
         return redact(text, self.secrets)
+
+
+def _failure_reason(payload: dict[str, Any], stderr_text: str) -> str:
+    """Why a run that produced a result event still failed.
+
+    A limit-terminated run (`error_max_budget_usd`, `error_max_turns`) has no
+    `result` text at all -- the reason is in `errors` and `subtype`. Reading
+    only `result` turned those into "Agent run failed: " with nothing after
+    it, on exactly the escalation a human has to act on.
+    """
+    parts = [str(e) for e in (payload.get("errors") or []) if e]
+    subtype = str(payload.get("subtype") or "")
+    if subtype and subtype not in ("success", "error"):
+        parts.append(f"({subtype})")
+    if payload.get("result"):
+        parts.append(str(payload["result"]))
+    return " ".join(parts) or stderr_text.strip() or "no reason reported"
