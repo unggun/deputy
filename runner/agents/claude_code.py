@@ -69,14 +69,14 @@ GIT_ENV_VARS = frozenset({
 
 # Set on every child. An agent that finds this in its environment is already
 # running inside a runner-managed run and must not start another one.
-RUN_ID_ENV = "AI_TASK_RUNNER_RUN_ID"
+RUN_ID_ENV = "DEPUTY_RUN_ID"
 
 # Where `reason()` runs. Triage is a tool-less classification of ticket text,
 # so any repository it happens to stand in is context it must not have -- see
 # `ClaudeCodeAgent.reason`. A *fixed* path rather than a fresh temp directory
 # because the cwd is part of the system prompt, and a path that changes every
 # call misses the prompt cache on every call.
-DEFAULT_TRIAGE_DIR = "~/.ai-runner/triage"
+DEFAULT_TRIAGE_DIR = "~/.deputy/triage"
 
 # Flags that stop `claude` pulling in ambient context. `--allowedTools ""`
 # removes the model's ability to *act*, but not the CLAUDE.md, MCP tool

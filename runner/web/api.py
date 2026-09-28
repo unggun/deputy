@@ -48,12 +48,12 @@ def _secrets(cfg: Config) -> list[str]:
 
 
 def build_app(cfg: Config) -> FastAPI:
-    db_path = cfg.get("runner.db_path", "~/.ai-runner/state.db")
-    log_root = Path(str(cfg.get("runner.log_dir", "~/.ai-runner/logs"))).expanduser()
+    db_path = cfg.get("runner.db_path", "~/.deputy/state.db")
+    log_root = Path(str(cfg.get("runner.log_dir", "~/.deputy/logs"))).expanduser()
     limits = cfg.get("runner.limits", {}) or {}
     secrets = _secrets(cfg)
 
-    app = FastAPI(title="ai-task-runner", docs_url=None, redoc_url=None)
+    app = FastAPI(title="deputy", docs_url=None, redoc_url=None)
 
     def reader() -> Reader:
         # One connection per request: sqlite3 objects are not safely shared

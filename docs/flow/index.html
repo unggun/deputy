@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ai-task-runner — Flow Diagrams</title>
+<title>deputy — Flow Diagrams</title>
 <style>
   :root{
     --bg:#f7f8f8; --panel:#ffffff; --ink:#15211f; --muted:#5d6b68;
@@ -72,7 +72,7 @@
 <div class="wrap">
 
 <header>
-  <p class="eyebrow">ai-task-runner</p>
+  <p class="eyebrow">deputy</p>
   <h1>Flow diagrams</h1>
   <p class="lede">
     Six views of the same machine: a resumable bridge between a task manager and a coding agent.
@@ -99,7 +99,7 @@
   <a class="card" href="02-one-tick.html">
     <span class="num">02</span><span class="kind">Workflow</span>
     <h3>One tick</h3>
-    <p>What a single <code>ai-task-runner run</code> actually does: day and window gates, daily
+    <p>What a single <code>deputy run</code> actually does: day and window gates, daily
        limits, advance in-flight rows first, then triage what is new.</p>
     <ul>
       <li>Every task moves at most one step, then the process exits</li>
@@ -173,7 +173,7 @@
   docs/flow/specs/04-build-review-ship.workflow.json \
   docs/flow/04-build-review-ship.html --quality showcase</pre>
   <p style="margin-top:12px">The live state graph itself stays authoritative in
-     <code>runner/graph.py</code>; <code>ai-task-runner graph</code> prints it as Mermaid straight
+     <code>runner/graph.py</code>; <code>deputy graph</code> prints it as Mermaid straight
      from the same <code>TRANSITIONS</code> table the runtime uses.</p>
 </div>
 

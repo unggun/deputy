@@ -1,7 +1,7 @@
-# ai-task-runner dashboard (frontend)
+# deputy dashboard (frontend)
 
 The React/TypeScript source for the read-only monitoring dashboard served by
-`ai-task-runner serve`. It talks to the FastAPI routes in `runner/web/api.py`
+`deputy serve`. It talks to the FastAPI routes in `runner/web/api.py`
 and renders nothing it cannot get from them.
 
 ```bash
@@ -13,7 +13,7 @@ npm run lint    # oxlint
 
 `npm run build` writes into **`../runner/web/static/`**, which is committed:
 the Python package ships the built assets so `pip install` plus
-`ai-task-runner serve` works without Node. Any change under `web/src` has to
+`deputy serve` works without Node. Any change under `web/src` has to
 be rebuilt and the rebuilt `runner/web/static/` committed alongside it, or the
 served dashboard silently stays on the previous version.
 

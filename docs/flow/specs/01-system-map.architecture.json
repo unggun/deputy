@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "ai-task-runner — System Map",
+    "title": "deputy — System Map",
     "quality_profile": "showcase",
     "viewBox": [
       1200,
@@ -133,7 +133,7 @@
       "id": "cron",
       "type": "external",
       "label": "Cron / launchd",
-      "sublabel": "ai-task-runner run",
+      "sublabel": "deputy run",
       "pos": [
         44,
         172

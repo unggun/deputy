@@ -1,12 +1,12 @@
 [project]
-name = "ai-task-runner"
+name = "deputy"
 version = "0.1.0"
 description = "Pluggable bridge between a task manager and a coding agent"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.31", "pyyaml>=6.0"]
 
 [project.scripts]
-ai-task-runner = "runner.cli:main"
+deputy = "runner.cli:main"
 
 [project.optional-dependencies]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]

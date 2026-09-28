@@ -1,4 +1,4 @@
-# ai-task-runner
+# deputy
 
 A resumable bridge between a task manager and a coding agent. Ships with
 ClickUp + Claude Code; swap either by implementing one small interface.
@@ -16,7 +16,7 @@ Illegal transitions raise instead of corrupting state, and this diagram is
 generated from the same object the runtime uses, so it cannot drift:
 
 ```bash
-ai-task-runner graph        # paste into Confluence / ClickUp docs
+deputy graph        # paste into Confluence / ClickUp docs
 ```
 
 ```mermaid
@@ -118,7 +118,7 @@ hand when that happens.
 | `agent.reviewer_tools` | tools available to the reviewer station; the repo's own `test` command is appended at call time |
 | `limits.daily_tokens` | daily token ceiling; `0` (default) disables it. See *Two daily limits* below |
 | `agent.max_log_bytes` | cap on one run's JSONL event log under `runner.log_dir` |
-| `agent.triage_dir` | the empty directory triage runs in (default `~/.ai-runner/triage`) |
+| `agent.triage_dir` | the empty directory triage runs in (default `~/.deputy/triage`) |
 | `agent.isolate_triage` | `false` lets triage inherit the launch directory's context again |
 
 ## Two daily limits, because dollars are the wrong unit
@@ -139,7 +139,7 @@ tokens dominate. On a subscription the dollar limit will essentially never fire 
 so if you want a real ceiling, set `daily_tokens`. On an `ANTHROPIC_API_KEY` the dollar
 figure is the true one and you can leave `daily_tokens: 0`.
 
-`ai-task-runner status` prints both per row.
+`deputy status` prints both per row.
 
 ## Triage does not read your repos — now actually
 
@@ -181,7 +181,7 @@ Agent runs are supervised rather than simply waited on:
   terminal it then waits on forever. The prompt is passed in argv.
 - The child gets a **sanitised environment**: inherited `GIT_DIR` / `GIT_WORK_TREE` /
   `GIT_INDEX_FILE` are stripped (they would silently point the agent's `git` at a different
-  repository), and `AI_TASK_RUNNER_RUN_ID` is set so a nested agent can tell it is already
+  repository), and `DEPUTY_RUN_ID` is set so a nested agent can tell it is already
   inside a managed run.
 
 ## Credentials never reach a ticket
@@ -283,7 +283,7 @@ cp config.example.yaml config.yaml
 export CLICKUP_TOKEN=pk_xxx GH_TOKEN_WORK=ghp_xxx
 gh auth login              # or skip it and set GH_TOKEN_* per vcs_profile
 claude auth status         # must report an authenticated identity
-ai-task-runner doctor      # checks every source, profile and repo
+deputy doctor      # checks every source, profile and repo
 ```
 
 A venv rather than a bare `pip install` because Debian/Ubuntu ship PEP 668
@@ -297,10 +297,10 @@ Schedule nothing until it exits 0.
 ## Run
 
 ```bash
-ai-task-runner run --dry-run --force        # see what it would do, right now
-ai-task-runner run                          # one tick, respects time windows
-ai-task-runner run --source acme            # limit to one workspace
-ai-task-runner status                       # what is in flight, across sources
+deputy run --dry-run --force        # see what it would do, right now
+deputy run                          # one tick, respects time windows
+deputy run --source acme            # limit to one workspace
+deputy status                       # what is in flight, across sources
 python3 tests_smoke.py                      # offline state-machine tests
 ```
 
@@ -308,7 +308,7 @@ python3 tests_smoke.py                      # offline state-machine tests
 
 ```bash
 pip install -e '.[web]'
-ai-task-runner serve            # http://127.0.0.1:8787
+deputy serve            # http://127.0.0.1:8787
 ```
 
 A read-only view of this laptop's runner: what is stuck, what is running,
@@ -319,7 +319,7 @@ acting on the runner stays in the task manager and the CLI.
 `serve` refuses to start against a missing or unusable database rather than
 serving a dashboard full of zeros — those are indistinguishable from a runner
 that ran and found nothing to do, which is exactly the ambiguity the
-dashboard exists to remove. Run `ai-task-runner run` at least once first.
+dashboard exists to remove. Run `deputy run` at least once first.
 
 It binds loopback by default. `--host` accepts anything, and warns, because
 the page carries ticket titles, PR URLs and error text.
@@ -341,20 +341,20 @@ near-empty environment and reads neither `.profile` nor `.bashrc`, so `claude`
 and `gh` are off `PATH` and every `${VAR}` in `config.yaml` is unset:
 
 ```cron
-*/15 * * * * $HOME/.ai-runner/run.sh run >> $HOME/.ai-runner/logs/cron.log 2>&1
+*/15 * * * * $HOME/.deputy/run.sh run >> $HOME/.deputy/logs/cron.log 2>&1
 ```
 
 The wrapper is in *Deploy on a VPS* below — it is identical on a laptop.
 
 **Windows**
 ```powershell
-schtasks /create /tn "ai-task-runner" /sc minute /mo 15 ^
-  /tr "C:\Python312\Scripts\ai-task-runner.exe run -c C:\ai-runner\config.yaml"
+schtasks /create /tn "deputy" /sc minute /mo 15 ^
+  /tr "C:\Python312\Scripts\deputy.exe run -c C:\deputy\config.yaml"
 ```
 
 **Anywhere** — if cron is awkward (laptop sleeps, Windows quirks):
 ```bash
-ai-task-runner daemon --interval 900
+deputy daemon --interval 900
 ```
 
 On a Linux server, prefer a systemd timer over both — the next section.
@@ -384,8 +384,8 @@ any `remote:` is an SSH URL.
 ### 1. A user of its own
 
 ```bash
-sudo adduser --disabled-password --gecos "" airunner
-sudo -u airunner -H bash -l
+sudo adduser --disabled-password --gecos "" deputy
+sudo -u deputy -H bash -l
 ```
 
 The agent runs each repo's `setup:` through `bash -lc` and holds `Write`/`Edit`
@@ -454,8 +454,8 @@ GH_TOKEN=$GH_TOKEN_WORK gh auth status
 ### 6. Config
 
 ```bash
-sudo install -d -o airunner -g airunner /opt/ai-task-runner
-git clone <this repo> /opt/ai-task-runner && cd /opt/ai-task-runner
+sudo install -d -o deputy -g deputy /opt/deputy
+git clone <this repo> /opt/deputy && cd /opt/deputy
 python3 -m venv .venv && .venv/bin/pip install -e .
 cp config.example.yaml config.yaml
 ```
@@ -472,15 +472,15 @@ These are per-machine, and silently wrong if you copy a laptop's `config.yaml`:
 ### 7. Secrets, in a file the scheduler can read
 
 ```bash
-install -m 700 -d ~/.ai-runner
-cat > ~/.ai-runner/env <<'EOF'
+install -m 700 -d ~/.deputy
+cat > ~/.deputy/env <<'EOF'
 CLICKUP_TOKEN=pk_xxx
 JIRA_EMAIL=you@example.com
 JIRA_TOKEN=xxx
 GH_TOKEN_WORK=ghp_xxx
 CLAUDE_CODE_OAUTH_TOKEN=xxx
 EOF
-chmod 600 ~/.ai-runner/env
+chmod 600 ~/.deputy/env
 ```
 
 `Config.load` raises on the first unset `${VAR}`, so a tick with a half-loaded
@@ -497,10 +497,10 @@ the `PATH` export in `~/.profile` above the interactive guard.
 ### 8. Prove it works before scheduling it
 
 ```bash
-set -a; . ~/.ai-runner/env; set +a
-cd /opt/ai-task-runner
-.venv/bin/ai-task-runner doctor              # must exit 0
-.venv/bin/ai-task-runner run --dry-run --force
+set -a; . ~/.deputy/env; set +a
+cd /opt/deputy
+.venv/bin/deputy doctor              # must exit 0
+.venv/bin/deputy run --dry-run --force
 .venv/bin/python3 tests_smoke.py             # offline state-machine tests
 ```
 
@@ -509,21 +509,21 @@ cd /opt/ai-task-runner
 Preferred over cron on a VPS: it takes the env file directly, it will not start
 a second tick on top of one still running, and `journalctl` beats a stray log file.
 
-`/etc/systemd/system/ai-task-runner.service`:
+`/etc/systemd/system/deputy.service`:
 
 ```ini
 [Unit]
-Description=ai-task-runner — one tick
+Description=deputy — one tick
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
-User=airunner
-WorkingDirectory=/opt/ai-task-runner
-EnvironmentFile=/home/airunner/.ai-runner/env
-Environment=PATH=/home/airunner/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/opt/ai-task-runner/.venv/bin/ai-task-runner run -c /opt/ai-task-runner/config.yaml
+User=deputy
+WorkingDirectory=/opt/deputy
+EnvironmentFile=/home/deputy/.deputy/env
+Environment=PATH=/home/deputy/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/deputy/.venv/bin/deputy run -c /opt/deputy/config.yaml
 TimeoutStartSec=3600
 ```
 
@@ -533,11 +533,11 @@ of an agent run. `PATH` is explicit because a unit inherits almost nothing:
 without it `claude` is not found and `ClaudeCodeAgent.__init__` raises before any
 work starts.
 
-`/etc/systemd/system/ai-task-runner.timer`:
+`/etc/systemd/system/deputy.timer`:
 
 ```ini
 [Unit]
-Description=ai-task-runner every 15 minutes
+Description=deputy every 15 minutes
 
 [Timer]
 OnBootSec=5min
@@ -551,10 +551,10 @@ WantedBy=timers.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now ai-task-runner.timer
-systemctl list-timers ai-task-runner.timer
-sudo systemctl start --no-block ai-task-runner.service   # one tick, by hand
-journalctl -u ai-task-runner -f
+sudo systemctl enable --now deputy.timer
+systemctl list-timers deputy.timer
+sudo systemctl start --no-block deputy.service   # one tick, by hand
+journalctl -u deputy -f
 ```
 
 Cron instead, if you prefer it — but it needs a wrapper, because cron gets a
@@ -564,26 +564,26 @@ near-empty environment and reads neither `.profile` nor `.bashrc`:
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-set -a; . "$HOME/.ai-runner/env"; set +a
-cd /opt/ai-task-runner
-exec /opt/ai-task-runner/.venv/bin/ai-task-runner "$@"
+set -a; . "$HOME/.deputy/env"; set +a
+cd /opt/deputy
+exec /opt/deputy/.venv/bin/deputy "$@"
 ```
 
 ```cron
-*/15 * * * * $HOME/.ai-runner/run.sh run >> $HOME/.ai-runner/logs/cron.log 2>&1
+*/15 * * * * $HOME/.deputy/run.sh run >> $HOME/.deputy/logs/cron.log 2>&1
 ```
 
 ### 10. Keep an eye on it
 
 ```bash
-set -a; . ~/.ai-runner/env; set +a           # `status` still loads config.yaml
-/opt/ai-task-runner/.venv/bin/ai-task-runner status -c /opt/ai-task-runner/config.yaml
-journalctl -u ai-task-runner --since today | grep '"lvl":"ERROR"'
-du -sh ~/.ai-runner/work/*                   # worktrees are not free
+set -a; . ~/.deputy/env; set +a           # `status` still loads config.yaml
+/opt/deputy/.venv/bin/deputy status -c /opt/deputy/config.yaml
+journalctl -u deputy --since today | grep '"lvl":"ERROR"'
+du -sh ~/.deputy/work/*                   # worktrees are not free
 ```
 
 Logs are JSON lines, one `runner.log` in `runner.log_dir` plus whatever the
-scheduler captures. Rotate them — `/etc/logrotate.d/ai-runner` with `weekly`,
+scheduler captures. Rotate them — `/etc/logrotate.d/deputy` with `weekly`,
 `rotate 8`, `compress`, `copytruncate` is enough. Nothing prunes worktrees except
 the pipeline itself, so watch the disk for the first few weeks.
 
@@ -629,11 +629,36 @@ Before upgrading a ClickUp source on `custom_field`:
 1. Create ClickUp dropdown options for `new`, `planning` and `review` on the
    AI State custom field.
 2. Add all three to that source's `state_field_options:` in `config.yaml`.
-3. Run `ai-task-runner doctor` and confirm no `RuntimeError` surfaces from
+3. Run `deputy doctor` and confirm no `RuntimeError` surfaces from
    the ClickUp provider.
 
 Jira is unaffected — state lives in an issue entity property that accepts
 any value, and only the four human-actionable states are mirrored to labels.
+
+### From `ai-task-runner` to `deputy`
+
+The rename changed local names only. Ticket-side identifiers are unchanged —
+`<!-- ai-runner -->`, the ClickUp footer `🤖 posted by ai-task-runner`, the
+`ai-runner-state` Jira property, `ai:*` labels, `ai-override` / `no-ai` — so
+in-flight tickets carry on.
+
+What did change: the CLI is `deputy`, the default data directory is
+`~/.deputy`, and agents see `DEPUTY_RUN_ID` instead of `AI_TASK_RUNNER_RUN_ID`.
+**Nothing falls back to `~/.ai-runner`.** Starting on an empty `~/.deputy`
+means a fresh database, and every ticket that is in flight remotely gets
+orphaned to `blocked`. So move the directory, don't just repoint config:
+
+1. Stop the scheduler, or wait until no tick is running.
+2. `mv ~/.ai-runner ~/.deputy`
+3. Worktrees link to their repo by absolute path, so repair each one from
+   its source repo: `git -C <repo path> worktree repair ~/.deputy/work/<repo key>/*`
+4. Update `~/.ai-runner` paths in `config.yaml`, your wrapper script, `env` and
+   the crontab / systemd unit. Reinstall (`pip install -e .`) to get the
+   `deputy` console script.
+5. `deputy doctor`, then `deputy status` — the in-flight rows should all be
+   there — then re-enable the scheduler.
+
+Hooks in a target repo that check `AI_TASK_RUNNER_RUN_ID` need updating too.
 
 ## Adding a provider or agent
 

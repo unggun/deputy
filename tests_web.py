@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory() as tmp:
 # it, nothing wipes it), so without a terminal filter the "Needs a human"
 # list and the red KPI tile degrade into a permanent record of every error
 # the runner ever hit -- "Nothing is stuck" becomes unreachable after the
-# first escalation, and the dashboard disagrees with `ai-task-runner status`,
+# first escalation, and the dashboard disagrees with `deputy status`,
 # which does filter terminals.
 with tempfile.TemporaryDirectory() as tmp:
     path, st = seed(tmp)

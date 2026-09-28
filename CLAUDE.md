@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ai-task-runner` — a resumable bridge between a task manager (ClickUp / Jira) and a
+`deputy` — a resumable bridge between a task manager (ClickUp / Jira) and a
 coding agent (Claude Code). It picks up tickets assigned to the developer, triages
 them, plans, writes code in an isolated worktree, opens a draft PR, and follows the
 PR through CI/review until merge.
@@ -35,19 +35,19 @@ the repo root and auto-discovery would try to treat it as a package too. A
 — auto-discovery finds Python packages and carries no other files, so without
 that entry the built dashboard assets would be silently absent from the wheel
 while the package still imported cleanly. The console script is
-`ai-task-runner = runner.cli:main`, so `pyproject.toml` must stay at the repo
+`deputy = runner.cli:main`, so `pyproject.toml` must stay at the repo
 root, not inside `runner/`.
 
 ## Commands
 
 ```bash
-ai-task-runner doctor                     # validate graph, vcs profiles, provider creds, repo mapping
-ai-task-runner run --dry-run --force      # one tick, ignore time windows, no writes
-ai-task-runner run                        # one tick, respects windows/days; this is the cron entrypoint
-ai-task-runner run --source acme          # limit to one source (repeatable)
-ai-task-runner daemon --interval 900      # loop, for hosts where cron is awkward
-ai-task-runner status                     # in-flight rows across all sources
-ai-task-runner graph                      # print the live transition table as Mermaid
+deputy doctor                     # validate graph, vcs profiles, provider creds, repo mapping
+deputy run --dry-run --force      # one tick, ignore time windows, no writes
+deputy run                        # one tick, respects windows/days; this is the cron entrypoint
+deputy run --source acme          # limit to one source (repeatable)
+deputy daemon --interval 900      # loop, for hosts where cron is awkward
+deputy status                     # in-flight rows across all sources
+deputy graph                      # print the live transition table as Mermaid
 python3 tests_smoke.py                    # offline state-machine tests (fake provider + fake agent)
 ```
 
@@ -231,7 +231,7 @@ it. Asked what project it was in, unisolated triage recited this repository's `C
 isolated triage answers `NO PROJECT CONTEXT`.
 
 So `reason()` runs in `agent.triage_dir` (a fixed empty directory, default
-`~/.ai-runner/triage`) with `TRIAGE_ISOLATION`: `--strict-mcp-config`,
+`~/.deputy/triage`) with `TRIAGE_ISOLATION`: `--strict-mcp-config`,
 `--disable-slash-commands`, `--setting-sources ""`. Fixed and not a temp dir because the
 cwd is part of the system prompt — a path that changes per call misses the prompt cache
 per call. An uncreatable directory logs and falls back to the old behaviour rather than
@@ -275,7 +275,7 @@ accident:
   is not a spare channel.
 - **The environment is sanitised.** `_sanitized_env()` strips `GIT_DIR`, `GIT_WORK_TREE`,
   `GIT_INDEX_FILE` and friends, which otherwise override the worktree and point the agent's
-  `git` at a different repository, and sets `AI_TASK_RUNNER_RUN_ID` so a nested agent can
+  `git` at a different repository, and sets `DEPUTY_RUN_ID` so a nested agent can
   tell it is already inside a managed run.
 - **The prompt has a ceiling.** It travels in argv, so past the kernel's limit the exec
   fails as a bare `OSError` — at the one moment an operator most needs a readable
@@ -396,7 +396,7 @@ not committed (`config.example.yaml` is the template).
 
 `runner/web/` is a read-only HTTP view over the same SQLite file and log
 directory the cron tick writes. It is a separate process, started by
-`ai-task-runner serve`; nothing was added to a tick, and the runner does not
+`deputy serve`; nothing was added to a tick, and the runner does not
 know the dashboard exists.
 
 Invariants, each easy to undo by accident:
@@ -459,7 +459,7 @@ Invariants, each easy to undo by accident:
   ever clears that column, so a `done` row that hit one transient `gh` timeout
   on the way was reported stuck forever and "Nothing is stuck" became
   unreachable after the first escalation. A permanently-red tile is a tile
-  nobody reads. `ai-task-runner status` deliberately uses a different filter —
+  nobody reads. `deputy status` deliberately uses a different filter —
   it calls `store.in_flight()`, which excludes *all* terminal states, `blocked`
   and `human-only` included. `stuck()` keeps those two on purpose: they are
   terminal precisely because a human must act, which is what this list exists
@@ -519,7 +519,7 @@ splitting each `detail` string on `->`.
 
 The graph tab does not render a diagram. `/api/graph` returns
 `{"transitions": [...], "mermaid": "..."}`, both derived from the same
-`graph.TRANSITIONS` object that backs `ai-task-runner graph`, so neither the
+`graph.TRANSITIONS` object that backs `deputy graph`, so neither the
 table nor the pasted-out text can drift from the runtime's own rules. The
 frontend (`GraphTab.tsx`) renders `transitions` as a plain table and tucks the
 `mermaid` string in a `<details>` for copy-out elsewhere. A real

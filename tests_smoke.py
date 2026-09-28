@@ -2368,13 +2368,13 @@ def _canary(text, ok=True, timed_out=False):
     return AgentResult(ok=ok, text=text, timed_out=timed_out)
 
 
-_named = _canary("You are in the ai-task-runner repository.")
+_named = _canary("You are in the deputy repository.")
 _c_checks = [
     ("the sentinel means isolated",
      _isolation_status(True, _canary(CANARY_SENTINEL))[0] == "ok"),
     ("a named project means not isolated", _isolation_status(True, _named)[0] == "broken"),
     ("...and the detail quotes what it saw",
-     "ai-task-runner" in _isolation_status(True, _named)[1]),
+     "deputy" in _isolation_status(True, _named)[1]),
     ("isolate_triage: false is skipped, not passed",
      _isolation_status(False, _canary(CANARY_SENTINEL))[0] == "skipped"),
     ("a failed canary call is unverified, not passed",

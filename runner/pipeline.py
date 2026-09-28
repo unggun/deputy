@@ -47,12 +47,12 @@ class Pipeline:
         self.dry_run = dry_run
         self.runner_id = str(cfg.get("runner.id", "runner"))
         self.mode = str(cfg.get("runner.mode", "shadow"))  # shadow | execute
-        self.work_root = cfg.path("runner.work_dir", "~/.ai-runner/work")
-        self.log_root = cfg.path("runner.log_dir", "~/.ai-runner/logs")
+        self.work_root = cfg.path("runner.work_dir", "~/.deputy/work")
+        self.log_root = cfg.path("runner.log_dir", "~/.deputy/logs")
         self.limits = cfg.get("runner.limits", {}) or {}
         self.policy = cfg.get("policy", {}) or {}
         self.acfg = cfg.get("agent", {}) or {}
-        self.brain_root = cfg.path("runner.brain_dir", "~/.ai-runner/brain")
+        self.brain_root = cfg.path("runner.brain_dir", "~/.deputy/brain")
         self.pcfg = source.provider
         # Lazily gathered on first use: building it touches every vcs
         # profile, and a shadow-mode tick may never need one.

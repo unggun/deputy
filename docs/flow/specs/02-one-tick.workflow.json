@@ -2,7 +2,7 @@
   "schema_version": 2,
   "diagram_type": "workflow",
   "meta": {
-    "title": "One Tick of ai-task-runner run",
+    "title": "One Tick of deputy run",
     "quality_profile": "showcase",
     "views": [
       {
@@ -99,7 +99,7 @@
       "col": 0,
       "type": "external",
       "label": "Cron fires",
-      "sublabel": "ai-task-runner run",
+      "sublabel": "deputy run",
       "width": 152
     },
     {

@@ -30,7 +30,7 @@ CANARY_PROMPT = (
 
 
 def _logging(cfg: Config, verbose: bool) -> None:
-    log_dir = cfg.path("runner.log_dir", "~/.ai-runner/logs")
+    log_dir = cfg.path("runner.log_dir", "~/.deputy/logs")
     handlers: list[logging.Handler] = [
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(log_dir / "runner.log", encoding="utf-8"),
@@ -46,7 +46,7 @@ def _logging(cfg: Config, verbose: bool) -> None:
 
 def _pipelines(cfg: Config, dry_run: bool, only: list[str] | None) -> list[Pipeline]:
     agent = ClaudeCodeAgent(cfg.get("agent", {}) or {})
-    store = Store(cfg.get("runner.db_path", "~/.ai-runner/state.db"))
+    store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
     marker = str(cfg.get("runner.bot_marker", BOT_MARKER_DEFAULT))
     out = []
     for src in cfg.sources(only=only):
@@ -160,7 +160,7 @@ def _doctor(cfg: Config) -> int:
                      repo["key"], profile["name"], path,
                      "present" if path.exists() else "will clone")
         for repo in src.repos:
-            bp = brain.brain_path(cfg.path("runner.brain_dir", "~/.ai-runner/brain"),
+            bp = brain.brain_path(cfg.path("runner.brain_dir", "~/.deputy/brain"),
                                   src.key, repo["key"])
             cap = int((cfg.get("runner.limits", {}) or {})
                       .get("brain_max_bytes", brain.DEFAULT_MAX_BYTES))
@@ -231,7 +231,7 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
               f"error text to anything that can reach this machine.",
               file=sys.stderr)
 
-    db = Path(str(cfg.get("runner.db_path", "~/.ai-runner/state.db"))).expanduser()
+    db = Path(str(cfg.get("runner.db_path", "~/.deputy/state.db"))).expanduser()
     # Refuse rather than serve an empty or broken dashboard. Zeros rendered
     # from a missing database are indistinguishable from a runner that ran
     # and found nothing to do -- exactly the ambiguity this dashboard exists
@@ -244,12 +244,12 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
         probe.close()
     except FileNotFoundError:
         print(f"no state database at {db}\n"
-              f"run `ai-task-runner run` at least once first.", file=sys.stderr)
+              f"run `deputy run` at least once first.", file=sys.stderr)
         return 1
     except sqlite3.Error as exc:
         # Exists but is not a usable runner database -- a directory, a
         # corrupt file, or something else entirely.
-        print(f"{db} is not a readable ai-task-runner database: {exc}",
+        print(f"{db} is not a readable deputy database: {exc}",
               file=sys.stderr)
         return 1
 
@@ -263,7 +263,7 @@ def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="ai-task-runner")
+    ap = argparse.ArgumentParser(prog="deputy")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--source", action="append", dest="sources",
@@ -304,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor(cfg)
 
     if args.cmd == "status":
-        store = Store(cfg.get("runner.db_path", "~/.ai-runner/state.db"))
+        store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
         rows = store.in_flight()
         if not rows:
             print("nothing in flight")
