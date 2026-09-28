@@ -1,5 +1,9 @@
-# Local runtime state — never committed
-config.yaml
+# Local runtime state — never committed. config*.yaml, not config.yaml:
+# backup copies (config.yaml.bak, config.local.yaml) hold the same real
+# config and must not ride along on a `git add .`.
+config*.yaml
+config.yaml.*
+!config.example.yaml
 *.db
 *.db-journal
 *.db-wal
