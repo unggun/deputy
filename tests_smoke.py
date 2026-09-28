@@ -526,6 +526,11 @@ checks = [
     ("reason() uses triage_model", _flag(r_cmd, "--model") == "opus"),
     ("work() uses model",          _flag(w_cmd, "--model") == "sonnet"),
     ("reason() still has no tools", _flag(r_cmd, "--allowedTools") == ""),
+    # --allowedTools only auto-approves; --tools is what removes built-ins
+    # from what the model is offered. Without it opus spends its one turn
+    # on a Bash call and triage ends error_max_turns with no answer.
+    ("reason() is offered no tools", _flag(r_cmd, "--tools") == ""),
+    ("work() keeps its built-in tools", "--tools" not in w_cmd),
     ("reason() is one turn",        _flag(r_cmd, "--max-turns") == "1"),
     ("work() may dispatch subagents", "Agent" in (_flag(w_cmd, "--allowedTools") or "")),
 ]
@@ -2169,11 +2174,16 @@ with tempfile.TemporaryDirectory() as tmp:
     i1 = r_kw["cwd"] == str(tdir) and tdir.is_dir()
     i2 = all(f in r_cmd for f in ("--strict-mcp-config", "--disable-slash-commands"))
     i3 = r_cmd[r_cmd.index("--setting-sources") + 1] == ""
+    # The default system prompt casts the model as an agent in a directory
+    # and carries cwd and memory paths; auto-memory ignores --setting-sources.
+    i3b = (_flag(r_cmd, "--system-prompt") == CC.TRIAGE_SYSTEM_PROMPT
+           and json.loads(_flag(r_cmd, "--settings") or "{}").get("autoMemoryEnabled") is False)
     # work() must NOT be isolated: the target repo's own CLAUDE.md is exactly
     # the context the implementer is supposed to have.
     i4 = w_kw["cwd"] == "/some/worktree"
     i5 = not any(f in w_cmd for f in
-                 ("--strict-mcp-config", "--disable-slash-commands", "--setting-sources"))
+                 ("--strict-mcp-config", "--disable-slash-commands", "--setting-sources",
+                  "--system-prompt", "--settings", "--tools"))
     # `claude -p` appends a non-TTY stdin to the prompt.
     i6 = r_kw["stdin"] is CC.subprocess.DEVNULL and w_kw["stdin"] is CC.subprocess.DEVNULL
     # The triage cwd is fixed, not per-call: the cwd is in the system prompt,
@@ -2189,6 +2199,7 @@ with tempfile.TemporaryDirectory() as tmp:
 for label, ok in [("triage runs in its own empty directory", i1),
                   ("triage disables MCP servers and skills", i2),
                   ("triage loads no settings or CLAUDE.md", i3),
+                  ("triage replaces the agent prompt and drops auto-memory", i3b),
                   ("work() still runs in the worktree", i4),
                   ("work() keeps the repo's own context", i5),
                   ("stdin is closed so it cannot become prompt", i6),
@@ -2207,7 +2218,8 @@ with tempfile.TemporaryDirectory() as tmp:
         agent.reason("classify this")
     finally:
         CC.subprocess.Popen = real
-    i8 = seen[0][1]["cwd"] is None and "--strict-mcp-config" not in seen[0][0]
+    i8 = (seen[0][1]["cwd"] is None and "--strict-mcp-config" not in seen[0][0]
+          and _flag(seen[0][0], "--tools") == "")   # opting out keeps no-tools
 
     # A triage dir that cannot be created must degrade, not strand triage.
     blocker = Path(tmp) / "afile"

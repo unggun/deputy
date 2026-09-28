@@ -88,7 +88,7 @@ def _isolation_status(isolate_triage: bool,
                       res: AgentResult) -> tuple[str, str]:
     """Did triage really run with no ambient project context?
 
-    `--allowedTools ""` removes the ability to act, not the ambient context,
+    `--tools ""` removes the ability to act, not the ambient context,
     and `_triage_cwd` deliberately degrades to the launch directory when the
     triage dir cannot be created. Both leave triage reading whatever repo cron
     happened to start in, and neither says so at the point it matters. This is

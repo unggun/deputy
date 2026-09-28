@@ -154,10 +154,13 @@ Asked "what project is your working directory?", triage launched from this repo 
 recite this repo's `CLAUDE.md`. It now answers `NO PROJECT CONTEXT`.
 
 Triage therefore runs in `agent.triage_dir` — a fixed empty directory — with MCP servers,
-skills and settings sources switched off. Fixed rather than a fresh temp directory because
-the cwd is part of the system prompt, so a path that changes every call would miss the
-prompt cache every call. On one ticket-shaped prompt this took a triage call from ~46k
-tokens to ~32k, but the reason to do it is correctness, not cost.
+skills, settings sources and auto-memory switched off, and with Claude Code's default
+agent system prompt replaced by a short one saying it only classifies tickets. It is
+also offered no tools at all (`--tools ""`): `--allowedTools ""` only controls what runs
+without asking, so on its own the model was still offered Bash, reached for it, and ran
+out of its single turn with no answer. Fixed rather than a fresh temp directory so a
+changing path cannot defeat the prompt cache. With all of it, the `doctor` canary costs
+about 370 input tokens instead of ~31k, but the reason to do it is correctness, not cost.
 
 `work()` is **not** isolated, deliberately: the target repository's own `CLAUDE.md` is
 exactly the context the implementer, analyst and reviewer need.

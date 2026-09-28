@@ -177,12 +177,16 @@ whatever branch and worktree the dropped row already owned.
 own model and tool set instead of adding new methods. That gives four effectively
 independent seams:
 
-- `reason(prompt, *, max_turns=1)` — triage. Runs `claude -p` with `--allowedTools ""`
-  and one turn, so **triage never reads the repo**; it judges `scope` *and routes the
+- `reason(prompt, *, max_turns=1)` — triage. Runs `claude -p` with `--tools ""` and one
+  turn, so **triage never reads the repo**; it judges `scope` *and routes the
   ticket to one or more repos* from ticket text plus each candidate repo's `language`
-  and `notes` in config. Uses `agent.triage_model`. `--allowedTools ""` removes the
-  ability to *act* but not the ambient context, so isolation is a separate mechanism —
-  see below.
+  and `notes` in config. Uses `agent.triage_model`. It is `--tools ""` that makes it
+  tool-less: `--allowedTools ""` (still passed) only decides what runs without asking,
+  so with it alone Bash was still *offered*, and a model that reached for it spent its
+  one turn and ended `error_max_turns` with no answer. `--tools ""` applies even with
+  `isolate_triage: false` — no tools is this seam's contract. Removing tools takes away
+  the ability to *act* but not the ambient context, so isolation is a separate
+  mechanism — see below.
 - `work(prompt, cwd, *, log_path=None)` — implementation and fix passes. 60 turns, full
   allowlist, cwd is the worktree. Uses `agent.model`.
 - `work(prompt, cwd, model=agent.model, allowed_tools=agent.planner_tools)` — the
@@ -232,9 +236,25 @@ isolated triage answers `NO PROJECT CONTEXT`.
 
 So `reason()` runs in `agent.triage_dir` (a fixed empty directory, default
 `~/.deputy/triage`) with `TRIAGE_ISOLATION`: `--strict-mcp-config`,
-`--disable-slash-commands`, `--setting-sources ""`. Fixed and not a temp dir because the
-cwd is part of the system prompt — a path that changes per call misses the prompt cache
-per call. An uncreatable directory logs and falls back to the old behaviour rather than
+`--disable-slash-commands`, `--setting-sources ""`, `--system-prompt
+TRIAGE_SYSTEM_PROMPT` and `--settings '{"autoMemoryEnabled": false}'`. The last two
+were added after the canary failed on opus, and each closes a separate leak:
+
+- **The default system prompt** casts the model as an agent working in a directory and
+  carries cwd, env info, memory paths and git status. Even with no tools, opus acted on
+  it — it wrote out a fake `ls` call and invented the output instead of answering. The
+  replacement says it classifies tickets and has no environment.
+- **Auto-memory ignores `--setting-sources` and `--system-prompt`.** Run from a repo that
+  has a `~/.claude/projects/<cwd>/memory/` directory, fully flagged triage still quoted
+  the memory note. Only `autoMemoryEnabled: false` (or `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`)
+  stops it. This is also why the empty `triage_dir` is still load-bearing, not redundant.
+
+Measured on the canary: ~31k input tokens with the first three flags, 366 with all five.
+`--bare` would do much of this in one flag but is **not usable**: it reads auth only from
+`ANTHROPIC_API_KEY`, so it breaks every subscription-login install.
+
+Fixed and not a temp dir so a path that changes per call cannot defeat the prompt cache.
+An uncreatable directory logs and falls back to the old behaviour rather than
 stranding every new ticket. `agent.isolate_triage: false` opts out.
 
 That fallback is silent by design and therefore easy to be wrong about, so `doctor`

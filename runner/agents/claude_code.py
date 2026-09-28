@@ -73,18 +73,35 @@ RUN_ID_ENV = "DEPUTY_RUN_ID"
 
 # Where `reason()` runs. Triage is a tool-less classification of ticket text,
 # so any repository it happens to stand in is context it must not have -- see
-# `ClaudeCodeAgent.reason`. A *fixed* path rather than a fresh temp directory
-# because the cwd is part of the system prompt, and a path that changes every
-# call misses the prompt cache on every call.
+# `ClaudeCodeAgent.reason`. Still load-bearing with the flags below: auto-memory
+# is keyed by cwd, and run from a repo with a memory directory it leaked into
+# the prompt past every other flag. A *fixed* path rather than a fresh temp
+# directory so a per-call path cannot defeat the prompt cache.
 DEFAULT_TRIAGE_DIR = "~/.deputy/triage"
 
-# Flags that stop `claude` pulling in ambient context. `--allowedTools ""`
-# removes the model's ability to *act*, but not the CLAUDE.md, MCP tool
-# definitions, skills and settings it is handed before it is asked anything.
+# Replaces Claude Code's default system prompt for triage. The default casts
+# the model as an agent working in a directory, and opus acts on that even
+# with no tools: asked the doctor canary, it wrote out a fake `ls` call and
+# invented its output instead of answering. The default prompt is also where
+# cwd, env info, memory paths and git status live.
+TRIAGE_SYSTEM_PROMPT = (
+    "You classify task-tracker tickets for a software team. You have no tools "
+    "and no access to any files, repository, shell or environment. Answer only "
+    "from the text in the user's message, in the format it asks for.")
+
+# Flags that stop `claude` pulling in ambient context. Removing the tools
+# (`--tools ""` in `reason`) takes away the model's ability to *act*, but not
+# the CLAUDE.md, MCP tool definitions, skills and settings it is handed before
+# it is asked anything. Measured on the canary: ~31k input tokens with only
+# the first three flags, 366 with all of them.
 TRIAGE_ISOLATION = [
     "--strict-mcp-config",       # no MCP servers (none are configured for it)
     "--disable-slash-commands",  # no skills
     "--setting-sources", "",     # no user/project/local settings or CLAUDE.md
+    "--system-prompt", TRIAGE_SYSTEM_PROMPT,
+    # Auto-memory ignores --setting-sources and --system-prompt; only this
+    # (or CLAUDE_CODE_DISABLE_AUTO_MEMORY=1) keeps a cwd's memory out.
+    "--settings", '{"autoMemoryEnabled": false}',
 ]
 
 # How long the process group gets to exit on SIGTERM before SIGKILL. The agent
@@ -267,10 +284,18 @@ class ClaudeCodeAgent(CodingAgent):
         switched off. Measured on one ticket-shaped prompt, that moved a
         triage call from ~37.5k tokens to ~23k, and -- more to the point --
         from the wrong answer to the right one.
+
+        `--allowedTools ""` did not make it tool-less either: that flag only
+        decides what runs without asking, so Bash and friends were still
+        offered. A model that reached for one spent its only turn and the run
+        ended `error_max_turns` with no answer. `--tools ""` is what removes
+        them, and applies even with isolation off: no tools is this seam's
+        contract, not an isolation setting.
         """
         cmd = [self.binary, "-p", prompt,
                "--output-format", "json",
                "--max-turns", str(max_turns),
+               "--tools", "",
                "--allowedTools", "",
                "--permission-mode", "dontAsk"]
         if self.triage_model:
