@@ -3388,6 +3388,36 @@ with tempfile.TemporaryDirectory() as _tmp:
     _s_checks.append(("with a cap of one, the next tick goes to the scorer that waited",
                       sorted(_order) == ["ran-tests", "second"]))
 
+# A human reset deletes the row but not its runs; triage then routes the same
+# row id again with a new plan. The old run must not be graded against it.
+with tempfile.TemporaryDirectory() as _tmp:
+    _j = _Judge()
+    _pipe, _st = _scoring_pipe(_tmp, _j)
+    _rid = _seed_run(_st, _tmp, "T95")
+    _old_ev = _st.conn.execute("SELECT id FROM events WHERE task_id = ?",
+                               (_rid,)).fetchone()[0]
+    _pipe.provider = FakeProvider([mk("T95", "T95 title", "")])
+    _st.delete(_rid)                                  # as _reset_by_human does
+    _pipe._route(mk("T95", "T95 title", ""), ["pulse-backend"],
+                 {"plan": ["rewrite the header"], "acceptance_criteria": ["new header"]},
+                 AIState.QUEUED)
+    _write_log(Path(_tmp, "l", _aln("T95", "pulse-backend", "implement-2")))
+    _st.record("implement", _rid, "ok", 0.5, 1000, log="implement-2")
+    _pipe._score_runs(_in_window)
+    _by_ev = {r["event_id"]: dict(r) for r in _st.conn.execute("SELECT * FROM scores")}
+    _stale = _by_ev.get(_old_ev) or {}
+    _s_checks.append(("a run from before a re-route is not graded against the new plan",
+                      _stale.get("label") == "insufficient_evidence"
+                      and _stale.get("passed") is None
+                      and "triaged again" in (_stale.get("reasoning") or "")
+                      and len(_j.calls) == 1 and len(_by_ev) == 2
+                      and "rewrite the header" in _j.calls[0]["prompt"]))
+_s_checks.append(("a plan run's own output is not presented as what it was asked",
+                  "What the run produced" in SC.build_prompt(
+                      _sc, {**_ev, "kind": "plan"}, _row, _repo, _meta, "t")
+                  and "What the run was asked to do" in SC.build_prompt(
+                      _sc, _ev, _row, _repo, _meta, "t")))
+
 # `deputy score`: the same verdict, recorded only when asked.
 import runner.cli as _cli
 with tempfile.TemporaryDirectory() as _tmp:

@@ -372,12 +372,17 @@ def build_prompt(sc: Scorer, ev: dict[str, Any], row: dict[str, Any],
     What the run was *asked* to do comes from the row's `meta` (the plan,
     approach and acceptance criteria triage and the analyst wrote), not from
     the ticket: the provider is never called here, and the station prompt is
-    deliberately not in the log. `meta` is the row as it is now, which for
-    those three fields is what it was when the run started -- they are
-    written before execution and not rewritten after.
+    deliberately not in the log. `meta` is the row as it is now. For an
+    implement, review or fix run that is what the run was given: the analyst
+    writes those fields before execution, nothing rewrites them until triage
+    routes the ticket again, and a run from before that is not judged at all
+    (`Store.routed_after`). A plan run is the exception: what it wrote back
+    replaced what it was given, so the section says it is the run's output.
     """
     labels = "\n".join(f"- `{k}` (score {v:g})" for k, v in sc.labels.items())
     allowed = ", ".join([*sc.labels, INSUFFICIENT])
+    asked = ("What the run produced\n\nThe plan this run wrote back to the ticket."
+             if ev.get("kind") == "plan" else "What the run was asked to do")
     return f"""Grade one run of an autonomous coding agent against the rubric below.
 
 ## Rubric: {sc.name}
@@ -398,7 +403,7 @@ Test command: {repo.get('test') or '(none configured)'}
 Station: {ev.get('kind')}, logged as {ev.get('log')}
 Recorded outcome: {ev.get('detail') or '(none)'}
 
-### What the run was asked to do
+### {asked}
 
 Approach: {meta.get('approach') or '(none recorded)'}
 
@@ -484,10 +489,18 @@ def score_run(agent: Any, store: Any, sc: Scorer, ev: dict[str, Any], *,
                                         station=ev["kind"], log=ev.get("log")):
         return None
     try:
-        meta = json.loads(row.get("meta") or "{}")
-        verdict = judge(agent, sc, ev, row, repo or {"key": row.get("repo_key")},
-                        meta, log_path(log_root, row, str(ev.get("log") or "")),
-                        model=model)
+        if store.routed_after(ev["task_id"], ev["id"]):
+            # The plan on the row now is a later attempt's. Grading this run
+            # against it would fail an implementation that followed its own.
+            verdict = Verdict(INSUFFICIENT, "the ticket was triaged again after "
+                                            "this run, so the plan and acceptance "
+                                            "criteria on record are not the ones it "
+                                            "was given")
+        else:
+            meta = json.loads(row.get("meta") or "{}")
+            verdict = judge(agent, sc, ev, row, repo or {"key": row.get("repo_key")},
+                            meta, log_path(log_root, row, str(ev.get("log") or "")),
+                            model=model)
     except Exception as exc:  # noqa: BLE001
         log.exception("scorer %s failed on run %s", sc.name, ev["id"])
         verdict = Verdict(ERROR, f"scoring crashed: {exc}")

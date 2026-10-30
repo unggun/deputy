@@ -670,6 +670,13 @@ Invariants, each easy to undo by accident:
   the run as it happened. Its input is `condense()` of the JSONL `_EventLog`
   wrote (already redacted), plus the row's `meta` plan, approach and acceptance
   criteria. The provider is never called; the station prompt is not in the log.
+- **`meta` is the row now, not the row then.** `_route()` replaces it on every
+  re-triage, and a human reset deletes the row but keeps its runs, so the same
+  row id comes back with a later attempt's plan. A run recorded before triage
+  routed its row again (`Store.routed_after`, by ledger id, not timestamp) is
+  `insufficient_evidence` with no judge call; graded against the new plan, an
+  implementation that followed its own would fail for good. A plan run's
+  `meta` is its own output, and the prompt labels it so.
 - **Never cut the run in half.** `CLIP_LEVELS` clip every message harder at each
   level and never drop one; if even the tightest level does not fit
   `agent.max_prompt_bytes`, the verdict is `insufficient_evidence` with no agent

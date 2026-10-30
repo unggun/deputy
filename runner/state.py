@@ -334,6 +334,23 @@ class Store:
              _now() - self.SCORE_CLAIM_TTL)).fetchall()
         return [dict(r) for r in rows]
 
+    def routed_after(self, task_id: str, event_id: int) -> bool:
+        """Whether triage routed `task_id` again after ledger line `event_id`.
+
+        `_route()` replaces a row's `meta` as it moves the row out of `new`
+        into `planning` or `queued`: on a re-triage after a rejected plan, and
+        on a human reset, which deletes the row but keeps its events. A run
+        recorded before that was given a plan the row no longer holds. Ids,
+        not timestamps: the ledger is append-only, and a fast tick records a
+        run and the next transition inside the same second.
+        """
+        routed = [f"{AIState.NEW.value}->{s.value}"
+                  for s in (AIState.PLANNING, AIState.QUEUED)]
+        return self.conn.execute(
+            "SELECT 1 FROM events WHERE task_id = ? AND kind = 'state' AND id > ?"
+            " AND detail IN (?, ?) LIMIT 1",
+            (task_id, int(event_id), *routed)).fetchone() is not None
+
     def last_scored(self) -> dict[str, int]:
         """When each scorer last claimed a run: who has waited longest."""
         return {r["scorer"]: int(r["ts"]) for r in self.conn.execute(
