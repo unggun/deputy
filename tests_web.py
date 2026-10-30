@@ -617,6 +617,19 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a merge with no human review has no review-stage time",
           by[rid2]["pr_to_review"] is None and fl["summary"]["n"]["pr_to_review"] == 1)
 
+    # A person reviewed the draft before the runner marked it ready.
+    rid4 = "acme:14#api"
+    st.upsert(rid4, source="acme", provider_task_id="14", task_key="DEV-14",
+              title="early review", state="done", repo_key="api")
+    _ev(st, t0, rid4, "state", "review->pr-open")
+    _ev(st, t0 + 5, rid4, "pr_review", "dana")
+    _ev(st, t0 + 9, rid4, "pr_ready", "")
+    _ev(st, t0 + 20, rid4, "pr_merged", "human_commits=0")
+    _ev(st, t0 + 21, rid4, "state", "pr-open->done")
+    early = {r["task_id"]: r for r in Reader(path, limits={}).flow(7)["rows"]}[rid4]
+    check("a review before the PR was marked ready waited zero, never negative",
+          early["pr_to_review"] == 0 and early["review_to_merge"] == 16)
+
     # Marker lines carry no money and must not reach the spend chart.
     kinds = set()
     for d in rdr.spend_by_day(7):

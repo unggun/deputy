@@ -451,7 +451,11 @@ class Reader:
             "done_at": done_at,
             "total": done_at - start,
             "to_pr": pr_open - start if pr_open is not None else None,
-            "pr_to_review": review - ready if review is not None and ready is not None else None,
+            # Clamped: a person can review the draft before the runner marks
+            # it ready, and `pr_ready` is tick time while `pr_review` is
+            # GitHub's. That PR waited no time for review, not negative time.
+            "pr_to_review": (max(0, review - ready)
+                             if review is not None and ready is not None else None),
             "review_to_merge": done_at - review if review is not None else None,
             "waiting": waiting,
             "in_state": dict(in_state),
