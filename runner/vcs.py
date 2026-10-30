@@ -369,6 +369,35 @@ def pr_size(wt: Path, number: int,
             "files": int(data["changedFiles"])}
 
 
+def pr_diff(main: Path, number: int, env: dict[str, str] | None = None) -> str:
+    """The PR's diff as GitHub shows it: what the PR changed, nothing merged in."""
+    return run(["gh", "pr", "diff", str(number), "--color", "never"],
+               cwd=main, env=env).stdout
+
+
+def scratch_checkout(repo: dict[str, Any], sha: str, dest: Path,
+                     env: dict[str, str] | None = None) -> Path:
+    """A throwaway clone of `repo` at `sha`, detached, with no remote.
+
+    For the implementation benchmark, whose runs must never be pushed. A
+    worktree would share the main clone's `origin`, its credentials and its
+    branch namespace; a `--shared` clone borrows the objects and nothing
+    else, and with its only remote removed a `git push` has nowhere to go.
+    The main clone is only ever read, plus a fetch of `sha` when it does not
+    have that commit yet -- the same fetch the tick makes.
+    """
+    main = Path(str(repo["path"])).expanduser()
+    if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=main,
+           check=False, env=env).returncode != 0:
+        run(["git", "fetch", "origin", sha], cwd=main, env=env)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(main), str(dest)],
+        env=env)
+    run(["git", "remote", "remove", "origin"], cwd=dest, env=env)
+    run(["git", "checkout", "--quiet", "--detach", sha], cwd=dest, env=env)
+    return dest
+
+
 def first_human_activity(wt: Path, number: int, allowlist: list[str],
                          env: dict[str, str] | None = None) -> tuple[str, str] | None:
     """(ISO time, login) of the earliest human review, comment or reaction.

@@ -4519,6 +4519,298 @@ for label, ok in _b_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- implementation benchmark --------------------------------------------------
+print("\nimplementation benchmark")
+from runner import bench_impl as _bi
+from runner.pipeline import _work_prompt as _wp
+
+_i_checks = []
+
+
+class _Implementer:
+    """work() edits the scratch clone the way each model is scripted to;
+    reason() is the judge, and says what it is told to."""
+    def __init__(self, label="correct"):
+        self.label = label
+        self.work_calls, self.reason_calls = [], []
+
+    def reason(self, prompt, *, max_turns=1, model=None, system_prompt=None):
+        self.reason_calls.append({"prompt": prompt, "model": model, "system": system_prompt})
+        return AgentResult(ok=True, cost_usd=0.01, usage=TokenUsage(input_tokens=50),
+                           text=json.dumps({"label": self.label, "reasoning": "it does"}))
+
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        cwd = Path(cwd)
+        self.work_calls.append({
+            "prompt": prompt, "model": model, "tools": allowed_tools,
+            "remotes": vcs.run(["git", "remote"], cwd=cwd).stdout.strip(),
+            "head": vcs.run(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()})
+        Path(log_path).write_text('{"type": "result"}\n', encoding="utf-8")
+        if model == "sloppy":
+            (cwd / "other.txt").write_text("token sekrit-123\n", encoding="utf-8")
+        elif model != "idle":
+            (cwd / "feature.txt").write_text("export\n", encoding="utf-8")
+        return AgentResult(ok=True, text="done", cost_usd=0.5, num_turns=12,
+                           duration_ms=90000, usage=TokenUsage(input_tokens=1000))
+
+
+def _impl_world(tmp, test="test -f feature.txt"):
+    """A real repo whose merged change adds feature.txt, a real triage tick
+    that routed B30 and B31 to it, and a hand-written implement run and
+    merge for both. B31 predates base-commit tracking."""
+    repo = Path(tmp) / "repo"
+    repo.mkdir()
+
+    def g(*a):
+        return vcs.run(["git", *a], cwd=repo).stdout.strip()
+
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@example.com")
+    g("config", "user.name", "t")
+    (repo / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "base")
+    base = g("rev-parse", "HEAD")
+    (repo / "feature.txt").write_text("export\n", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "the change that merged")
+    ref = vcs.run(["git", "diff", base, "HEAD"], cwd=repo).stdout
+    g("reset", "-q", "--hard", base)
+
+    cfg, src = _two_repo_cfg(tmp)
+    cfg.data["runner"]["windows"]["execute"] = ["23:00-23:01"]
+    backend = next(r for r in src.repos if r["key"] == "pulse-backend")
+    backend.update(path=str(repo), test=test)
+    backend.pop("setup", None)
+    store = Store(f"{tmp}/s.db")
+    prov = FakeProvider([mk("B30", "Add CSV export", "an endpoint that returns CSV"),
+                         mk("B31", "Add XML export", "the same, as XML")])
+    Pipeline(cfg, src, prov,
+             _TriageScript({"B30": [_ex("pulse-backend")], "B31": [_ex("pulse-backend")]}),
+             store).tick(dt.datetime(2026, 8, 10, 7, 0))
+    for key, extra in (("B30", {"base_sha": base}), ("B31", {})):
+        meta = dict(json.loads(store.get(rid(key))["meta"]), **extra)
+        store.record("implement", rid(key), "ok", 0.5, 1000)
+        store.upsert(rid(key), state="done", pr_number=7, meta=meta)
+        store.record("pr_merged", rid(key), "human_commits=0")
+    bfile = B.brain_path(Path(tmp) / "b", "mycorp", "pulse-backend")
+    bfile.parent.mkdir(parents=True, exist_ok=True)
+    bfile.write_text("- 2020-01-01: the old note\nwritten by hand\n"
+                     "- 2999-01-01: a note from after the work\n", encoding="utf-8")
+    repos_now = {(s.key, r["key"]): r for s in cfg.sources() for r in s.repos}
+    return cfg, store, repos_now, repo, base, ref
+
+
+def _irun(agent, store, cases, vs, tmp, **kw):
+    opts = dict(repeat=1, max_usd=10.0, limits_check=lambda: None, work_prompt=_wp,
+                profile_env=lambda repo: {}, work_root=Path(tmp) / "w",
+                log_root=Path(tmp) / "l", brain_root=Path(tmp) / "b", judge_model="judgy",
+                max_prompt_bytes=120_000, secrets=["sekrit-123"])
+    opts.update(kw)
+    return _bi.run(agent, store, cases, vs, **opts)
+
+
+_real_pr_diff = vcs.pr_diff
+try:
+    with tempfile.TemporaryDirectory() as _tmp:
+        _cfg, _st, _rn, _repo, _base, _ref = _impl_world(_tmp)
+        vcs.pr_diff = lambda main, number, env=None: _ref
+        _cases, _out = _bi.load(_st, Path(_tmp) / "l", _rn)
+        _i_checks.append(("a merged ticket is a case; one without a base commit is left out",
+                          [c.name for c in _cases] == ["B30__pulse-backend"]
+                          and _out == {"no base commit": 1}
+                          and _cases[0].base_sha == _base
+                          and _cases[0].task.title == "Add CSV export"
+                          and _cases[0].cost_usd == 0.5))
+        _ivs = _bi.variants(["idle", "sloppy", "idle", "sonnet"], default_model="sonnet")
+        _i_checks.append(("the configured model first, then each one asked for, once",
+                          [v.label for v in _ivs] == ["sonnet", "idle", "sloppy"]
+                          and _ivs[0].model is None))
+        _ag = _Implementer()
+        _run_id, _stop = _irun(_ag, _st, _cases, _ivs, _tmp)
+        _tr = {t["variant"]: t for t in (_bench.decode(t) for t in _st.bench_trials(_run_id))}
+        _w = _ag.work_calls
+        _i_checks.append(("every trial starts at the base commit in a clone with no remote",
+                          len(_w) == 3 and all(c["head"] == _base and c["remotes"] == ""
+                                               for c in _w)))
+        _i_checks.append(("...with the tick's own implement prompt, plan and criteria",
+                          all("=== AGREED PLAN ===" in c["prompt"] and "1. do it" in c["prompt"]
+                              and "- it works" in c["prompt"]
+                              and "Ticket: B30 — Add CSV export" in c["prompt"] for c in _w)
+                          and [c["model"] for c in _w] == [None, "idle", "sloppy"]
+                          and all(c["tools"] is None for c in _w)))
+        _i_checks.append(("...and the brain as it stood: older and hand-written notes, not later ones",
+                          "the old note" in _w[0]["prompt"] and "written by hand" in _w[0]["prompt"]
+                          and "after the work" not in _w[0]["prompt"]))
+        _i_checks.append(("the change that merged passes the tests here, so the tests grade",
+                          all(t["ref_tests"] == 1 for t in _tr.values())))
+        _i_checks.append(("a change the judge passes and the tests pass is correct",
+                          _tr["sonnet"]["decision"] == "correct" and _tr["sonnet"]["tests"] == 1
+                          and _tr["sonnet"]["correct"] == 1 and _tr["sonnet"]["files"] == 1
+                          and _tr["sonnet"]["additions"] == 1 and _tr["sonnet"]["turns"] == 12))
+        _i_checks.append(("a failing test outranks the judge",
+                          _tr["sloppy"]["decision"] == "correct" and _tr["sloppy"]["tests"] == 0
+                          and _tr["sloppy"]["correct"] == 0))
+        _i_checks.append(("changing nothing is wrong, and costs no judge call",
+                          _tr["idle"]["decision"] == "no changes" and _tr["idle"]["correct"] == 0
+                          and len(_ag.reason_calls) == 2))
+        _jp = _ag.reason_calls[0]
+        _i_checks.append(("the judge sees the ticket and both diffs, with no tools",
+                          _jp["system"] == _bi.JUDGE_SYSTEM and _jp["model"] == "judgy"
+                          and _jp["prompt"].count("+++ b/feature.txt") == 2
+                          and "=== REFERENCE: THE CHANGE THAT MERGED ===" in _jp["prompt"]
+                          and "passed on the candidate" in _jp["prompt"]))
+        _sloppy_diff = Path(_tmp) / "l" / _tr["sloppy"]["diff"]
+        _i_checks.append(("a trial's diff is kept beside its log, redacted, and so is what the judge reads",
+                          _sloppy_diff.exists() and "other.txt" in _sloppy_diff.read_text()
+                          and "sekrit-123" not in _sloppy_diff.read_text()
+                          and "sekrit-123" not in _ag.reason_calls[1]["prompt"]
+                          and (Path(_tmp) / "l" / _tr["sonnet"]["log"]).exists()))
+        _iled = [dict(r) for r in _st.conn.execute(
+            "SELECT * FROM events WHERE kind = 'bench' ORDER BY id")]
+        _i_checks.append(("each agent run and judge call is on the ledger as bench, with no task",
+                          len(_iled) == 5 and all(r["task_id"] is None for r in _iled)
+                          and abs(sum(r["cost_usd"] for r in _iled) - 1.52) < 1e-9
+                          and _tr["sonnet"]["cost_usd"] == 0.51
+                          and _iled[0]["log"] == _tr["sonnet"]["log"]))
+        _branches = vcs.run(["git", "branch", "--format=%(refname:short)"], cwd=_repo).stdout.split()
+        _i_checks.append(("the scratch clones are gone and the main clone is as it was",
+                          not (Path(_tmp) / "w" / "bench" / str(_run_id)).exists()
+                          and _branches == ["main"] and _stop is None
+                          and vcs.run(["git", "rev-parse", "HEAD"], cwd=_repo).stdout.strip() == _base
+                          and len(vcs.run(["git", "worktree", "list"], cwd=_repo).stdout.splitlines()) == 1
+                          and not vcs.run(["git", "status", "--porcelain"], cwd=_repo).stdout.strip()))
+        _isum = {r["variant"]: r for r in _bi.summarize(
+            [_bench.decode(t) for t in _st.bench_trials(_run_id)], [v.label for v in _ivs])}
+        _i_checks.append(("the summary: correctness with its range, tests, and cost per run",
+                          (_isum["sonnet"]["correct"], _isum["sonnet"]["n"]) == (1, 1)
+                          and _isum["sloppy"]["rate"] == 0 and _isum["idle"]["no_changes"] == 1
+                          and (_isum["sloppy"]["tests_ok"], _isum["sloppy"]["tests_n"]) == (0, 1)
+                          and _isum["sonnet"]["low"] is not None
+                          and abs(_isum["sonnet"]["avg_minutes"] - 1.5) < 1e-9))
+
+        # the cap is checked against the next ticket's estimate, the limits before every run
+        _ag2 = _Implementer()
+        _c_id, _c_stop = _irun(_ag2, _st, _cases, _ivs, _tmp, max_usd=1.0)
+        _i_checks.append(("the cap stops before a ticket whose estimate would cross it",
+                          _c_stop == "cap" and _ag2.work_calls == []
+                          and _st.bench_trials(_c_id) == []
+                          and "the next was estimated at $1.50" in _st.bench_run(_c_id)["note"]))
+        _ag3 = _Implementer()
+        _calls = iter([None, None, "daily budget exhausted (20.00 / 20.00 USD)"])
+        _l_id, _l_stop = _irun(_ag3, _st, _cases, _ivs, _tmp, limits_check=lambda: next(_calls))
+        _i_checks.append(("the daily limits are checked before every agent run",
+                          _l_stop == "limits" and len(_ag3.work_calls) == 1
+                          and "daily budget exhausted" in _st.bench_run(_l_id)["note"]
+                          and "partway through ticket 1 of 1" in _st.bench_run(_l_id)["note"]))
+        _lsum = _bi.summarize([_bench.decode(t) for t in _st.bench_trials(_l_id)],
+                              [v.label for v in _ivs])
+        _i_checks.append(("...and a ticket not every variant finished is left out of the comparison",
+                          all(r["n"] == 0 for r in _lsum) and _lsum[0]["left_out"] == 1))
+
+        def _no_diff(main, number, env=None):
+            raise vcs.CommandError("gh pr diff 7 -> 1\nHTTP 404 sekrit-123")
+        vcs.pr_diff = _no_diff
+        _ag4 = _Implementer()
+        _seen_skip = []
+        _s_id, _s_stop = _irun(_ag4, _st, _cases, _ivs, _tmp,
+                               on_skip=lambda c, why: _seen_skip.append(why))
+        _i_checks.append(("a ticket whose merged diff cannot be read is skipped, and said so",
+                          _s_stop is None and _ag4.work_calls == []
+                          and _st.bench_trials(_s_id) == []
+                          and "1 skipped: reference unavailable" in _st.bench_run(_s_id)["note"]
+                          and "sekrit-123" not in _seen_skip[0]))
+        vcs.pr_diff = lambda main, number, env=None: _ref
+        _ag5 = _Implementer()
+        _irun(_ag5, _st, _cases, _ivs[:1], _tmp, max_prompt_bytes=500)
+        _big = _bench.decode(_st.bench_trials(_st.bench_runs(1)[0]["id"])[0])
+        _i_checks.append(("diffs too big for one prompt are never cut: insufficient, nothing called",
+                          _big["decision"] == "insufficient_evidence" and _big["correct"] is None
+                          and _ag5.reason_calls == [] and "nothing was cut" in _big["reasoning"]))
+
+        # the CLI
+        import argparse as _argparse
+        import contextlib as _ctx
+        from runner import cli as _cli
+
+        def _icli(action, **kw):
+            ns = _argparse.Namespace(action=action, sources=None, models=[], repos=[],
+                                     judge_model=None, limit=10, repeat=1, max_usd=10.0,
+                                     keep=False, dry_run=False, id=None)
+            for k, v in kw.items():
+                setattr(ns, k, v)
+            out = io.StringIO()
+            with _ctx.redirect_stdout(out), _ctx.redirect_stderr(io.StringIO()):
+                rc = _cli._bench(_cfg, ns)
+            return rc, out.getvalue()
+
+        _cfg.data["runner"]["db_path"] = f"{_tmp}/s.db"
+        _rc_d, _out_d = _icli("implement", dry_run=True, models=["idle"])
+        _i_checks.append(("--dry-run shows the suite and an estimate, and runs nothing",
+                          _rc_d == 0
+                          and "1 merged ticket can be replayed (of 2 merged rows)" in _out_d
+                          and "1 no base commit" in _out_d
+                          and "2 agent runs; the merged runs cost $0.50 each, so about $1.00"
+                          in _out_d and "nothing was run, fetched or recorded" in _out_d))
+        _cli_ag = _Implementer()
+        _cli_ag.max_prompt_bytes = 120_000
+        _real_cc = _cli.ClaudeCodeAgent
+        _cli.ClaudeCodeAgent = lambda acfg: _cli_ag
+        os.environ["GH_TOKEN_WORK"] = "sekrit-123"
+        try:
+            _rc_r, _out_r = _icli("implement", models=["sloppy"])
+        finally:
+            _cli.ClaudeCodeAgent = _real_cc
+            os.environ.pop("GH_TOKEN_WORK", None)
+        _new = _st.bench_runs(1)[0]
+        _i_checks.append(("deputy bench implement runs, prints the table and records the run",
+                          _rc_r == 0 and len(_cli_ag.work_calls) == 2
+                          and _new["suite"] == "implement"
+                          and "tests passed" in _out_r and "1/1 100%" in _out_r
+                          and f"recorded as bench #{_new['id']}" in _out_r))
+        _rc_s, _out_s = _icli("show", id=_new["id"])
+        _rc_l, _out_l = _icli("list")
+        _i_checks.append(("show and list know an implement run",
+                          _rc_s == 0 and "1 ticket " in _out_s and "graded wrong:" in _out_s
+                          and "sloppy: correct, tests failed" in _out_s
+                          and _rc_l == 0 and "implement" in _out_l and "1 ticket" in _out_l))
+finally:
+    vcs.pr_diff = _real_pr_diff
+
+# the reference fails the tests here: the tests cannot grade, the judge still can
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg, _st, _rn, _repo, _base, _ref = _impl_world(_tmp, test="test -f never.txt")
+    vcs.pr_diff = lambda main, number, env=None: _ref
+    try:
+        _cases, _ = _bi.load(_st, Path(_tmp) / "l", _rn)
+        _ag = _Implementer()
+        _r_id, _ = _irun(_ag, _st, _cases, _bi.variants([], default_model="sonnet"), _tmp)
+    finally:
+        vcs.pr_diff = _real_pr_diff
+    _t = _bench.decode(_st.bench_trials(_r_id)[0])
+    _i_checks.append(("a suite that fails on the merged change does not grade the trial",
+                      _t["ref_tests"] == 0 and _t["tests"] is None and _t["correct"] == 1
+                      and "fails the test command here too" in _ag.reason_calls[0]["prompt"]))
+
+# an older database gets the implement columns
+with tempfile.TemporaryDirectory() as _tmp:
+    import sqlite3 as _sq
+    _c = _sq.connect(f"{_tmp}/old.db")
+    _c.execute("CREATE TABLE bench_trials (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               " run_id INTEGER NOT NULL, ts INTEGER NOT NULL, variant TEXT NOT NULL,"
+               " case_name TEXT NOT NULL, model TEXT)")
+    _c.commit()
+    _c.close()
+    _cols = {r["name"] for r in Store(f"{_tmp}/old.db").conn.execute(
+        "PRAGMA table_info(bench_trials)")}
+    _i_checks.append(("a database from before the implement suite gets its columns",
+                      {"tests", "ref_tests", "turns", "log", "diff", "additions",
+                       "deletions", "files"} <= _cols))
+
+for label, ok in _i_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 # --- a limit-terminated agent run says which limit ---------------------------
 print("\nfailed agent runs say why")
 from runner.agents.claude_code import _failure_reason

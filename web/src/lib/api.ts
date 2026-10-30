@@ -292,11 +292,44 @@ export type BenchConfig = {
   current_repos: boolean;
 };
 
-export type BenchRun = {
-  id: number; ts: number; finished: number | null; suite: string; cases: number;
-  note: string | null; config: BenchConfig[]; variants: BenchVariant[];
-  trials: number; cost_usd: number; tokens: number; misses: BenchMiss[];
+/** One variant's results in one implement run, from `bench_impl.summarize`.
+ *  `rate` is over trials with a verdict; `errors` are beside it. Trials on a
+ *  ticket not every variant finished are `left_out` of everything else. */
+export type ImplVariant = {
+  variant: string; trials: number; errors: number; left_out: number;
+  n: number; correct: number; rate: number | null;
+  low: number | null; high: number | null;
+  partial: number; incorrect: number; no_changes: number; insufficient: number;
+  tests_n: number; tests_ok: number; tests_rate: number | null;
+  cost_usd: number; tokens: number; avg_cost_usd: number; avg_tokens: number;
+  duration_ms: number; avg_minutes: number; turns: number; models: string[];
 };
+
+/** An implement trial graded wrong: by the judge, the tests, or no change. */
+export type ImplMiss = {
+  id: number; variant: string; case: string; task_key: string | null;
+  open_id: string | null; title: string | null; repo_key: string | null;
+  decision: string | null; correct: number | null;
+  tests: number | null; ref_tests: number | null;
+  additions: number | null; deletions: number | null; files: number | null;
+  reasoning: string | null; diff: string | null;
+};
+
+type BenchRunBase = {
+  id: number; ts: number; finished: number | null; cases: number;
+  note: string | null; trials: number; cost_usd: number; tokens: number;
+};
+
+export type TriageBenchRun = BenchRunBase & {
+  suite: "triage"; config: BenchConfig[]; variants: BenchVariant[]; misses: BenchMiss[];
+};
+
+export type ImplBenchRun = BenchRunBase & {
+  suite: "implement"; config: { label: string; model: string | null }[];
+  variants: ImplVariant[]; misses: ImplMiss[];
+};
+
+export type BenchRun = TriageBenchRun | ImplBenchRun;
 
 export const useBench = (days = 30) =>
   useQuery({ queryKey: ["bench", days],

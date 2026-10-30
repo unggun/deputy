@@ -55,9 +55,21 @@ def read(path: Path) -> str:
         return ""
 
 
-def as_prompt_block(path: Path) -> str:
-    """The brain as a prompt section, or an empty string when there is nothing."""
+def as_prompt_block(path: Path, *, before: dt.date | None = None) -> str:
+    """The brain as a prompt section, or an empty string when there is nothing.
+
+    `before` is the brain as it stood on that day, as near as the file can
+    say: notes `append` dated on or after it are left out, lines it did not
+    date (headings, notes written by hand) are kept. The implementation
+    benchmark replays a ticket with it, because the note an approving review
+    wrote about that very ticket is dated the day it was approved.
+    """
     text = read(path)
+    if before is not None:
+        cut = before.isoformat()
+        text = "\n".join(
+            line for line in text.splitlines()
+            if not (_DATE_PREFIX.match(line) and line[2:12] >= cut)).strip()
     if not text:
         return ""
     return (

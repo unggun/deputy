@@ -986,6 +986,45 @@ with tempfile.TemporaryDirectory() as tmp:
     check("...and never as a run on the Runs tab",
           all(r["kind"] != "bench" for r in Reader(path, limits={}).runs(7)))
 
+    # an implement run: its own summary, and misses that open the routed row
+    from runner import bench_impl as _bi_mod
+    iid = st.start_bench("implement", [{"label": "sonnet", "model": None},
+                                       {"label": "opus", "model": "opus"}], 2)
+    icommon = dict(case_name="DEV-50__api", task_id="acme:50#api", task_key="DEV-50",
+                   why="merged", rep=1, ref_tests=1, turns=10)
+    st.record_trial(iid, variant="sonnet", decision="correct", correct=1, tests=1,
+                    cost_usd=0.8, tokens=40000, duration_ms=120000, files=2,
+                    additions=30, deletions=4, **icommon)
+    st.record_trial(iid, variant="opus", decision="partial", correct=0, tests=1,
+                    cost_usd=2.4, tokens=60000, duration_ms=240000, files=3,
+                    additions=50, deletions=9,
+                    reasoning="misses the header row; ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                    **icommon)
+    # stopped by the daily limits after the baseline's run on a second ticket
+    st.record_trial(iid, variant="sonnet", decision="correct", correct=1, tests=None,
+                    cost_usd=0.9, tokens=41000,
+                    **dict(icommon, case_name="DEV-52__api", task_id="acme:52#api",
+                           task_key="DEV-52"))
+    st.finish_bench(iid, "daily budget exhausted; stopped partway through ticket 2 of 2")
+    irun = next(r for r in Reader(path, limits={}).bench(7)["runs"] if r["id"] == iid)
+    iby = {v["variant"]: v for v in irun["variants"]}
+    check("an implement run is summarised by bench_impl, in the run's variant order",
+          irun["suite"] == "implement" and [v["variant"] for v in irun["variants"]]
+          == ["sonnet", "opus"]
+          and irun["variants"] == _bi_mod.summarize(
+              [_bench_mod.decode(t) for t in st.bench_trials(iid)], ["sonnet", "opus"]))
+    check("...and a ticket only the baseline finished is left out of both",
+          (iby["sonnet"]["correct"], iby["sonnet"]["n"], iby["sonnet"]["left_out"])
+          == (1, 1, 1) and iby["opus"]["rate"] == 0.0
+          and abs(irun["cost_usd"] - 4.1) < 1e-9)
+    imiss = irun["misses"]
+    check("an implement miss opens its routed row, with its diff size, redacted",
+          len(imiss) == 1 and imiss[0]["open_id"] == "acme:50#api"
+          and imiss[0]["decision"] == "partial" and imiss[0]["tests"] == 1
+          and (imiss[0]["files"], imiss[0]["additions"], imiss[0]["deletions"]) == (3, 50, 9)
+          and imiss[0]["repo_key"] == "api"
+          and "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (imiss[0]["reasoning"] or ""))
+
     raw = sqlite3.connect(path)
     raw.execute("DROP TABLE bench_trials")
     raw.commit()

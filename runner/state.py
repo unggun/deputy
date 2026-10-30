@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS bench_runs (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     ts        INTEGER NOT NULL,        -- started at
     finished  INTEGER,
-    suite     TEXT NOT NULL,           -- 'triage'
+    suite     TEXT NOT NULL,           -- 'triage' or 'implement'
     variants  TEXT NOT NULL DEFAULT '[]',
     cases     INTEGER NOT NULL DEFAULT 0,
     note      TEXT                     -- why it stopped early, when it did
@@ -137,7 +137,16 @@ CREATE TABLE IF NOT EXISTS bench_trials (
     cost_usd       REAL NOT NULL DEFAULT 0,
     tokens         INTEGER NOT NULL DEFAULT 0,
     duration_ms    INTEGER NOT NULL DEFAULT 0,
-    model          TEXT
+    model          TEXT,
+    -- The implement suite only. `decision` is then the judge's label.
+    tests          INTEGER,            -- the repo's test command on the trial: 1, 0, NULL
+    ref_tests      INTEGER,            -- the same on what was merged; 0 turns `tests` off
+    turns          INTEGER NOT NULL DEFAULT 0,
+    log            TEXT,               -- the agent run's log, under log_dir
+    diff           TEXT,               -- the trial's diff, under log_dir
+    additions      INTEGER,
+    deletions      INTEGER,
+    files          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_bench_trials_run ON bench_trials(run_id);
 CREATE TABLE IF NOT EXISTS posted_comments (
@@ -182,6 +191,14 @@ class Store:
             ("events", "model", "TEXT"),
             ("events", "model_requested", "TEXT"),
             ("events", "log", "TEXT"),
+            ("bench_trials", "tests", "INTEGER"),
+            ("bench_trials", "ref_tests", "INTEGER"),
+            ("bench_trials", "turns", "INTEGER NOT NULL DEFAULT 0"),
+            ("bench_trials", "log", "TEXT"),
+            ("bench_trials", "diff", "TEXT"),
+            ("bench_trials", "additions", "INTEGER"),
+            ("bench_trials", "deletions", "INTEGER"),
+            ("bench_trials", "files", "INTEGER"),
         ):
             names = {r["name"] for r in
                      self.conn.execute(f"PRAGMA table_info({table})")}
@@ -489,6 +506,23 @@ class Store:
     # `error` run produced nothing a human could act on, and an `abandoned`
     # claim belonged to a killed tick, so their evidence stays available.
     IMPROVE_CONSUMED = ("running", "pending", "none", "accepted", "rejected")
+
+    def merged_rows(self) -> list[dict[str, Any]]:
+        """Routed rows whose PR merged, newest merge first, with `merged_at`.
+
+        `done` alone is not enough: the ledger's `pr_merged` line is what says
+        a person merged it, rather than a row someone moved by hand.
+        """
+        return [dict(r) for r in self.conn.execute(
+            "SELECT t.*, MAX(e.ts) AS merged_at, MAX(e.id) AS merged_id FROM tasks t"
+            " JOIN events e ON e.task_id = t.task_id AND e.kind = 'pr_merged'"
+            " WHERE t.state = 'done' GROUP BY t.task_id ORDER BY merged_at DESC, t.task_id")]
+
+    def row_runs(self, task_id: str, kind: str) -> list[dict[str, Any]]:
+        """One row's `kind` ledger lines, oldest first."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM events WHERE task_id = ? AND kind = ? ORDER BY id",
+            (task_id, kind))]
 
     def repo_of(self, task_id: str) -> str | None:
         """The repo a run belongs to, even after its row is gone.

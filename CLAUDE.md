@@ -15,6 +15,7 @@ PR through CI/review until merge.
 runner/
   __init__.py  cli.py  config.py  graph.py  models.py  pipeline.py  state.py  triage.py  vcs.py
   analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py  improve.py  bench.py
+  bench_impl.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
   providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
   web/       __init__.py  api.py  db.py  logs.py  static/ (committed build output)
@@ -53,6 +54,7 @@ deputy score NAME [--run ID] [--record]   # judge real runs with one scorer; rec
 deputy improve list|show ID|accept ID|reject ID [--reason ..]   # proposed brain notes
 deputy improve run --repo KEY             # one improve run now, skipping the "is it due" check
 deputy bench triage [--model M] [--prompt FILE] [--dry-run]   # replay past triage runs, graded by history
+deputy bench implement [--model M] [--repo KEY] [--limit N] [--dry-run]   # replay merged tickets in scratch clones
 deputy bench list|show [ID]|prompt       # past benchmark runs; the built-in triage prompt
 python3 tests_smoke.py                    # offline state-machine tests (fake provider + fake agent)
 ```
@@ -221,6 +223,9 @@ The triage benchmark is not a seventh seam. `deputy bench triage` calls
 `triage.triage()` itself with `model=` and `system=` overrides, which reach
 `reason(model=...)` and stand in for `triage.SYSTEM` in the rendered prompt;
 the isolation, the system prompt and the post-conditions are triage's own.
+Nor is the implementation benchmark: its runs are the implement seam,
+`work(model=...)` with the production `allowed_tools`, and its judge is the
+scoring judge's contract, `reason(system_prompt=bench_impl.JUDGE_SYSTEM)`.
 
 `triage_model` falls back to `model` when unset. `allowed_tools` includes `Agent`, which
 is what permits `work()` to dispatch subagents — the tool is named `Agent`, not `Task`.
@@ -898,9 +903,65 @@ each easy to undo by accident:
   never consults the model, so a routing rate over single-repo tickets would
   be 100% by construction.
 
-The implementation benchmark (replaying merged tickets at `meta.base_sha` in
-a scratch worktree) is not built. It would live outside the tick in the same
-way, and `bench_runs.suite` exists so it can share the tables.
+### Implementation benchmark
+
+`runner/bench_impl.py` replays merged tickets: one `work()` run per ticket per
+model, at the commit the branch forked from, graded by the repo's tests and a
+judge. It shares `bench_runs` (`suite = 'implement'`) and `bench_trials` (with
+its own columns) with the triage suite. Invariants, each easy to undo by
+accident:
+
+- **A scratch clone with no remote, never a worktree.** `vcs.scratch_checkout`
+  makes a `git clone --shared` of the main clone and removes `origin`. A
+  worktree would share the main clone's remote and branch namespace. With no
+  remote a `git push` has nowhere to go, which is what lets a replay use the
+  production `allowed_tools` (`Bash(git:*)` included) unchanged. The main
+  clone is only read, plus a `git fetch origin <sha>` when it lacks the base
+  commit. Nothing builds a provider: no comment, no AI State, no review.
+- **The tick's own prompt, the first pass only.** The CLI passes
+  `pipeline._work_prompt` in as `work_prompt`, so `bench_impl.py` never
+  imports `pipeline` and `db.py` can import it. The review loop is not
+  replayed; a trial is one implement run.
+- **Inputs as they were.** The attempt that merged is the last successful
+  triage before the `pr_merged` line and the first implement run after it, so
+  a reset ticket's earlier attempt is not mistaken for it. The ticket text is
+  that triage run's snapshot (matched as the triage suite matches). The brain
+  is `brain.as_prompt_block(before=day)`, which drops notes dated on or after
+  the implement run's day: the approving review of that very ticket writes a
+  dated note, and it would hand the replay its answer. Undated lines, which
+  are hand edits, stay.
+- **The tests only grade where the merged change passes them here.**
+  `reference()` applies the PR's own diff (`vcs.pr_diff`, i.e. `gh pr diff`)
+  at the base commit in a second scratch clone and runs `setup` and `test`.
+  If that fails or does not apply, `ref_tests` is 0 or NULL and every trial's
+  `tests` is NULL. Otherwise a broken local environment fails every variant
+  alike and reads as a model failure.
+- **The judge reads diffs, never the repo.** `reason()` with
+  `JUDGE_SYSTEM`, on `--judge-model` or `agent.scorer_model`, over redacted
+  diffs. Over `agent.max_prompt_bytes` the verdict is `insufficient_evidence`
+  with no call: never truncate a diff.
+- **Correct means the judge says correct and the tests did not fail.** A
+  failed test outranks the judge. An empty diff is `no changes`, wrong, with
+  no judge call. A failed run, a judge error and `insufficient_evidence`
+  leave `correct` NULL (unless a test failed) and never move the rate.
+- **Cap against an estimate, limits before every agent run.** A triage case
+  costs cents; an implement case costs dollars. `run()` checks the cap before
+  each ticket against what is spent plus that ticket's original implement
+  cost times its trials, and `limits_check` before every agent run, as the
+  tick does. A stop inside a ticket leaves it half-compared, so
+  `summarize()` compares only tickets every variant finished equally
+  (`complete()`) and counts the rest as `left_out`.
+- **A ticket with no reference is skipped, not replayed.** A diff GitHub will
+  not give, or credentials `profile_env` cannot build, skips the ticket and
+  says so in the run's note.
+- **Spend is on the ledger, not a row.** Kind `bench`, `task_id` NULL, one
+  line per agent run (with its `log`) and one per judge call. A trial's `log`
+  and `diff` are paths under `runner.log_dir`
+  (`bench/{run}/{agent_log_name(task, repo, "vN-rep")}`); the diff is
+  redacted, and the scratch clones are deleted unless `--keep`.
+- **One summary for the terminal and the tab.** `bench_impl.summarize()`,
+  taking the run's variant labels, is what `deputy bench show` prints and
+  what `Reader.bench()` returns for an implement run.
 
 `runner/web/static/` is committed build output, not source. `web/vite.config.ts`
 points `build.outDir` at it directly rather than the default `web/dist`,
