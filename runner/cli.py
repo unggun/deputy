@@ -514,7 +514,7 @@ def _labels(run: dict) -> list[str]:
 
 def _impl_show(run: dict, trials: list[dict]) -> None:
     print("\n".join(_impl_table(trials, _labels(run))))
-    missed = bench_impl.misses(trials)
+    missed = bench_impl.misses(trials, _labels(run))
     if missed:
         print("\ngraded wrong:")
     for t in missed:

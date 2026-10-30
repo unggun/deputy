@@ -5,8 +5,9 @@ forked from (`meta.base_sha`), the ticket as triage last saw it before the
 work started, and the plan and acceptance criteria the implementer was given.
 A trial is one `work()` run on that case under one model, with the tick's own
 implement prompt and tool allowlist, in a scratch repository holding the
-base commit's history and nothing later. It is never pushed, commented on or
-reviewed. The repository has no remote, and nothing here builds a provider.
+base commit's history and nothing later. The runner pushes nothing from it,
+comments on nothing and reviews nothing; it has no remote, and nothing here
+builds a provider.
 
 Each trial is graded twice, and neither grade stands in for the other:
 
@@ -213,10 +214,12 @@ class Reference:
 def _shell(cmd: str, wt: Path, env: dict[str, str]) -> int | None:
     """Exit code of `bash -lc cmd` in `wt`, or None when it timed out.
 
-    In its own process group, signalled whole on the way out, as the agent
-    is: `subprocess.run(timeout=)` kills the shell only, and a test runner's
-    workers or a dev server would go on running, and writing, after the
-    trial had moved on and deleted the checkout under them.
+    In its own process group, signalled whole on a timeout, as the agent is:
+    `subprocess.run(timeout=)` kills the shell only, and a test runner's
+    workers would go on running, and writing, after the trial had moved on
+    and deleted the checkout under them. Only on a timeout: once `wait()`
+    has reaped the shell its pid may belong to someone else, and looking up
+    a group by it could signal an unrelated one.
     """
     proc = subprocess.Popen(["bash", "-lc", cmd], cwd=wt, env={**os.environ, **env},
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -224,9 +227,8 @@ def _shell(cmd: str, wt: Path, env: dict[str, str]) -> int | None:
     try:
         return proc.wait(timeout=TEST_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return None
-    finally:
         _kill_tree(proc)
+        return None
 
 
 def _setup(repo: dict[str, Any], wt: Path, env: dict[str, str]) -> None:
@@ -609,6 +611,12 @@ def summarize(trials: list[dict[str, Any]],
     return out
 
 
-def misses(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Trials graded wrong: by the judge, by the tests, or by changing nothing."""
-    return [t for t in trials if t.get("correct") == 0]
+def misses(trials: list[dict[str, Any]],
+           labels: list[str] | None = None) -> list[dict[str, Any]]:
+    """Trials graded wrong: by the judge, by the tests, or by changing nothing.
+
+    Only on tickets `summarize` compares, so the list never shows a ticket
+    the numbers beside it leave out.
+    """
+    whole = complete(trials, labels or list(dict.fromkeys(t["variant"] for t in trials)))
+    return [t for t in trials if t.get("correct") == 0 and t["case_name"] in whole]

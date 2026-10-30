@@ -4840,6 +4840,13 @@ with tempfile.TemporaryDirectory() as _tmp:
                       _t["ref_tests"] == 0 and _t["tests"] is None and _t["correct"] == 1
                       and "fails the test command here too" in _ag.reason_calls[0]["prompt"]))
 
+# the wrong-run list follows the comparison
+_mt = [{"case_name": "half", "variant": "a", "correct": 0},
+       {"case_name": "both", "variant": "a", "correct": 0},
+       {"case_name": "both", "variant": "b", "correct": 1}]
+_i_checks.append(("runs graded wrong are listed only on tickets the summary compares",
+                  _bi.misses(_mt, ["a", "b"]) == [_mt[1]]))
+
 # a test command that outlives its timeout takes its children with it
 with tempfile.TemporaryDirectory() as _tmp:
     _real_tt, _bi.TEST_TIMEOUT = _bi.TEST_TIMEOUT, 1

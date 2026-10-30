@@ -372,8 +372,8 @@ function ImplementRun({ run, onOpen }: { run: ImplBenchRun; onOpen: Open }) {
       <Command text={`deputy bench show ${run.id}`} />
       <p className="text-xs text-muted-foreground">
         Each run implements a ticket that merged, from the commit its branch started
-        at, in a scratch copy with no remote and no later history, so nothing is
-        pushed and the answer is not there to find. A run is correct
+        at, in a scratch copy with no remote and no later history, so the answer is
+        not there to find, and the runner pushes nothing. A run is correct
         when a judge with no tools, reading the ticket, the criteria and both diffs,
         says so, and the repo's tests pass. The tests only grade where the change that
         merged passes them on this machine too. A judge unsure about the diffs and a

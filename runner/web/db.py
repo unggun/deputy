@@ -709,7 +709,7 @@ class Reader:
         """
         labels = [str(c.get("label")) for c in config if isinstance(c, dict)]
         missed = []
-        for t in _bench_impl.misses(trials)[:int(misses)]:
+        for t in _bench_impl.misses(trials, labels or None)[:int(misses)]:
             owner = by_id.get(t["task_id"] or "") or {}
             missed.append({
                 "id": t["id"], "variant": t["variant"], "case": t["case_name"],

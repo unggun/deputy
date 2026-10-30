@@ -1001,7 +1001,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     reasoning="misses the header row; ghp_abcdefghijklmnopqrstuvwxyz0123456789",
                     **icommon)
     # stopped by the daily limits after the baseline's run on a second ticket
-    st.record_trial(iid, variant="sonnet", decision="correct", correct=1, tests=None,
+    st.record_trial(iid, variant="sonnet", decision="incorrect", correct=0, tests=None,
                     cost_usd=0.9, tokens=41000,
                     **dict(icommon, case_name="DEV-52__api", task_id="acme:52#api",
                            task_key="DEV-52"))
@@ -1018,7 +1018,8 @@ with tempfile.TemporaryDirectory() as tmp:
           == (1, 1, 1) and iby["opus"]["rate"] == 0.0
           and abs(irun["cost_usd"] - 4.1) < 1e-9)
     imiss = irun["misses"]
-    check("an implement miss opens its routed row, with its diff size, redacted",
+    check("an implement miss opens its routed row, with its diff size, redacted, "
+          "and a ticket left out of the numbers is left out of the misses",
           len(imiss) == 1 and imiss[0]["open_id"] == "acme:50#api"
           and imiss[0]["decision"] == "partial" and imiss[0]["tests"] == 1
           and (imiss[0]["files"], imiss[0]["additions"], imiss[0]["deletions"]) == (3, 50, 9)

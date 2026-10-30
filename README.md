@@ -483,9 +483,11 @@ began, the agreed plan and acceptance criteria, and the repo's brain as it
 stood that day. Notes dated on or after it are left out, since the approving
 review of that very ticket may have written one. It runs in a scratch
 repository under `{runner.work_dir}/bench/` that holds the base commit's
-history and nothing else: no remote, so nothing can be pushed, and no branch,
-tag or later commit, so the change that merged is not there to find. Nothing
-is commented on or reviewed. The clone is deleted
+history and nothing else: no remote, and no branch, tag or later commit, so
+the change that merged is not there to find. The runner pushes nothing from
+it, and nothing is commented on or reviewed. It is not a sandbox: the replay
+has the same tools as the implementer in the tick, which could still push to
+a URL it was given, and its prompt tells it not to push, as there. The clone is deleted
 afterwards; its diff and agent log stay under `{runner.log_dir}/bench/`.
 
 Each run is graded twice:

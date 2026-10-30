@@ -917,11 +917,16 @@ accident:
   worktree would share the main clone's remote and branch namespace. A clone,
   even with `origin` removed, keeps a local branch and the tags, and with
   `--shared` every object, so `git show main:file` would hand the replay the
-  change that merged. With no remote a `git push` has nowhere to go, which is
-  what lets a replay use the production `allowed_tools` (`Bash(git:*)`
-  included) unchanged. The main clone is only read, plus a `git fetch origin
-  <sha>` when it lacks the base commit. Nothing builds a provider: no
-  comment, no AI State, no review.
+  change that merged. What it guarantees is no configured remote and no ref
+  or object later than the base commit, so the answer is not in the
+  repository and a plain `git push` has no destination. It is not a sandbox:
+  the replay runs the production `allowed_tools` unchanged, so
+  `Bash(git:*)` can still push to a URL or read a path it is given or
+  guesses, exactly as the implementer can in the tick. The work prompt
+  tells it not to push, as it does there, and the runner pushes nothing.
+  The main clone is only read, plus a `git fetch origin <sha>` when it lacks
+  the base commit. Nothing builds a provider: no comment, no AI State, no
+  review.
 - **The tick's own prompt, the first pass only.** The CLI passes
   `pipeline._work_prompt` in as `work_prompt`, so `bench_impl.py` never
   imports `pipeline` and `db.py` can import it. The review loop is not
@@ -940,9 +945,14 @@ accident:
   If that fails or does not apply, `ref_tests` is 0 or NULL and every trial's
   `tests` is NULL. Otherwise a broken local environment fails every variant
   alike and reads as a model failure. `setup` and `test` run through
-  `_shell()`, in their own process group that `_kill_tree` signals whole, for
-  the agent's reason: `subprocess.run(timeout=)` kills only the shell, and a
-  timed-out suite's workers would keep running in a checkout being deleted.
+  `_shell()`, in their own process group that `_kill_tree` signals whole on
+  a timeout, for the agent's reason: `subprocess.run(timeout=)` kills only
+  the shell, and a timed-out suite's workers would keep running in a
+  checkout being deleted. Only on a timeout: after `wait()` has reaped the
+  shell, a group looked up by its pid may be someone else's.
+- **The wrong-run list follows the comparison.** `misses()` takes the run's
+  variant labels and keeps only tickets `complete()` accepts, so `deputy
+  bench show` and the tab never list a ticket the numbers leave out.
 - **The judge reads diffs, never the repo.** `reason()` with
   `JUDGE_SYSTEM`, on `--judge-model` or `agent.scorer_model`, over redacted
   diffs. Over `agent.max_prompt_bytes` the verdict is `insufficient_evidence`
