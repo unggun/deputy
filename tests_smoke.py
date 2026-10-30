@@ -3759,6 +3759,19 @@ with tempfile.TemporaryDirectory() as _tmp:
         _st.conn.execute("DELETE FROM improvements WHERE id = ?", (_sr,))
         _st.conn.commit()
 
+        # A brain that cannot be written leaves the proposal pending.
+        _so = _st.claim_improvement("mycorp", "pulse-backend", ttl=600)
+        _st.finish_improvement(_so, "pending", note="A note for a read-only disk.")
+        _blocked_root = Path(_tmp, "not-a-dir")
+        _blocked_root.write_text("a file where the brain directory should be")
+        _ok_os, _msg_os = IM.accept(_st, _so, _blocked_root)
+        _i_checks.append(("a brain write that fails leaves the proposal pending",
+                          not _ok_os and "still pending" in _msg_os
+                          and _st.improvement(_so)["status"] == "pending"
+                          and _st.improvement(_so)["decided_at"] is None))
+        _st.conn.execute("DELETE FROM improvements WHERE id = ?", (_so,))
+        _st.conn.commit()
+
         # A rejection, and its reason, reach the next run's prompt.
         _s2 = _seed_fail(_st, _tmp, "T210", reasoning="skipped lint")
         _s3 = _seed_fail(_st, _tmp, "T211", reasoning="skipped lint again")

@@ -429,9 +429,16 @@ def accept(store: Any, improvement_id: int, brain_root: Path, *,
         return False, f"proposal {improvement_id} is {now}, not pending"
     path = brain.brain_path(brain_root, row["source"], row["repo_key"])
     note = str(row["note"] or "")
-    if brain.has_note(path, note):
-        return True, f"accepted; {path} already had this note"
-    if not brain.append(path, [note], max_bytes=max_bytes):
+    try:
+        if brain.has_note(path, note):
+            return True, f"accepted; {path} already had this note"
+        written = brain.append(path, [note], max_bytes=max_bytes)
+    except OSError as exc:
+        # The decision is already committed; a brain that could not be read
+        # or written must not leave it saying accepted.
+        store.undecide_improvement(improvement_id, "accepted")
+        return False, f"could not write {path} ({exc}); still pending"
+    if not written:
         store.undecide_improvement(improvement_id, "accepted")
         return False, (f"{path} is at its {max_bytes}-byte cap, so nothing was "
                        f"written; prune it by hand and accept again")
