@@ -745,9 +745,13 @@ accident:
 
 - **Propose, never apply.** A run writes an `improvements` row with status
   `pending`. Only `improve.accept()` (`deputy improve accept`) writes the
-  brain, through `brain.append()` and its cap. At the cap nothing is written
-  and the proposal stays pending: the brain refuses rather than evicts, here
-  too. The dashboard shows the CLI commands; it does not grow a button.
+  brain, through `brain.append()` and its cap. It decides first and writes
+  second: `decide_improvement()` only takes a pending row, so of an accept and
+  a reject racing on one proposal exactly one wins, and only a winning accept
+  touches the brain. At the cap nothing is written and the decision is put
+  back to pending (`undecide_improvement()`): the brain refuses rather than
+  evicts, here too. The dashboard shows the CLI commands; it does not grow a
+  button.
 - **Every proposal cites what it was shown.** `parse_proposal()` keeps only
   refs (`score:<scores.id>`, `review:<events.id>`) that were rendered into the
   prompt; a proposal citing none of them is recorded as `none`, not pending. A
@@ -761,7 +765,10 @@ accident:
   `improve.due()` holds the repo off for `RETRY_AFTER_ERROR` (a day) so a
   broken setup costs one run a day, not one a tick.
 - **Rejections are remembered.** Every pending and rejected note, with the
-  human's reason, goes into every later prompt for that repo.
+  human's reason, goes into every later prompt for that repo and into the
+  duplicate check, however many there are (`limit=None`). A history that alone
+  fills the prompt ceiling makes the run an `error` that says to prune, not a
+  run that quietly forgets the oldest rejection.
 - **One run per repo at a time.** `claim_improvement()` inserts a `running`
   row under a partial unique index on `(source, repo_key) WHERE status =
   'running'`. A claim older than `improve.claim_ttl()` (four agent timeouts,
@@ -775,7 +782,8 @@ accident:
   for a later run, never clipped mid-item. A score item carries the judge's
   reasoning and, when short enough, the run's condensed transcript; a review
   item carries the reviewer's blocking findings read back from the run's final
-  reply (`scorers.final_text()`). A review whose log no longer parses is spent
+  reply (`scorers.final_text()`), or its summary alone when a rejection gave
+  no individual findings. A review whose log no longer parses is spent
   without an agent call, so it cannot wedge the repo.
 - **Spend is on the ledger, not a row.** Kind `improve`, `task_id` NULL,
   detail `"{source}:{repo} #{id}: {status}"`, log under `improve/` in

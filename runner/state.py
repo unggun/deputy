@@ -509,6 +509,14 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def undecide_improvement(self, improvement_id: int, status: str) -> None:
+        """Put a decision back to pending: an accept the brain's cap refused."""
+        self.conn.execute(
+            "UPDATE improvements SET status = 'pending', reason = NULL,"
+            " decided_at = NULL WHERE id = ? AND status = ?",
+            (int(improvement_id), status))
+        self.conn.commit()
+
     def score(self, score_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM scores WHERE id = ?",
                                 (int(score_id),)).fetchone()
@@ -522,8 +530,8 @@ class Store:
     def improvements(self, *, source: str | None = None,
                      repo_key: str | None = None,
                      statuses: tuple[str, ...] | None = None,
-                     limit: int = 200) -> list[dict[str, Any]]:
-        """Improve runs, newest first."""
+                     limit: int | None = 200) -> list[dict[str, Any]]:
+        """Improve runs, newest first. `limit=None` returns every one."""
         sql, args = "SELECT * FROM improvements WHERE 1 = 1", []
         if source is not None:
             sql += " AND source = ?"
@@ -535,7 +543,7 @@ class Store:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
             args.extend(statuses)
         rows = self.conn.execute(sql + " ORDER BY ts DESC, id DESC LIMIT ?",
-                                 (*args, int(limit)))
+                                 (*args, -1 if limit is None else int(limit)))
         return [dict(r) for r in rows]
 
     # --- comment idempotency -------------------------------------------

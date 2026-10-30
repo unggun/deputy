@@ -201,11 +201,13 @@ def render(store: Any, ev: dict[str, Any], log_root: Path) -> str | None:
         return None
     findings = [scorers.clip(f, FINDING_MAX)
                 for f in str_list(reply.get("blocking_findings"))][:FINDINGS_PER_RUN]
-    if not findings:
+    summary = scorers.clip(str(reply.get("summary") or ""), FINDING_MAX)
+    # A rejection of the whole approach can carry its reason in the summary
+    # alone; that is still evidence. Only a reply that says nothing is not.
+    if not findings and not summary:
         return None
     what = ("rejected the approach" if ev.get("verdict") == "reject"
             else "asked for changes")
-    summary = scorers.clip(str(reply.get("summary") or ""), FINDING_MAX)
     return (f"[{ev['ref']}] the reviewer {what} on {ticket} ({ev['log']}):\n"
             + "\n".join(f"- {f}" for f in findings)
             + (f"\nSummary: {summary}" if summary else ""))
@@ -296,8 +298,10 @@ def run_for_repo(ctx: Context, repo: dict[str, Any], env: dict[str, str],
             ctx.store.finish_improvement(iid, "abandoned",
                                          reasoning="nothing left to look at")
             return None
+        # All of them, however many: a rejection dropped from the prompt and
+        # the duplicate check below is one the next run can propose again.
         prior = ctx.store.improvements(source=ctx.source_key, repo_key=key,
-                                       statuses=("pending", "rejected"), limit=30)
+                                       statuses=("pending", "rejected"), limit=None)
         brain_file = brain.brain_path(ctx.brain_root, ctx.source_key, key)
         brain_text = brain.read(brain_file)
         rubrics = {ev["scorer"]: ctx.rubrics[ev["scorer"]] for ev in evidence
@@ -306,6 +310,7 @@ def run_for_repo(ctx: Context, repo: dict[str, Any], env: dict[str, str],
                      or scorers.DEFAULT_PROMPT_BYTES) - len(_RETRY_SUFFIX.encode())
         items: list[str] = []
         shown: set[str] = set()
+        full = False
         for ev in evidence:
             text = render(ctx.store, ev, ctx.log_root)
             if text is None:
@@ -314,15 +319,19 @@ def run_for_repo(ctx: Context, repo: dict[str, Any], env: dict[str, str],
             # Whole items or none: a later run gets the ones that do not fit.
             if len(build_prompt(repo, brain_text, items + [text], prior,
                                 rubrics).encode()) > budget:
+                full = True
                 break
             items.append(text)
             shown.add(ev["ref"])
             looked.append(ev["ref"])
-        if not items:
-            result = {"status": "none" if looked else "error", "evidence": looked,
-                      "reasoning": ("none of the evidence could be read back from "
-                                    "its run's log" if looked else
-                                    "the evidence does not fit the prompt ceiling")}
+        if not items and full:
+            result = {"status": "error", "evidence": looked, "reasoning": (
+                f"not even one piece of evidence fits the prompt ceiling beside the "
+                f"brain and the {len(prior)} pending or rejected notes; prune the "
+                f"brain, or raise agent.max_prompt_bytes")}
+        elif not items:
+            result = {"status": "none", "evidence": looked, "reasoning":
+                      "none of the evidence could be read back from its run's log"}
         else:
             prompt = build_prompt(repo, brain_text, items, prior, rubrics)
             wt = vcs.ensure_review_worktree(repo, str(repo.get("base_branch", "main")),
@@ -412,17 +421,20 @@ def accept(store: Any, improvement_id: int, brain_root: Path, *,
     row = store.improvement(improvement_id)
     if row is None:
         return False, f"no proposal {improvement_id}"
-    if row["status"] != "pending":
-        return False, f"proposal {improvement_id} is {row['status']}, not pending"
+    # Decide first. The update only takes a pending row, so of an accept and
+    # a reject racing on one proposal exactly one wins, and the brain is only
+    # written by the accept that did.
+    if not store.decide_improvement(improvement_id, "accepted"):
+        now = (store.improvement(improvement_id) or row)["status"]
+        return False, f"proposal {improvement_id} is {now}, not pending"
     path = brain.brain_path(brain_root, row["source"], row["repo_key"])
     note = str(row["note"] or "")
     if brain.has_note(path, note):
-        store.decide_improvement(improvement_id, "accepted")
         return True, f"accepted; {path} already had this note"
     if not brain.append(path, [note], max_bytes=max_bytes):
+        store.undecide_improvement(improvement_id, "accepted")
         return False, (f"{path} is at its {max_bytes}-byte cap, so nothing was "
                        f"written; prune it by hand and accept again")
-    store.decide_improvement(improvement_id, "accepted")
     return True, f"accepted; added to {path}"
 
 

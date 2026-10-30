@@ -3722,7 +3722,9 @@ with tempfile.TemporaryDirectory() as _tmp:
         # Accepting writes the brain through its cap; a second accept is refused.
         _bfile = BR.brain_path(Path(_tmp, "b"), "mycorp", "pulse-backend")
         _ok_cap, _msg_cap = IM.accept(_st, _row["id"], Path(_tmp, "b"), max_bytes=10)
-        _cap_status = _st.improvement(_row["id"])["status"]
+        _cap_row = _st.improvement(_row["id"])
+        _cap_status = (_cap_row["status"] if _cap_row["decided_at"] is None
+                       else "decided_at left set")
         _ok1, _ = IM.accept(_st, _row["id"], Path(_tmp, "b"))
         _ok2, _msg2 = IM.accept(_st, _row["id"], Path(_tmp, "b"))
         _i_checks.append(("at the brain's cap nothing is written and the proposal waits",
@@ -3732,6 +3734,30 @@ with tempfile.TemporaryDirectory() as _tmp:
                           and BR.has_note(_bfile, _row["note"])
                           and BR.read(_bfile).count("pnpm test") == 1
                           and bool(_st.improvement(_row["id"])["decided_at"])))
+
+        # An accept that read the row before a reject decided it loses.
+        class _StaleRead:
+            def __init__(self, store):
+                self.store, self.reads = store, 0
+
+            def improvement(self, iid):
+                self.reads += 1                  # only the first read is stale
+                row = self.store.improvement(iid)
+                return {**row, "status": "pending"} if self.reads == 1 else row
+
+            def __getattr__(self, name):
+                return getattr(self.store, name)
+
+        _sr = _st.claim_improvement("mycorp", "pulse-backend", ttl=600)
+        _st.finish_improvement(_sr, "pending", note="A note a human rejected.")
+        IM.reject(_st, _sr, "no")
+        _ok_race, _msg_race = IM.accept(_StaleRead(_st), _sr, Path(_tmp, "b"))
+        _i_checks.append(("an accept that lost a race to a reject writes nothing",
+                          not _ok_race and "rejected, not pending" in _msg_race
+                          and not BR.has_note(_bfile, "A note a human rejected.")
+                          and _st.improvement(_sr)["status"] == "rejected"))
+        _st.conn.execute("DELETE FROM improvements WHERE id = ?", (_sr,))
+        _st.conn.commit()
 
         # A rejection, and its reason, reach the next run's prompt.
         _s2 = _seed_fail(_st, _tmp, "T210", reasoning="skipped lint")
@@ -3823,6 +3849,45 @@ with tempfile.TemporaryDirectory() as _tmp:
                           and "T222: " not in _ag9.calls[0]["prompt"]
                           and len(json.loads(_row9["evidence"])) == 2
                           and len(_st.improve_evidence("mycorp", "pulse-backend", 0)) == 1))
+        _ag10 = _Improver(max_prompt_bytes=_base + 50 + len(IM._RETRY_SUFFIX.encode()))
+        _row10 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag10), _BACKEND, {}, _NOW)
+        _i_checks.append(("evidence that cannot fit at all is an error that says why",
+                          _ag10.calls == [] and _row10["status"] == "error"
+                          and "prune the brain" in _row10["reasoning"]
+                          and len(_st.improve_evidence("mycorp", "pulse-backend", 0)) == 1))
+
+        # A rejection whose reason is all in the summary is still evidence.
+        _r11 = _seed_review(_st, _tmp, "T223", [], verdict="reject")
+        _p = Path(_tmp, "l", _aln("T223", "pulse-backend", "review"))
+        _review_log(_p, [], summary="this belongs in the queue worker, not the API",
+                    verdict="reject")
+        _ev11 = [e for e in _st.improve_evidence("mycorp", "pulse-backend", 0)
+                 if e["ref"] == f"review:{_r11}"]
+        _txt11 = IM.render(_st, _ev11[0], Path(_tmp, "l")) if _ev11 else None
+        _review_log(_p, [], summary="", verdict="reject")
+        _i_checks.append(("a rejection explained only in its summary is still evidence",
+                          _txt11 is not None and "rejected the approach" in _txt11
+                          and "queue worker" in _txt11
+                          and IM.render(_st, _ev11[0], Path(_tmp, "l")) is None))
+
+        # Every rejection is remembered, not the latest thirty.
+        _st.conn.execute("DELETE FROM improvements")
+        _st.conn.commit()
+        for _n in range(35):
+            _iid = _st.claim_improvement("mycorp", "pulse-backend", ttl=600)
+            _st.finish_improvement(_iid, "pending", note=f"Old idea number {_n}.")
+            _st.decide_improvement(_iid, "rejected", f"reason {_n}")
+        _st.conn.execute("UPDATE improvements SET ts = ts - (100 - id)")
+        _st.conn.commit()
+        _s12 = _seed_fail(_st, _tmp, "T224")
+        _ag12 = _Improver({"proposal": {"problem": "p", "solution": "s",
+                                        "note": "Old idea number 0.",
+                                        "evidence": [f"score:{_s12}"]}, "reasoning": "r"})
+        _row12 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag12, max_evidence=1), _BACKEND, {}, _NOW)
+        _i_checks.append(("the oldest of many rejections still reaches the prompt and the check",
+                          "Old idea number 0." in _ag12.calls[0]["prompt"]
+                          and "reason 0" in _ag12.calls[0]["prompt"]
+                          and _row12["status"] == "none"))
     finally:
         _vcs.ensure_review_worktree = _real_review_wt
 
