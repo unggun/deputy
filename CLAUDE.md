@@ -939,7 +939,10 @@ accident:
   at the base commit in a second scratch clone and runs `setup` and `test`.
   If that fails or does not apply, `ref_tests` is 0 or NULL and every trial's
   `tests` is NULL. Otherwise a broken local environment fails every variant
-  alike and reads as a model failure.
+  alike and reads as a model failure. `setup` and `test` run through
+  `_shell()`, in their own process group that `_kill_tree` signals whole, for
+  the agent's reason: `subprocess.run(timeout=)` kills only the shell, and a
+  timed-out suite's workers would keep running in a checkout being deleted.
 - **The judge reads diffs, never the repo.** `reason()` with
   `JUDGE_SYSTEM`, on `--judge-model` or `agent.scorer_model`, over redacted
   diffs. Over `agent.max_prompt_bytes` the verdict is `insufficient_evidence`
@@ -953,8 +956,9 @@ accident:
 - **Cap against an estimate, limits before every agent run.** A triage case
   costs cents; an implement case costs dollars. `run()` checks the cap before
   each ticket against what is spent plus that ticket's original implement
-  cost times its trials, and `limits_check` before every agent run, as the
-  tick does. A stop inside a ticket leaves it half-compared, so
+  cost times its trials, and `limits_check` before every agent run, the
+  judge's included (`trial(before_judge=)`), as the tick does. A stop inside
+  a ticket leaves it half-compared, so
   `summarize()` compares only tickets every variant finished equally
   (`complete()`) and counts the rest as `left_out`.
 - **A ticket with no reference is skipped, not replayed.** A diff GitHub will

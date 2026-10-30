@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import shutil
 import subprocess
 from collections import Counter
@@ -39,6 +40,7 @@ from typing import Any
 
 from . import bench, brain, vcs
 from .agents.base import CodingAgent
+from .agents.claude_code import _kill_tree
 from .jsonio import parse_json_object
 from .models import Spend, Task, agent_log_name, wilson
 from .redact import redact
@@ -208,19 +210,33 @@ class Reference:
     note: str                     # why `tests` is not 1, when it is not
 
 
+def _shell(cmd: str, wt: Path, env: dict[str, str]) -> int | None:
+    """Exit code of `bash -lc cmd` in `wt`, or None when it timed out.
+
+    In its own process group, signalled whole on the way out, as the agent
+    is: `subprocess.run(timeout=)` kills the shell only, and a test runner's
+    workers or a dev server would go on running, and writing, after the
+    trial had moved on and deleted the checkout under them.
+    """
+    proc = subprocess.Popen(["bash", "-lc", cmd], cwd=wt, env={**os.environ, **env},
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return proc.wait(timeout=TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        _kill_tree(proc)
+
+
 def _setup(repo: dict[str, Any], wt: Path, env: dict[str, str]) -> None:
     # As `_execute` does it: a failed setup is the agent's to notice, not a stop.
     if repo.get("setup"):
-        vcs.run(["bash", "-lc", str(repo["setup"])], cwd=wt, check=False,
-                timeout=TEST_TIMEOUT, env=env)
+        _shell(str(repo["setup"]), wt, env)
 
 
 def _tests(repo: dict[str, Any], wt: Path, env: dict[str, str]) -> int:
-    try:
-        return int(vcs.run(["bash", "-lc", str(repo["test"])], cwd=wt, check=False,
-                           timeout=TEST_TIMEOUT, env=env).returncode == 0)
-    except subprocess.TimeoutExpired:
-        return 0
+    return int(_shell(str(repo["test"]), wt, env) == 0)    # a timeout is a failure
 
 
 def reference(case: Case, root: Path, *, env: dict[str, str],
@@ -337,19 +353,28 @@ def judge(agent: CodingAgent, case: Case, ref: Reference, diff: str, tests: int 
 
 
 # --- running ---------------------------------------------------------------
+class _Stop(Exception):
+    def __init__(self, kind: str, note: str) -> None:
+        super().__init__(note)
+        self.kind, self.note = kind, note
+
+
 def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
           checkout: Path, log_file: Path, log_rel: str, brain_root: Path,
           work_prompt: Callable[[Task, dict[str, Any], dict[str, Any], str], str],
           judge_model: str | None, max_prompt_bytes: int, env: dict[str, str],
           secrets: list[str], keep: bool,
-          on_work: Callable[[Spend, bool], None] | None = None
+          on_work: Callable[[Spend, bool], None] | None = None,
+          before_judge: Callable[[], None] | None = None
           ) -> tuple[dict[str, Any], Spend, Spend]:
     """One trial: the variant implements one merged ticket, graded.
 
     Returns the trial's fields and the spend of its agent run and its judge
     call, apart, since each has its own ledger line. `on_work` gets the agent
     run's spend the moment it returns, before the tests and the judge: a ^C
-    there must not lose dollars the daily limits have to see.
+    there must not lose dollars the daily limits have to see. `before_judge`
+    runs before the judge call, which is an agent run too, and raises `_Stop`
+    to end the run there.
     """
     fields: dict[str, Any] = {
         "variant": variant.label, "case_name": case.name, "task_id": case.row_id,
@@ -386,6 +411,8 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
             return fields, work, judged
         if ref.tests == 1:
             fields["tests"] = _tests(case.repo, checkout, env)
+        if before_judge:
+            before_judge()
         label, reasoning, judged = judge(agent, case, ref, diff, fields["tests"],
                                          model=judge_model, max_bytes=max_prompt_bytes)
         reasoning = redact(reasoning, secrets)
@@ -397,6 +424,8 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
             fields["correct"] = int(label == CORRECT and fields["tests"] != 0)
         elif fields["tests"] == 0:
             fields["correct"] = 0       # the judge could not say; the tests could
+    except _Stop:
+        raise
     except Exception as exc:  # noqa: BLE001 -- one bad trial must not end the run
         log.warning("bench trial %s / %s failed", case.name, variant.label, exc_info=True)
         fields["error"] = redact(f"{type(exc).__name__}: {exc}", secrets)[:1000]
@@ -406,12 +435,6 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
         if not keep:
             shutil.rmtree(checkout, ignore_errors=True)
     return fields, work, judged
-
-
-class _Stop(Exception):
-    def __init__(self, kind: str, note: str) -> None:
-        super().__init__(note)
-        self.kind, self.note = kind, note
 
 
 def run(agent: CodingAgent, store: Any, cases: list[Case], variants_: list[Variant], *,
@@ -456,13 +479,18 @@ def run(agent: CodingAgent, store: Any, cases: list[Case], variants_: list[Varia
                 if on_skip:
                     on_skip(case, redact(str(exc), secrets)[:300])
                 continue
+
+            def gate(i: int = i) -> None:
+                # Before every agent run, the judge's included, as the tick does.
+                hit = limits_check()
+                if hit:
+                    raise _Stop("limits", f"{hit}; stopped partway through ticket "
+                                          f"{i + 1} of {len(cases)}, which is left "
+                                          f"out of the comparison")
+
             for vi, v in enumerate(variants_, 1):
                 for rep in range(1, max(1, repeat) + 1):
-                    hit = limits_check()
-                    if hit:
-                        raise _Stop("limits", f"{hit}; stopped partway through ticket "
-                                              f"{i + 1} of {len(cases)}, which is left "
-                                              f"out of the comparison")
+                    gate()
                     # The source is a directory: two sources may share both keys.
                     name = agent_log_name(case.task_key, case.repo_key, f"v{vi}-{rep}")
                     log_rel = f"bench/{run_id}/{case.source.replace('/', '_')}/{name}"
@@ -480,7 +508,8 @@ def run(agent: CodingAgent, store: Any, cases: list[Case], variants_: list[Varia
                         log_file=Path(log_root) / log_rel, log_rel=log_rel,
                         brain_root=brain_root, work_prompt=work_prompt,
                         judge_model=judge_model, max_prompt_bytes=max_prompt_bytes,
-                        env=env, secrets=secrets, keep=keep, on_work=ran)
+                        env=env, secrets=secrets, keep=keep, on_work=ran,
+                        before_judge=gate)
                     if judged.cost_usd or judged.tokens:
                         store.record("bench", None,
                                      f"{head}: judge {fields['decision'] or 'failed'}",

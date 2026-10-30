@@ -4707,7 +4707,8 @@ try:
                           and _st.bench_trials(_c_id) == []
                           and "the next was estimated at $1.50" in _st.bench_run(_c_id)["note"]))
         _ag3 = _Implementer()
-        _calls = iter([None, None, "daily budget exhausted (20.00 / 20.00 USD)"])
+        # the ticket, the first run, its judge; then the second run is refused
+        _calls = iter([None, None, None, "daily budget exhausted (20.00 / 20.00 USD)"])
         _l_id, _l_stop = _irun(_ag3, _st, _cases, _ivs, _tmp, limits_check=lambda: next(_calls))
         _i_checks.append(("the daily limits are checked before every agent run",
                           _l_stop == "limits" and len(_ag3.work_calls) == 1
@@ -4717,6 +4718,16 @@ try:
                               [v.label for v in _ivs])
         _i_checks.append(("...and a ticket not every variant finished is left out of the comparison",
                           all(r["n"] == 0 for r in _lsum) and _lsum[0]["left_out"] == 1))
+        _ag3j = _Implementer()
+        _calls_j = iter([None, None, "daily token limit reached"])
+        _j_id, _j_stop = _irun(_ag3j, _st, _cases, _ivs, _tmp, limits_check=lambda: next(_calls_j))
+        _jled = [dict(r) for r in _st.conn.execute(
+            "SELECT * FROM events WHERE kind = 'bench' AND detail LIKE ?", (f"#{_j_id} %",))]
+        _i_checks.append(("...the judge's call included, keeping the run it would have judged",
+                          _j_stop == "limits" and len(_ag3j.work_calls) == 1
+                          and _ag3j.reason_calls == [] and _st.bench_trials(_j_id) == []
+                          and len(_jled) == 1 and _jled[0]["detail"].endswith("implement ok")
+                          and "daily token limit reached" in _st.bench_run(_j_id)["note"]))
 
         def _no_diff(main, number, env=None):
             raise vcs.CommandError("gh pr diff 7 -> 1\nHTTP 404 sekrit-123")
@@ -4828,6 +4839,19 @@ with tempfile.TemporaryDirectory() as _tmp:
     _i_checks.append(("a suite that fails on the merged change does not grade the trial",
                       _t["ref_tests"] == 0 and _t["tests"] is None and _t["correct"] == 1
                       and "fails the test command here too" in _ag.reason_calls[0]["prompt"]))
+
+# a test command that outlives its timeout takes its children with it
+with tempfile.TemporaryDirectory() as _tmp:
+    _real_tt, _bi.TEST_TIMEOUT = _bi.TEST_TIMEOUT, 1
+    try:
+        _t0 = time.monotonic()
+        _rc = _bi._tests({"test": "(sleep 1.5; touch late) & wait"}, Path(_tmp), {})
+        _took = time.monotonic() - _t0
+    finally:
+        _bi.TEST_TIMEOUT = _real_tt
+    time.sleep(1.5)
+    _i_checks.append(("a test command past its timeout fails, and its children are killed with it",
+                      _rc == 0 and _took < 1.4 and not (Path(_tmp) / "late").exists()))
 
 # an older database gets the implement columns
 with tempfile.TemporaryDirectory() as _tmp:
