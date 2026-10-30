@@ -443,13 +443,16 @@ def accept(store: Any, improvement_id: int, brain_root: Path, *,
     try:
         if brain.has_note(path, note):
             return True, f"accepted; {path} already had this note"
-        written = brain.append(path, [note], max_bytes=max_bytes)
+        # Empty either at the cap or because another writer added the same
+        # note between the check above and the brain's lock.
+        present = bool(brain.append(path, [note], max_bytes=max_bytes)
+                       or brain.has_note(path, note))
     except OSError as exc:
         # The decision is already committed; a brain that could not be read
         # or written must not leave it saying accepted.
         store.undecide_improvement(improvement_id, "accepted")
         return False, f"could not write {path} ({exc}); still pending"
-    if not written:
+    if not present:
         store.undecide_improvement(improvement_id, "accepted")
         return False, (f"{path} is at its {max_bytes}-byte cap, so nothing was "
                        f"written; prune it by hand and accept again")

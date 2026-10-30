@@ -377,7 +377,11 @@ independent review or a person approved. It refuses to grow past `limits.brain_m
 cap it logs and skips the append rather than evicting older notes, because a brain that
 quietly forgets is worse than one that tells you to prune it. It is plain markdown in a
 known directory — editing or deleting it by hand is a supported operation, not
-corruption.
+corruption. `append()` rewrites the whole file, and the tick and `deputy improve
+accept` can both be writing it, so the read-dedupe-write runs under an exclusive lock
+on a sidecar `{file}.lock` (`brain._locked`: `flock`, or `msvcrt.locking` on
+Windows). Without it the slower writer rewrites from a stale read and drops the
+other's note while both report success.
 
 ## Provider gotchas worth preserving
 

@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -71,11 +74,49 @@ def has_note(path: Path, note: str) -> bool:
         for line in read(path).splitlines() if line.strip()}
 
 
+@contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on `path`'s brain across processes.
+
+    `append` reads, dedupes and rewrites the whole file, and two writers can
+    run at once: the tick appending an approving review's notes, and
+    `deputy improve accept` from a terminal. Unlocked, the slower one rewrites
+    the file from what it read and the other's note is lost while both report
+    success. The lock is a sidecar `.lock` file, so the brain itself stays a
+    plain file a person can open and edit.
+    """
+    lock = path.with_name(path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a+b") as fh:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def append(path: Path, notes: list[str], *,
            max_bytes: int = DEFAULT_MAX_BYTES,
            today: dt.date | None = None) -> list[str]:
     """Append notes that are not already present. Returns what was written."""
     path = Path(path)
+    with _locked(path):
+        return _append(path, notes, max_bytes, today)
+
+
+def _append(path: Path, notes: list[str], max_bytes: int,
+            today: dt.date | None) -> list[str]:
     existing = read(path)
     seen = {
         _norm(_DATE_PREFIX.sub("", line))

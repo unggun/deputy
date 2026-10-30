@@ -3974,6 +3974,22 @@ with tempfile.TemporaryDirectory() as _tmp:
                       and SC.final_text(Path(_tmp, "gone.log")) is None))
     _bp = Path(_tmp, "brain.md")
     BR.append(_bp, ["Use  pnpm, not npm."], today=dt.date(2026, 1, 2))
+    # Two writers on one brain: the second waits for the first's lock rather
+    # than rewriting the file from a stale read and dropping its note.
+    import threading as _th
+    _lb = Path(_tmp, "locked.md")
+    _done = []
+    with BR._locked(_lb):
+        _w = _th.Thread(target=lambda: _done.append(BR.append(_lb, ["second note"])))
+        _w.start()
+        _w.join(0.3)
+        _waited = _w.is_alive()
+        _lb.write_text("- 2026-01-01: first note\n")   # the lock holder's write
+    _w.join(5)
+    _i_checks.append(("a brain append waits for another writer and keeps both notes",
+                      _waited and _done == [["second note"]]
+                      and BR.has_note(_lb, "first note")
+                      and BR.has_note(_lb, "second note")))
     _i_checks.append(("has_note compares notes the way append dedupes them",
                       BR.has_note(_bp, "use pnpm,   NOT npm.")
                       and not BR.has_note(_bp, "Use yarn.")
