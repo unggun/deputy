@@ -7,7 +7,58 @@ export type TaskRow = {
   cost_usd: number; tokens: number; last_error: string | null;
   lease_owner: string | null; lease_until: number; updated_at: number;
   reason?: string; stations?: string[];
-  events?: { ts: number; kind: string; detail: string; cost_usd: number; tokens: number }[];
+  events?: EventRow[];
+};
+
+/** Mirrors `AIState.is_terminal`: nothing moves a row out of these on its own. */
+export const TERMINAL: readonly string[] = ["done", "blocked", "human-only"];
+
+/** One `events` ledger line. The telemetry columns are 0 / null on lines
+ *  written before they existed, and on markers (`state`, `pr_*`). */
+export type EventRow = {
+  ts: number; task_id: string | null; kind: string; detail: string | null;
+  cost_usd: number; tokens: number;
+  duration_ms?: number; turns?: number; model?: string | null;
+  model_requested?: string | null; log?: string | null;
+};
+
+/** One agent run, as `/api/runs` lists it. `open_id` is a row the task sheet
+ *  can open -- a triage run's own row (the placeholder) is gone once routed. */
+export type RunRow = {
+  id: number; ts: number; started: number;
+  task_id: string; open_id: string | null;
+  task_key: string | null; repo_key: string | null; title: string | null;
+  kind: string; detail: string | null; outcome: string; failed: boolean;
+  cost_usd: number; tokens: number; duration_ms: number; turns: number;
+  model: string | null; models: string[]; model_requested: string | null;
+  model_mismatch: boolean; log: string | null;
+};
+
+export type FlowStage = "to_pr" | "pr_to_review" | "review_to_merge" | "total" | "waiting";
+export type Touch = "clarifications" | "plan_rejections" | "review_rounds"
+  | "fix_ci" | "fix_feedback";
+
+/** One merged row. Durations are seconds; null = that stage never happened
+ *  (no human review before the merge). `autonomous` null = cannot say. */
+export type FlowRow = {
+  task_id: string; task_key: string | null; repo_key: string | null;
+  title: string | null; pr_url: string | null; pr_number: number | null;
+  done_at: number; in_state: Record<string, number>;
+  human_commits: number | null; autonomous: boolean | null;
+} & Record<FlowStage, number | null> & Record<Touch, number>;
+
+export type FlowData = {
+  rows: FlowRow[];
+  summary: {
+    merged: number;
+    median: Record<FlowStage, number | null>;
+    n: Record<FlowStage, number>;
+    waiting_share: number | null;
+    time_by_state: Record<string, number>;
+    autonomy: { known: number; autonomous: number; rate: number | null };
+    touches: Record<Touch, number>;
+    human_commits: number;
+  };
 };
 
 export type Overview = {
@@ -110,6 +161,21 @@ export const useThroughput = (days = 30) =>
   useQuery({ queryKey: ["throughput", days],
              queryFn: () => get<ThroughputData>(`/api/throughput?days=${days}`),
              refetchInterval: 15000 });
+
+// The whole window, filtered client-side: the per-station summary has to
+// see every station even while the table shows one.
+export const RUNS_LIMIT = 2000;
+
+export const useRuns = (days = 30) =>
+  useQuery({ queryKey: ["runs", days],
+             queryFn: () => get<{ runs: RunRow[] }>(
+               `/api/runs?days=${days}&limit=${RUNS_LIMIT}`),
+             refetchInterval: 15000 });
+
+export const useFlow = (days = 30) =>
+  useQuery({ queryKey: ["flow", days],
+             queryFn: () => get<FlowData>(`/api/flow?days=${days}`),
+             refetchInterval: 30000 });
 
 export type GraphTransition = { from: string; to: string; label: string };
 

@@ -143,6 +143,23 @@ def build_app(cfg: Config) -> FastAPI:
         finally:
             r.close()
 
+    @app.get("/api/runs")
+    def runs(days: int = 30, station: str | None = None,
+             limit: int = Query(500, ge=1, le=5000)) -> dict[str, Any]:
+        r = reader()
+        try:
+            return {"runs": r.runs(days, station=station, limit=limit)}
+        finally:
+            r.close()
+
+    @app.get("/api/flow")
+    def flow(days: int = 30) -> dict[str, Any]:
+        r = reader()
+        try:
+            return r.flow(days)
+        finally:
+            r.close()
+
     @app.get("/api/graph")
     def state_graph() -> dict[str, Any]:
         # Structured, so the UI can render a table without a diagram engine.

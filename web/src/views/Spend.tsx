@@ -14,8 +14,8 @@ const round2 = (v: number) => Math.round(v * 100) / 100;
 /** One chart row: the day label plus one numeric field per station kind. */
 type SpendRow = Record<string, string | number>;
 
-export function Spend() {
-  const { data, isError, error } = useSpend(30);
+export function Spend({ days = 30 }: { days?: number }) {
+  const { data, isError, error } = useSpend(days);
   const m = useColorMode();
   // React Query leaves `data` undefined once its retries are exhausted, so
   // without this branch a dead API spins on "loading…" forever.

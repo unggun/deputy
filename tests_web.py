@@ -459,6 +459,36 @@ else:
                 weblogs.tail = _real_tail
             check("log route takes task_key/repo_key from the store, never "
                   "from the query string", ok)
+
+            # A routed row's history starts on its placeholder: triage and
+            # any clarification round were recorded before routing existed.
+            st.record("triage", "acme:1", "execute s 0.9", 0.01, 900,
+                      duration_ms=7000, turns=1, model="claude-haiku-5")
+            st.record("implement", "acme:1#api", "ok", 0.4, 40000,
+                      duration_ms=540000, turns=30, log="implement")
+            r = client.get("/api/task", params={"id": "acme:1#api"})
+            kinds = [e["kind"] for e in r.json().get("events", [])]
+            check("task history includes the placeholder's triage",
+                  r.status_code == 200 and kinds == ["triage", "implement"])
+            check("task events carry run telemetry",
+                  r.json()["events"][1].get("duration_ms") == 540000
+                  and r.json()["events"][1].get("log") == "implement")
+
+            r = client.get("/api/runs", params={"days": 7})
+            runs = r.json().get("runs", [])
+            check("runs route lists both runs, attributed to the ticket",
+                  r.status_code == 200 and len(runs) == 2
+                  and all(x["task_key"] == "DEV-1" for x in runs))
+            r = client.get("/api/runs", params={"station": "triage"})
+            check("runs route filters by station",
+                  [x["kind"] for x in r.json()["runs"]] == ["triage"])
+            r = client.get("/api/runs", params={"limit": 100000})
+            check("runs route refuses an unbounded limit", r.status_code == 422)
+
+            r = client.get("/api/flow", params={"days": 7})
+            check("flow route answers with rows and a summary before anything merged",
+                  r.status_code == 200 and r.json()["rows"] == []
+                  and r.json()["summary"]["merged"] == 0)
         finally:
             web_api.STATIC = original_static
 
@@ -496,6 +526,155 @@ finally:
     for _k, _v in _saved.items():
         if _v is not None:
             _os.environ[_k] = _v
+
+# --- flow: where time and human attention went --------------------------------
+# One ticket, clarified before routing (on its placeholder id), then routed,
+# planned, approved, implemented, reviewed by a human with feedback, merged.
+def _ev(st, ts, tid, kind, detail="", **kw):
+    st.record(kind, tid, detail, ts=ts, **kw)
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    t0 = int(dt.datetime.now().replace(hour=8, minute=0, second=0,
+                                       microsecond=0).timestamp()) - 86400
+    ph, rid = "acme:11", "acme:11#api"
+    st.upsert(rid, source="acme", provider_task_id="11", task_key="DEV-11",
+              title="flow", state="done", repo_key="api", pr_number=4,
+              pr_url="http://pr/4")
+    _ev(st, t0, ph, "triage", "clarify (s)", cost_usd=0.01)
+    _ev(st, t0 + 1, ph, "state", "new->needs-input")
+    _ev(st, t0 + 3601, ph, "state", "needs-input->new")      # 1h waiting on a human
+    _ev(st, t0 + 3602, ph, "triage", "execute (m)")
+    _ev(st, t0 + 3603, rid, "state", "new->planning")
+    _ev(st, t0 + 3700, rid, "plan", "ready")
+    _ev(st, t0 + 3701, rid, "state", "planning->plan-review")
+    _ev(st, t0 + 5501, rid, "state", "plan-review->queued")  # 30m approving the plan
+    _ev(st, t0 + 5502, rid, "state", "queued->in-progress")
+    _ev(st, t0 + 6000, rid, "implement", "ok", duration_ms=400_000, turns=12,
+        model="claude-sonnet-5", model_requested="sonnet", log="implement")
+    _ev(st, t0 + 6001, rid, "state", "in-progress->review")
+    _ev(st, t0 + 6100, rid, "review", "approve", log="review")
+    _ev(st, t0 + 6101, rid, "state", "review->pr-open")
+    _ev(st, t0 + 6700, rid, "pr_ready")                      # CI took 10m
+    _ev(st, t0 + 9700, rid, "pr_review", "dana")             # 50m to first review
+    _ev(st, t0 + 9800, rid, "fix", "feedback: ok", log="fix-1")
+    _ev(st, t0 + 9900, rid, "fix", "ci: ok", log="fix-2")
+    _ev(st, t0 + 10900, rid, "pr_merged", "human_commits=0")
+    _ev(st, t0 + 10901, rid, "state", "pr-open->done")
+    rdr = Reader(path, limits={})
+    fl = rdr.flow(7)
+    row = fl["rows"][0] if fl["rows"] else {}
+    check("flow finds the merged row", len(fl["rows"]) == 1)
+    check("flow counts from the placeholder's first event",
+          row.get("total") == 10901)
+    check("time to PR runs from first touch to pr-open",
+          row.get("to_pr") == 6101)
+    check("PR to first review is measured from ready-for-review",
+          row.get("pr_to_review") == 3000)
+    check("first review to merge", row.get("review_to_merge") == 10901 - 9700)
+    check("waiting counts clarification, plan approval and the review wait",
+          row.get("waiting") == 3600 + 1800 + 3000)
+    check("a clarification round before routing is a touch",
+          row.get("clarifications") == 1)
+    check("fix passes are split by cause",
+          row.get("fix_feedback") == 1 and row.get("fix_ci") == 1)
+    check("a human-feedback fix makes the PR not autonomous",
+          row.get("autonomous") is False)
+    check("summary carries the waiting share",
+          abs(fl["summary"]["waiting_share"] - 8400 / 10901) < 1e-9)
+    check("time by state never includes done",
+          "done" not in fl["summary"]["time_by_state"])
+
+    # Same ticket shape, but nobody had to step in: autonomous.
+    rid2 = "acme:12#api"
+    st.upsert(rid2, source="acme", provider_task_id="12", task_key="DEV-12",
+              title="clean", state="done", repo_key="api")
+    _ev(st, t0, rid2, "state", "new->queued")
+    _ev(st, t0 + 10, rid2, "state", "queued->in-progress")
+    _ev(st, t0 + 20, rid2, "state", "review->pr-open")
+    _ev(st, t0 + 30, rid2, "fix", "ci: ok")
+    _ev(st, t0 + 40, rid2, "pr_merged", "human_commits=0")
+    _ev(st, t0 + 50, rid2, "state", "pr-open->done")
+    # And one whose own pushes predate SHA tracking: unknown, not a guess.
+    rid3 = "acme:13#api"
+    st.upsert(rid3, source="acme", provider_task_id="13", task_key="DEV-13",
+              title="old", state="done", repo_key="api")
+    _ev(st, t0, rid3, "state", "review->pr-open")
+    _ev(st, t0 + 5, rid3, "fix", "ok")
+    _ev(st, t0 + 9, rid3, "pr_merged", "human_commits=?")
+    _ev(st, t0 + 10, rid3, "state", "pr-open->done")
+    rdr = Reader(path, limits={})
+    fl = rdr.flow(7)
+    by = {r["task_id"]: r for r in fl["rows"]}
+    check("no human fix and no human commit is autonomous",
+          by[rid2]["autonomous"] is True)
+    check("an unknown merge is neither autonomous nor not",
+          by[rid3]["autonomous"] is None)
+    check("the autonomy rate is over the rows that can say",
+          fl["summary"]["autonomy"] == {"known": 2, "autonomous": 1, "rate": 0.5})
+    check("a merge with no human review has no review-stage time",
+          by[rid2]["pr_to_review"] is None and fl["summary"]["n"]["pr_to_review"] == 1)
+
+    # Marker lines carry no money and must not reach the spend chart.
+    kinds = set()
+    for d in rdr.spend_by_day(7):
+        kinds |= set(d["kinds"])
+    check("PR milestone markers never appear as spend kinds",
+          not kinds & {"state", "pr_ready", "pr_review", "pr_merged"})
+
+    # --- runs ------------------------------------------------------------
+    runs = rdr.runs(7)
+    check("runs lists agent runs only", {r["kind"] for r in runs}
+          <= {"triage", "plan", "implement", "review", "fix"})
+    impl = next(r for r in runs if r["kind"] == "implement")
+    check("a run's start is derived from its duration",
+          impl["started"] == impl["ts"] - 400)
+    check("an alias request answered by its model is not a mismatch",
+          impl["model_mismatch"] is False and impl["model"] == "claude-sonnet-5")
+    tri = next(r for r in runs if r["kind"] == "triage")
+    check("a placeholder's triage run is attributed to its ticket",
+          tri["task_key"] == "DEV-11" and tri["open_id"] == rid
+          and tri["repo_key"] is None)
+    check("fix outcomes read through the cause prefix",
+          {r["outcome"] for r in runs if r["kind"] == "fix"} == {"ok"})
+    check("runs filter by station",
+          {r["kind"] for r in rdr.runs(7, station="fix")} == {"fix"})
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    now = int(time.time())
+    st.record("review", "acme:1#api", "approve", model="claude-opus-5",
+              model_requested="sonnet", ts=now)
+    st.record("implement", "acme:1#api", "agent timed out after 60s", ts=now)
+    st.record("fix", "acme:1#api", "ci+feedback: boom: no", ts=now)
+    rdr = Reader(path, limits={})
+    by_kind = {r["kind"]: r for r in rdr.runs(1)}
+    check("a different model answering is flagged",
+          by_kind["review"]["model_mismatch"] is True)
+    check("an implement error is a failed run",
+          by_kind["implement"]["failed"] is True)
+    check("a fix error after its cause is a failed run",
+          by_kind["fix"]["failed"] is True)
+
+# --- numbered station logs ----------------------------------------------------
+from runner.models import run_station
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    for name in ("implement", "implement-2", "implement-10", "review", "plan",
+                 "fix-1", "review-2"):
+        (root / f"DEV-1__api__{name}.log").write_text("{}\n", encoding="utf-8")
+    check("numbered station logs list in pipeline then run order",
+          weblogs.stations(root, "DEV-1", "api")
+          == ["plan", "implement", "implement-2", "implement-10", "review",
+              "review-2", "fix-1"])
+    check("a numbered station log is readable",
+          weblogs.tail(root, "DEV-1", "api", "implement-2", 0)["missing"] is False)
+    check("the first run keeps the bare name; later runs are numbered",
+          (run_station("implement", 1), run_station("implement", 2),
+           run_station("fix", 1)) == ("implement", "implement-2", "fix-1"))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
