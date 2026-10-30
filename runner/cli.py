@@ -10,11 +10,11 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from . import analyst, bench, brain, graph, improve, providers, scorers, vcs
+from . import analyst, bench, bench_impl, brain, graph, improve, providers, scorers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .models import AgentResult, AIState
-from .pipeline import Pipeline, limits_exceeded
+from .pipeline import Pipeline, _work_prompt, limits_exceeded
 from .state import Store
 
 BOT_MARKER_DEFAULT = "<!-- ai-runner -->"
@@ -458,29 +458,146 @@ def _pct(x: float | None) -> str:
     return "-" if x is None else f"{100 * x:.0f}%"
 
 
-def _bench_table(trials: list[dict]) -> list[str]:
-    """The per-variant summary, as `deputy bench triage` and `show` print it."""
-    head = ("variant", "accuracy", "95% range", "routing", "same as then",
-            "errors", "avg cost", "avg tokens")
-    body = [(r["variant"], f"{r['correct']}/{r['n']} {_pct(r['accuracy'])}",
-             "-" if r["low"] is None else f"{_pct(r['low'])}-{_pct(r['high'])}",
-             f"{r['routed_ok']}/{r['routed_n']}" if r["routed_n"] else "-",
-             f"{r['same']}/{r['compared']}", str(r["errors"]),
-             f"${r['avg_cost_usd']:.4f}", f"{r['avg_tokens']:,.0f}")
-            for r in bench.summarize(trials)]
+def _columns(head: tuple[str, ...], body: list[tuple[str, ...]]) -> list[str]:
+    """Aligned columns: the first left, the rest right."""
     widths = [max(len(row[i]) for row in (head, *body)) for i in range(len(head))]
     return ["  ".join(c.ljust(w) if i == 0 else c.rjust(w)
                       for i, (c, w) in enumerate(zip(row, widths))).rstrip()
             for row in (head, *body)]
 
 
-def _bench(cfg: Config, args: argparse.Namespace) -> int:
-    """`deputy bench`: replay past triage inputs under other models or prompts.
+def _many(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
-    Never part of the tick. It spends the same quota, so it is held to the
-    daily limits like `deputy score`, plus its own `--max-usd` cap, both
-    checked before each ticket. `--dry-run` shows the suite and what history
-    says about each ticket, and calls nothing.
+
+def _range(r: dict) -> str:
+    return "-" if r["low"] is None else f"{_pct(r['low'])}-{_pct(r['high'])}"
+
+
+def _bench_table(trials: list[dict]) -> list[str]:
+    """The per-variant summary, as `deputy bench triage` and `show` print it."""
+    return _columns(
+        ("variant", "accuracy", "95% range", "routing", "same as then",
+         "errors", "avg cost", "avg tokens"),
+        [(r["variant"], f"{r['correct']}/{r['n']} {_pct(r['accuracy'])}", _range(r),
+          f"{r['routed_ok']}/{r['routed_n']}" if r["routed_n"] else "-",
+          f"{r['same']}/{r['compared']}", str(r["errors"]),
+          f"${r['avg_cost_usd']:.4f}", f"{r['avg_tokens']:,.0f}")
+         for r in bench.summarize(trials)])
+
+
+def _impl_table(trials: list[dict], labels: list[str]) -> list[str]:
+    """The per-variant summary of an implement run."""
+    rows = bench_impl.summarize(trials, labels)
+    out = _columns(
+        ("variant", "correct", "95% range", "tests passed", "partial", "no changes",
+         "failed", "avg cost", "avg time"),
+        [(r["variant"], f"{r['correct']}/{r['n']} {_pct(r['rate'])}", _range(r),
+          f"{r['tests_ok']}/{r['tests_n']}" if r["tests_n"] else "-",
+          str(r["partial"]), str(r["no_changes"]), str(r["errors"]),
+          f"${r['avg_cost_usd']:.2f}", f"{r['avg_minutes']:.1f} min")
+         for r in rows])
+    left = max((r["left_out"] for r in rows), default=0)
+    if left:
+        out.append(f"(trials on a ticket not every variant finished are left out: "
+                   f"{sum(r['left_out'] for r in rows)})")
+    return out
+
+
+def _labels(run: dict) -> list[str]:
+    import json
+    try:
+        return [str(v["label"]) for v in json.loads(run.get("variants") or "[]")]
+    except (TypeError, ValueError, KeyError):
+        return []
+
+
+def _impl_show(run: dict, trials: list[dict]) -> None:
+    print("\n".join(_impl_table(trials, _labels(run))))
+    missed = bench_impl.misses(trials, _labels(run))
+    if missed:
+        print("\ngraded wrong:")
+    for t in missed:
+        tests = {1: "tests passed", 0: "tests failed"}.get(t["tests"], "tests not run")
+        print(f"  {t['task_key'] or t['case_name']:<12} {t['variant']}: "
+              f"{t['decision'] or 'no verdict'}, "
+              f"{tests}, +{t['additions'] or 0}/-{t['deletions'] or 0}")
+        if t["reasoning"]:
+            print(f"  {'':<12} {t['reasoning'][:200]}")
+
+
+def _bench_implement(cfg: Config, args: argparse.Namespace, store: Store) -> int:
+    """`deputy bench implement`: replay merged tickets under other models."""
+    acfg = cfg.get("agent", {}) or {}
+    log_root = cfg.path("runner.log_dir", "~/.deputy/logs")
+    repos_now = {(src.key, str(r["key"])): r for src in cfg.sources() for r in src.repos}
+    cases, left_out = bench_impl.load(store, log_root, repos_now, sources=args.sources,
+                                      repos=args.repos or None)
+    total, graded = len(cases) + sum(left_out.values()), len(cases)
+    cases = cases[:max(1, args.limit)]
+    print(f"implementation benchmark: {_many(graded, 'merged ticket')} can be replayed "
+          f"(of {_many(total, 'merged row')})"
+          + (f"; replaying the newest {len(cases)}" if graded > len(cases) else ""))
+    if left_out:
+        print("  left out: " + ", ".join(f"{v} {k}" for k, v in left_out.most_common()))
+    variants = bench_impl.variants(args.models, default_model=acfg.get("model"))
+    print("variants, baseline first:")
+    for v in variants:
+        print(f"  {v.label}")
+    runs = len(cases) * len(variants) * max(1, args.repeat)
+    seen = [c.cost_usd for c in cases if c.cost_usd]
+    guess = (f"; the merged runs cost ${sum(seen) / len(seen):.2f} each, so about "
+             f"${runs * sum(seen) / len(seen):.2f} plus a judge call per run" if seen else "")
+    print(f"{runs} agent runs{guess} (cap ${args.max_usd:.2f})")
+    if args.dry_run or not cases:
+        if not cases:
+            print("nothing to replay yet: a merged ticket needs its base commit, its PR "
+                  "number and the triage snapshot that routed it")
+        else:
+            print("dry run: nothing was run, fetched or recorded")
+        return 0
+
+    agent = ClaudeCodeAgent(acfg)
+    limits = cfg.get("runner.limits", {}) or {}
+
+    def progress(case: bench_impl.Case, fields: dict, spend: object) -> None:
+        mark = {1: "✓", 0: "✕"}.get(fields["correct"], "?")
+        tests = {1: "tests passed", 0: "tests failed"}.get(fields["tests"], "tests not run")
+        said = fields["decision"] or (fields["error"] or "failed")[:80]
+        print(f"  {case.task_key:<12} {case.repo_key:<16} {fields['variant']}: {said}, "
+              f"{tests} {mark}  ${getattr(spend, 'cost_usd', 0.0):.2f}")
+
+    def skipped(case: bench_impl.Case, why: str) -> None:
+        print(f"  {case.task_key:<12} {case.repo_key:<16} skipped, no reference: {why}")
+
+    run_id, stop = bench_impl.run(
+        agent, store, cases, variants, repeat=max(1, args.repeat), max_usd=args.max_usd,
+        limits_check=lambda: limits_exceeded(store, limits, dt.datetime.now()),
+        work_prompt=_work_prompt,
+        profile_env=lambda repo: vcs.profile_env(cfg.profile_for_repo(repo)),
+        work_root=cfg.path("runner.work_dir", "~/.deputy/work"), log_root=log_root,
+        brain_root=cfg.path("runner.brain_dir", "~/.deputy/brain"),
+        judge_model=args.judge_model or acfg.get("scorer_model"),
+        max_prompt_bytes=agent.max_prompt_bytes, secrets=_repo_secrets(cfg),
+        keep=args.keep, on_trial=progress, on_skip=skipped)
+    run = store.bench_run(run_id) or {}
+    print()
+    print("\n".join(_impl_table([bench.decode(t) for t in store.bench_trials(run_id)],
+                                [v.label for v in variants])))
+    if run.get("note"):
+        print(f"\n{run['note']}")
+    print(f"\nrecorded as bench #{run_id}; `deputy bench show {run_id}` lists what was "
+          f"graded wrong")
+    return 1 if stop in ("limits", "interrupted") else 0
+
+
+def _bench(cfg: Config, args: argparse.Namespace) -> int:
+    """`deputy bench`: replay past tickets under other models or prompts.
+
+    `triage` replays triage inputs; `implement` replays merged tickets in
+    scratch clones. Never part of the tick. Both spend the same quota, so
+    they are held to the daily limits like `deputy score`, plus their own
+    `--max-usd` cap. `--dry-run` shows the suite and calls nothing.
     """
     import json
 
@@ -488,6 +605,8 @@ def _bench(cfg: Config, args: argparse.Namespace) -> int:
         print(bench.triage.SYSTEM)
         return 0
     store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
+    if args.action == "implement":
+        return _bench_implement(cfg, args, store)
     if args.action == "list":
         runs = store.bench_runs(args.limit)
         if not runs:
@@ -497,9 +616,11 @@ def _bench(cfg: Config, args: argparse.Namespace) -> int:
             cost = sum(float(t["cost_usd"] or 0) for t in trials)
             state = ("did not finish" if r["finished"] is None
                      else r["note"] or "finished")
-            print(f"#{r['id']:<4} {_age(r['ts']):>4}  {r['suite']:<7} "
-                  f"{r['cases']:>3} triage runs  {len(json.loads(r['variants'] or '[]'))} "
-                  f"variants  ${cost:.2f}  {state}")
+            unit = "ticket" if r["suite"] == bench_impl.SUITE else "triage run"
+            print(f"#{r['id']:<4} {_age(r['ts']):>4}  {r['suite']:<9} "
+                  f"{_many(r['cases'], unit):>15}  "
+                  f"{_many(len(json.loads(r['variants'] or '[]')), 'variant'):<10}  "
+                  f"${cost:.2f}  {state}")
         return 0
     if args.action == "show":
         run = store.bench_run(args.id) if args.id else next(iter(store.bench_runs(1)), None)
@@ -508,8 +629,13 @@ def _bench(cfg: Config, args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return 1
         trials = [bench.decode(t) for t in store.bench_trials(run["id"])]
-        print(f"bench #{run['id']}  {run['suite']}  {run['cases']} triage runs  "
+        impl = run["suite"] == bench_impl.SUITE
+        print(f"bench #{run['id']}  {run['suite']}  "
+              f"{_many(run['cases'], 'ticket' if impl else 'triage run')}  "
               f"{'did not finish' if run['finished'] is None else run['note'] or 'finished'}")
+        if impl:
+            _impl_show(run, trials)
+            return 0
         print("\n".join(_bench_table(trials)))
         missed = bench.misses(trials)
         if missed:
@@ -698,7 +824,7 @@ def main(argv: list[str] | None = None) -> int:
     irun = isub.add_parser("run", help="run the improve station on one repo now")
     irun.add_argument("--repo", required=True, help="repo key from config")
     ben = sub.add_parser(
-        "bench", help="replay past tickets to compare triage models and prompts")
+        "bench", help="replay past tickets to compare models and prompts")
     bsub = ben.add_subparsers(dest="action", required=True)
     btri = bsub.add_parser("triage", help="replay past triage inputs under each variant")
     btri.add_argument("--model", action="append", dest="models", default=[],
@@ -716,6 +842,24 @@ def main(argv: list[str] | None = None) -> int:
                       help="stop starting tickets once this much is spent")
     btri.add_argument("--dry-run", action="store_true",
                       help="show the suite and the answer key; call nothing")
+    bimp = bsub.add_parser("implement",
+                           help="replay merged tickets in scratch clones under each model")
+    bimp.add_argument("--model", action="append", dest="models", default=[],
+                      help="a model to try (repeatable); the configured one is "
+                      "always the baseline")
+    bimp.add_argument("--repo", action="append", dest="repos", default=[],
+                      help="only this repo key (repeatable)")
+    bimp.add_argument("--judge-model", default=None,
+                      help="model for the correctness judge (default: agent.scorer_model, "
+                      "else the triage model)")
+    bimp.add_argument("--limit", type=int, default=10, help="most recent N merged tickets")
+    bimp.add_argument("--repeat", type=int, default=1, help="runs per ticket per variant")
+    bimp.add_argument("--max-usd", type=float, default=10.0,
+                      help="stop starting tickets once this much is spent, or would be")
+    bimp.add_argument("--keep", action="store_true",
+                      help="keep the scratch clones under work_dir/bench for inspection")
+    bimp.add_argument("--dry-run", action="store_true",
+                      help="show the suite and an estimate; run, fetch and record nothing")
     blist = bsub.add_parser("list", help="recent benchmark runs")
     blist.add_argument("--limit", type=int, default=20)
     bshow = bsub.add_parser("show", help="one run's results and its disagreements")

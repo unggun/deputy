@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .. import bench as _bench
+from .. import bench_impl as _bench_impl
 from ..models import AIState, model_present
 from ..models import fix_cause as _fix_cause
 from ..models import run_outcome as _outcome
@@ -649,10 +650,12 @@ class Reader:
     def bench(self, days: int = 30, *, misses: int = 100) -> dict[str, Any]:
         """Benchmark runs started in the range, newest first.
 
-        Each run carries its per-variant summary from `bench.summarize`, the
-        same function `deputy bench` prints from, so the tab and the terminal
-        cannot disagree; and its misses, the trials where a variant's call
-        differed from what history says, with the ticket they belong to.
+        Each run carries its per-variant summary from `bench.summarize` (or
+        `bench_impl.summarize` for an implement run), the same function
+        `deputy bench` prints from, so the tab and the terminal cannot
+        disagree; and its misses, the trials where a variant's call differed
+        from what history says or was graded wrong, with the ticket they
+        belong to.
 
         A database from before benchmarks has neither table; that is an empty
         answer, as in `scores()`.
@@ -662,7 +665,7 @@ class Reader:
             " AND name IN ('bench_runs', 'bench_trials')")}
         if len(has) < 2:
             return {"runs": []}
-        _, by_ticket = self._task_index()
+        by_id, by_ticket = self._task_index()
         out = []
         for run in self.conn.execute(
                 "SELECT * FROM bench_runs WHERE ts >= ? ORDER BY id DESC",
@@ -673,6 +676,16 @@ class Reader:
                 config = json.loads(run["variants"] or "[]")
             except ValueError:
                 config = []
+            common = {
+                "id": run["id"], "ts": run["ts"], "finished": run["finished"],
+                "suite": run["suite"], "cases": run["cases"],
+                "note": self._clean(run["note"]), "config": config,
+                "trials": len(trials),
+                "cost_usd": round(sum(float(t["cost_usd"] or 0) for t in trials), 6),
+                "tokens": sum(int(t["tokens"] or 0) for t in trials)}
+            if run["suite"] == _bench_impl.SUITE:
+                out.append({**common, **self._bench_impl(trials, config, by_id, misses)})
+                continue
             missed = []
             for t in _bench.misses(trials)[:int(misses)]:
                 owner = by_ticket.get(t["task_id"] or "") or {}
@@ -684,15 +697,30 @@ class Reader:
                     "recorded": t["recorded"], "decision": t["decision"],
                     "repos": t["repos"] or [], "correct": t["correct"], "routed": t["routed"],
                     "reasoning": self._clean(t["reasoning"])})
-            out.append({
-                "id": run["id"], "ts": run["ts"], "finished": run["finished"],
-                "suite": run["suite"], "cases": run["cases"],
-                "note": self._clean(run["note"]), "config": config,
-                "variants": _bench.summarize(trials), "trials": len(trials),
-                "cost_usd": round(sum(float(t["cost_usd"] or 0) for t in trials), 6),
-                "tokens": sum(int(t["tokens"] or 0) for t in trials),
-                "misses": missed})
+            out.append({**common, "variants": _bench.summarize(trials), "misses": missed})
         return {"runs": out}
+
+    def _bench_impl(self, trials: list[dict[str, Any]], config: list[Any],
+                    by_id: dict[str, dict[str, Any]], misses: int) -> dict[str, Any]:
+        """An implement run's summary and the trials graded wrong.
+
+        A trial's `task_id` is the routed row itself, so it opens directly;
+        `log` and `diff` are paths under `runner.log_dir`, for the CLI.
+        """
+        labels = [str(c.get("label")) for c in config if isinstance(c, dict)]
+        missed = []
+        for t in _bench_impl.misses(trials, labels or None)[:int(misses)]:
+            owner = by_id.get(t["task_id"] or "") or {}
+            missed.append({
+                "id": t["id"], "variant": t["variant"], "case": t["case_name"],
+                "task_key": t["task_key"], "open_id": owner.get("task_id"),
+                "title": owner.get("title"), "repo_key": owner.get("repo_key"),
+                "decision": t["decision"], "correct": t["correct"], "tests": t["tests"],
+                "ref_tests": t["ref_tests"], "additions": t["additions"],
+                "deletions": t["deletions"], "files": t["files"],
+                "reasoning": self._clean(t["reasoning"]), "diff": t["diff"]})
+        return {"variants": _bench_impl.summarize(trials, labels or None),
+                "misses": missed}
 
     def review_cycles(self, days: int = 30) -> list[dict[str, Any]]:
         rows = self.conn.execute(

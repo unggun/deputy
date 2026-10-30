@@ -319,6 +319,7 @@ deputy status                       # what is in flight, across sources
 deputy score NAME                   # try a scorer on the latest runs (see Scorers)
 deputy improve list                 # brain notes proposed for you (see Improvements)
 deputy bench triage --dry-run       # what a triage benchmark would replay (see Benchmarks)
+deputy bench implement --dry-run    # ... and an implementation benchmark
 python3 tests_smoke.py                      # offline state-machine tests
 ```
 
@@ -461,6 +462,62 @@ between triage runs, never in the middle of one, so a stopped benchmark still
 compares every variant on the same tickets. `--limit` (default 50) replays
 the newest; `--repeat N` asks each variant N times per run.
 
+### Implementation benchmark
+
+Would opus write fewer changes the reviewer sends back than sonnet, and is
+that worth three times the cost? `deputy bench implement` replays tickets
+that merged: for each one it checks out the commit the branch started from
+and runs the implementer again under each model, then grades what it wrote.
+
+```bash
+deputy bench implement --dry-run               # the suite and an estimate; runs nothing
+deputy bench implement --model opus --limit 5  # the configured model, then opus, on the newest 5
+deputy bench implement --repo pulse-backend    # only one repo's tickets
+deputy bench implement --keep                  # keep the scratch clones under work_dir/bench
+deputy bench show 7                            # one run, and every run graded wrong
+```
+
+A replay gets what the implementer got the first time: the tick's own
+implement prompt and tools, the ticket as triage last saw it before the work
+began, the agreed plan and acceptance criteria, and the repo's brain as it
+stood that day. Notes dated on or after it are left out, since the approving
+review of that very ticket may have written one. It runs in a scratch
+repository under `{runner.work_dir}/bench/` that holds the base commit's
+history and nothing else: no remote, and no branch, tag or later commit, so
+the change that merged is not there to find. The runner pushes nothing from
+it, and nothing is commented on or reviewed. It is not a sandbox: the replay
+has the same tools as the implementer in the tick, which could still push to
+a URL it was given, and its prompt tells it not to push, as there. The clone is deleted
+afterwards; its diff and agent log stay under `{runner.log_dir}/bench/`.
+
+Each run is graded twice:
+
+- **Tests.** The repo's `test` command, run on the replay. These only count
+  where the change that merged passes the same command in a scratch clone of
+  its own. A suite that fails on the merged code on this machine (a missing
+  service, an unbuilt dependency) cannot tell a good replay from a bad one.
+- **A judge.** A tool-less model call that reads the ticket, the criteria,
+  the plan, the merged diff and the replay's diff, and says `correct`,
+  `partial` or `incorrect`. The merged diff is one right answer, not the only
+  one. Diffs too big for one prompt are never cut: the verdict is
+  `insufficient_evidence` and nothing is called. It uses `agent.scorer_model`
+  unless you pass `--judge-model`.
+
+A run is correct when the judge says so and the tests, where they ran,
+passed. A run that changes nothing is wrong. A failed run, or a judge that
+could not decide, is counted beside the rate, never in it.
+
+A ticket can be replayed once it has a base commit, a PR number and the
+triage snapshot that routed it, all recorded since the measurement release.
+Its diff comes from `gh pr diff`, through the repo's vcs profile.
+
+This is the expensive benchmark: every run is a full implementation. The
+dry run's estimate is what each ticket's original implement run cost. The
+`--max-usd` cap (default 10) is checked against that estimate before each
+ticket, so a run stops before a ticket it expects to cross the cap. The daily
+limits are checked before every agent run, as in the tick. A ticket that not
+every variant finished is left out of the comparison. `--limit` defaults to 10.
+
 ## Dashboard
 
 ```bash
@@ -481,7 +538,7 @@ acting on the runner stays in the task manager and the CLI.
 | Runs | Every agent run: station, outcome, wall time, turns, the model that answered (⚠ when it differs from the one requested), tokens, cost; click one to open its log. `#id` is what `deputy score --run` takes |
 | Scorers | Per scorer: pass rate with its 95% range and n, passed/failed, insufficient evidence and judge errors beside it, judging cost; pass rate by day; every verdict with the judge's reasoning, opening the run's log |
 | Improvements | Proposed brain notes waiting for you, with the evidence they cite (each opens that run's log) and the commands to accept or reject them; the acceptance rate with its 95% range; runs that proposed nothing, and why |
-| Benchmarks | Per `deputy bench` run: each variant's accuracy against history with its 95% range, next to its average cost per call; routing, agreement with the original call, failed calls and the models that answered; every call that disagreed with history, with its reasoning |
+| Benchmarks | Per `deputy bench` run. Triage: each variant's accuracy against history with its 95% range, next to its average cost per call; routing, agreement with the original call, failed calls and the models that answered; every call that disagreed with history, with its reasoning. Implement: each variant's correct rate with its 95% range, next to its average cost per run; tests passed, partial, incorrect and no-change runs, time and models; every run graded wrong, with its diff size and the judge's reasoning |
 | Spend, Throughput | Tokens and dollars per station per day, with judging, improve and benchmark runs as one grey overhead band; outcomes and cycle times |
 | Graph | The live state machine as a table |
 
