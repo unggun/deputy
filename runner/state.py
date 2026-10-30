@@ -103,6 +103,43 @@ CREATE TABLE IF NOT EXISTS improvements (
 -- At most one improve run holds a repo at a time; see claim_improvement.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_improvements_running
     ON improvements(source, repo_key) WHERE status = 'running';
+-- One row per `deputy bench` invocation, and one per trial inside it: a
+-- variant (model, prompt) replayed on one past ticket. Operator-run, never
+-- written by the tick. `finished` stays NULL for a run that was killed.
+CREATE TABLE IF NOT EXISTS bench_runs (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,        -- started at
+    finished  INTEGER,
+    suite     TEXT NOT NULL,           -- 'triage'
+    variants  TEXT NOT NULL DEFAULT '[]',
+    cases     INTEGER NOT NULL DEFAULT 0,
+    note      TEXT                     -- why it stopped early, when it did
+);
+CREATE TABLE IF NOT EXISTS bench_trials (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL,
+    ts             INTEGER NOT NULL,
+    variant        TEXT NOT NULL,      -- its label
+    case_name      TEXT NOT NULL,      -- the snapshot, e.g. DEV-1__mycorp__triage-1
+    rep            INTEGER NOT NULL DEFAULT 1,
+    task_id        TEXT,               -- the ticket's pre-triage row id
+    task_key       TEXT,
+    why            TEXT,               -- what history says: merged, answered, ...
+    expected       TEXT NOT NULL DEFAULT '[]',  -- decisions history accepts
+    expected_repos TEXT,               -- JSON list, or NULL when it cannot say
+    recorded       TEXT,               -- what triage decided at the time
+    decision       TEXT,               -- NULL when the trial failed
+    repos          TEXT NOT NULL DEFAULT '[]',
+    correct        INTEGER,            -- NULL when the trial failed
+    routed         INTEGER,            -- NULL when there was no routing to judge
+    reasoning      TEXT,
+    error          TEXT,
+    cost_usd       REAL NOT NULL DEFAULT 0,
+    tokens         INTEGER NOT NULL DEFAULT 0,
+    duration_ms    INTEGER NOT NULL DEFAULT 0,
+    model          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bench_trials_run ON bench_trials(run_id);
 CREATE TABLE IF NOT EXISTS posted_comments (
     idempotency_key TEXT PRIMARY KEY,
     task_id TEXT,
@@ -395,6 +432,57 @@ class Store:
             f"SELECT * FROM events WHERE kind IN ({ph}) AND log IS NOT NULL"
             " ORDER BY ts DESC, id DESC LIMIT ?", (*kinds, int(limit))).fetchall()
         return [dict(r) for r in rows]
+
+    def ticket_history(self, placeholder: str) -> list[dict[str, Any]]:
+        """Every triage run and state change of one ticket, oldest first.
+
+        A ticket's history is its placeholder's events (triage, and any
+        clarification before routing) plus every routed row's, `{id}#{repo}`.
+        Events outlive the rows: a human reset deletes them, the ledger keeps
+        what happened before.
+        """
+        rows = self.conn.execute(
+            "SELECT id, ts, task_id, kind, detail FROM events"
+            " WHERE (task_id = ? OR substr(task_id, 1, ?) = ?)"
+            " AND kind IN ('triage', 'state') ORDER BY id",
+            (placeholder, len(placeholder) + 1, placeholder + "#")).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- benchmarks ----------------------------------------------------
+    def start_bench(self, suite: str, variants: list[dict[str, Any]],
+                    cases: int) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO bench_runs (ts, suite, variants, cases) VALUES (?,?,?,?)",
+            (_now(), suite, json.dumps(variants), int(cases)))
+        self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def record_trial(self, run_id: int, **fields: Any) -> None:
+        fields = {k: _coerce(v) for k, v in fields.items()}
+        cols = ["run_id", "ts", *fields]
+        self.conn.execute(
+            f"INSERT INTO bench_trials ({','.join(cols)})"
+            f" VALUES ({','.join('?' * len(cols))})",
+            (int(run_id), _now(), *fields.values()))
+        self.conn.commit()
+
+    def finish_bench(self, run_id: int, note: str | None = None) -> None:
+        self.conn.execute("UPDATE bench_runs SET finished = ?, note = ? WHERE id = ?",
+                          (_now(), note, int(run_id)))
+        self.conn.commit()
+
+    def bench_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM bench_runs ORDER BY id DESC LIMIT ?", (int(limit),))]
+
+    def bench_run(self, run_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM bench_runs WHERE id = ?",
+                                (int(run_id),)).fetchone()
+        return dict(row) if row else None
+
+    def bench_trials(self, run_id: int) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM bench_trials WHERE run_id = ? ORDER BY id", (int(run_id),))]
 
     # --- improvements --------------------------------------------------
     # Statuses whose evidence is spent: no later run is shown it again. An

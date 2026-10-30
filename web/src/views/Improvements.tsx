@@ -1,6 +1,6 @@
-import { useState } from "react";
 import { useImprovements, type Improvement, type ImprovementEvidence,
          type ImprovementsData } from "@/lib/api";
+import { Command } from "@/components/Command";
 import { FetchError } from "@/components/FetchError";
 import { StatTile } from "@/components/StatTile";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,31 +10,6 @@ import { STATUS } from "@/lib/palette";
 import { pct, when } from "@/lib/format";
 
 type Open = (id: string, station?: string) => void;
-
-/** A shell command, with a copy button. The dashboard is read-only: deciding
- *  happens at the terminal, and this is the shortest way there. */
-function Command({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // No clipboard (an insecure origin, a denied permission): the command
-      // is still on screen to select by hand.
-    }
-  };
-  return (
-    <div className="flex items-center gap-2 rounded bg-muted px-2 py-1">
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs">
-        {text}</code>
-      <button onClick={copy} className="shrink-0 text-xs text-muted-foreground"
-              aria-label={`copy: ${text}`}>
-        {copied ? "copied" : "copy"}</button>
-    </div>
-  );
-}
 
 function Evidence({ e, onOpen }: { e: ImprovementEvidence; onOpen: Open }) {
   const what = e.kind === "score" ? `${e.scorer}: ${e.label}` : `review: ${e.label}`;

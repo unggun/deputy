@@ -265,6 +265,44 @@ export const useImprovements = (days = 30) =>
              queryFn: () => get<ImprovementsData>(`/api/improvements?days=${days}`),
              refetchInterval: 30000 });
 
+/** One variant's results in one benchmark run, from `bench.summarize`.
+ *  `accuracy` is over trials that produced a decision; `errors` are beside
+ *  it, never in it. `routing` only counts tickets with a choice of repos. */
+export type BenchVariant = {
+  variant: string; trials: number; errors: number;
+  n: number; correct: number; accuracy: number | null;
+  low: number | null; high: number | null;
+  routed_n: number; routed_ok: number; routing: number | null;
+  compared: number; same: number;
+  cost_usd: number; tokens: number; avg_cost_usd: number; avg_tokens: number;
+  duration_ms: number; models: string[];
+};
+
+/** A trial whose call differed from what history says the right one was. */
+export type BenchMiss = {
+  id: number; variant: string; case: string; task_key: string | null;
+  open_id: string | null; title: string | null; why: string | null;
+  expected: string[]; expected_repos: string[] | null; recorded: string | null;
+  decision: string | null; repos: string[];
+  correct: number | null; routed: number | null; reasoning: string | null;
+};
+
+export type BenchConfig = {
+  label: string; model: string | null; prompt: string; prompt_sha: string;
+  current_repos: boolean;
+};
+
+export type BenchRun = {
+  id: number; ts: number; finished: number | null; suite: string; cases: number;
+  note: string | null; config: BenchConfig[]; variants: BenchVariant[];
+  trials: number; cost_usd: number; tokens: number; misses: BenchMiss[];
+};
+
+export const useBench = (days = 30) =>
+  useQuery({ queryKey: ["bench", days],
+             queryFn: () => get<{ runs: BenchRun[] }>(`/api/bench?days=${days}`),
+             refetchInterval: 30000 });
+
 export type GraphTransition = { from: string; to: string; label: string };
 
 export const useGraph = () =>

@@ -3,16 +3,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import math
 import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
+from .. import bench as _bench
 from ..models import AIState, model_present
 from ..models import fix_cause as _fix_cause
 from ..models import run_outcome as _outcome
+from ..models import wilson as _wilson
 from ..redact import redact
 
 # States that mean a human has to act before anything else happens.
@@ -60,22 +61,6 @@ def _median(values: Sequence[float]) -> float | None:
         return None
     mid = len(xs) // 2
     return float(xs[mid]) if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
-
-
-def _wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
-    """95% Wilson score interval for k passes out of n.
-
-    Not the normal approximation: at the sample sizes a scorer actually sees
-    (a dozen runs) that one gives intervals past 0 or 1 and a zero-width
-    interval at 0/n and n/n, which reads as certainty nobody has.
-    """
-    if n <= 0:
-        return None
-    p = k / n
-    denom = 1 + z * z / n
-    centre = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return max(0.0, centre - half), min(1.0, centre + half)
 
 
 def _size_bucket(lines: int | None) -> str:
@@ -659,6 +644,55 @@ class Reader:
             "low": ci[0] if ci else None, "high": ci[1] if ci else None,
             "cost_usd": round(float(spent["c"]), 6), "tokens": int(spent["t"]),
         }
+
+    # --- benchmarks ----------------------------------------------------
+    def bench(self, days: int = 30, *, misses: int = 100) -> dict[str, Any]:
+        """Benchmark runs started in the range, newest first.
+
+        Each run carries its per-variant summary from `bench.summarize`, the
+        same function `deputy bench` prints from, so the tab and the terminal
+        cannot disagree; and its misses, the trials where a variant's call
+        differed from what history says, with the ticket they belong to.
+
+        A database from before benchmarks has neither table; that is an empty
+        answer, as in `scores()`.
+        """
+        has = {r["name"] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " AND name IN ('bench_runs', 'bench_trials')")}
+        if len(has) < 2:
+            return {"runs": []}
+        _, by_ticket = self._task_index()
+        out = []
+        for run in self.conn.execute(
+                "SELECT * FROM bench_runs WHERE ts >= ? ORDER BY id DESC",
+                (self._since(days),)).fetchall():
+            trials = [_bench.decode(dict(t)) for t in self.conn.execute(
+                "SELECT * FROM bench_trials WHERE run_id = ? ORDER BY id", (run["id"],))]
+            try:
+                config = json.loads(run["variants"] or "[]")
+            except ValueError:
+                config = []
+            missed = []
+            for t in _bench.misses(trials)[:int(misses)]:
+                owner = by_ticket.get(t["task_id"] or "") or {}
+                missed.append({
+                    "id": t["id"], "variant": t["variant"], "case": t["case_name"],
+                    "task_key": t["task_key"], "open_id": owner.get("task_id"),
+                    "title": owner.get("title"), "why": t["why"],
+                    "expected": t["expected"] or [], "expected_repos": t["expected_repos"],
+                    "recorded": t["recorded"], "decision": t["decision"],
+                    "repos": t["repos"] or [], "correct": t["correct"], "routed": t["routed"],
+                    "reasoning": self._clean(t["reasoning"])})
+            out.append({
+                "id": run["id"], "ts": run["ts"], "finished": run["finished"],
+                "suite": run["suite"], "cases": run["cases"],
+                "note": self._clean(run["note"]), "config": config,
+                "variants": _bench.summarize(trials), "trials": len(trials),
+                "cost_usd": round(sum(float(t["cost_usd"] or 0) for t in trials), 6),
+                "tokens": sum(int(t["tokens"] or 0) for t in trials),
+                "misses": missed})
+        return {"runs": out}
 
     def review_cycles(self, days: int = 30) -> list[dict[str, Any]]:
         rows = self.conn.execute(

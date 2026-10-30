@@ -1,6 +1,7 @@
 """Provider/agent-agnostic domain objects."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -344,3 +345,21 @@ def fix_cause(detail: str | None) -> set[str] | None:
     head, sep, _ = (detail or "").partition(": ")
     parts = set(head.split("+")) if sep else set()
     return parts if parts and parts <= {"ci", "feedback"} else None
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    """95% Wilson score interval for k passes out of n.
+
+    Not the normal approximation: at the sample sizes a scorer actually sees
+    (a dozen runs) that one gives intervals past 0 or 1 and a zero-width
+    interval at 0/n and n/n, which reads as certainty nobody has. Here rather
+    than in the dashboard so `deputy bench` prints the range the Benchmarks
+    tab shows.
+    """
+    if n <= 0:
+        return None
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
