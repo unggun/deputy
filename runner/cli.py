@@ -7,9 +7,10 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
-from . import analyst, brain, graph, improve, providers, scorers, vcs
+from . import analyst, bench, brain, graph, improve, providers, scorers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .models import AgentResult, AIState
@@ -453,6 +454,145 @@ def _improve(cfg: Config, args: argparse.Namespace) -> int:
     return 1 if row["status"] == "error" else 0
 
 
+def _pct(x: float | None) -> str:
+    return "-" if x is None else f"{100 * x:.0f}%"
+
+
+def _bench_table(trials: list[dict]) -> list[str]:
+    """The per-variant summary, as `deputy bench triage` and `show` print it."""
+    head = ("variant", "accuracy", "95% range", "routing", "same as then",
+            "errors", "avg cost", "avg tokens")
+    body = [(r["variant"], f"{r['correct']}/{r['n']} {_pct(r['accuracy'])}",
+             "-" if r["low"] is None else f"{_pct(r['low'])}-{_pct(r['high'])}",
+             f"{r['routed_ok']}/{r['routed_n']}" if r["routed_n"] else "-",
+             f"{r['same']}/{r['compared']}", str(r["errors"]),
+             f"${r['avg_cost_usd']:.4f}", f"{r['avg_tokens']:,.0f}")
+            for r in bench.summarize(trials)]
+    widths = [max(len(row[i]) for row in (head, *body)) for i in range(len(head))]
+    return ["  ".join(c.ljust(w) if i == 0 else c.rjust(w)
+                      for i, (c, w) in enumerate(zip(row, widths))).rstrip()
+            for row in (head, *body)]
+
+
+def _bench(cfg: Config, args: argparse.Namespace) -> int:
+    """`deputy bench`: replay past triage inputs under other models or prompts.
+
+    Never part of the tick. It spends the same quota, so it is held to the
+    daily limits like `deputy score`, plus its own `--max-usd` cap, both
+    checked before each ticket. `--dry-run` shows the suite and what history
+    says about each ticket, and calls nothing.
+    """
+    import json
+
+    if args.action == "prompt":
+        print(bench.triage.SYSTEM)
+        return 0
+    store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
+    if args.action == "list":
+        runs = store.bench_runs(args.limit)
+        if not runs:
+            print("no benchmark runs yet; try `deputy bench triage --dry-run`")
+        for r in runs:
+            trials = store.bench_trials(r["id"])
+            cost = sum(float(t["cost_usd"] or 0) for t in trials)
+            state = ("did not finish" if r["finished"] is None
+                     else r["note"] or "finished")
+            print(f"#{r['id']:<4} {_age(r['ts']):>4}  {r['suite']:<7} "
+                  f"{r['cases']:>3} triage runs  {len(json.loads(r['variants'] or '[]'))} "
+                  f"variants  ${cost:.2f}  {state}")
+        return 0
+    if args.action == "show":
+        run = store.bench_run(args.id) if args.id else next(iter(store.bench_runs(1)), None)
+        if run is None:
+            print(f"no benchmark run {args.id}" if args.id else "no benchmark runs yet",
+                  file=sys.stderr)
+            return 1
+        trials = [bench.decode(t) for t in store.bench_trials(run["id"])]
+        print(f"bench #{run['id']}  {run['suite']}  {run['cases']} triage runs  "
+              f"{'did not finish' if run['finished'] is None else run['note'] or 'finished'}")
+        print("\n".join(_bench_table(trials)))
+        missed = bench.misses(trials)
+        if missed:
+            print("\nwhere a variant disagreed with history:")
+        for t in missed:
+            said = t["decision"] + (f" {', '.join(t['repos'])}"
+                                    if t["decision"] == "execute" and t["repos"] else "")
+            want = "/".join(t["expected"] or [])
+            if t["correct"] and t["routed"] == 0:
+                want = f"execute {', '.join(t['expected_repos'] or [])}"
+            print(f"  {t['task_key'] or t['case_name']:<12} {t['why']:<14} "
+                  f"history: {want:<16} {t['variant']}: {said}")
+            if t["reasoning"]:
+                print(f"  {'':<12} {t['reasoning'][:200]}")
+        return 0
+
+    # triage
+    acfg = cfg.get("agent", {}) or {}
+    policy = cfg.get("policy", {}) or {}
+    log_root = cfg.path("runner.log_dir", "~/.deputy/logs")
+    try:
+        variants = bench.variants(args.models, args.prompts,
+                                  default_model=acfg.get("triage_model") or acfg.get("model"),
+                                  current_repos=args.current_repos)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    cases, left_out = bench.load(log_root, store, now=int(time.time()),
+                                 policy=policy, sources=args.sources)
+    total = len(cases) + sum(left_out.values())
+    graded = len(cases)
+    cases = cases[:max(1, args.limit)]
+    why = Counter(c.why for c in cases)
+    print(f"triage benchmark: {graded} past triage runs history can grade "
+          f"(of {total} snapshots in {log_root / 'triage'})"
+          + (f"; replaying the newest {len(cases)}" if graded > len(cases) else ""))
+    if why:
+        print("  " + " · ".join(f"{k} {v}" for k, v in why.most_common()))
+    if left_out:
+        print("  left out: " + ", ".join(f"{v} {k}" for k, v in left_out.most_common()))
+    print("variants, baseline first:")
+    for v in variants:
+        print(f"  {v.label}")
+    calls = len(cases) * len(variants) * max(1, args.repeat)
+    seen = [float(c.snap.get("cost_usd") or 0) for c in cases if c.snap.get("cost_usd")]
+    guess = (f"; triage averaged ${sum(seen) / len(seen):.4f} a call, so about "
+             f"${calls * sum(seen) / len(seen):.2f}" if seen else "")
+    print(f"{calls} calls{guess} (cap ${args.max_usd:.2f})")
+    if args.dry_run or not cases:
+        if not cases:
+            print("nothing to replay yet: snapshots need an outcome first "
+                  "(a merge, an answered question, a reset)")
+        else:
+            print("dry run: nothing was called or recorded")
+        return 0
+
+    repos_now = {(src.key, str(r["key"])): r for src in cfg.sources() for r in src.repos}
+    limits = cfg.get("runner.limits", {}) or {}
+
+    def progress(case: bench.Case, fields: dict, spend: object) -> None:
+        mark = ("failed" if fields["decision"] is None
+                else "✓" if fields["correct"] and fields["routed"] != 0 else "✕")
+        said = fields["decision"] or (fields["error"] or "")[:80]
+        print(f"  {case.task_key or case.name:<12} {case.why:<14} {fields['variant']}: "
+              f"{said} {mark}")
+
+    run_id, stop = bench.run(
+        ClaudeCodeAgent(acfg), store, cases, variants, policy=policy,
+        repos_now=repos_now, repeat=max(1, args.repeat), max_usd=args.max_usd,
+        limits_check=lambda: limits_exceeded(store, limits, dt.datetime.now()),
+        secrets=_repo_secrets(cfg), on_trial=progress)
+    run = store.bench_run(run_id) or {}
+    print()
+    print("\n".join(_bench_table([bench.decode(t) for t in store.bench_trials(run_id)])))
+    if run.get("note"):
+        print(f"\n{run['note']}")
+    print(f"\nrecorded as bench #{run_id}; `deputy bench show {run_id}` lists the "
+          f"disagreements")
+    # The cap is a choice the person made; the daily limits and a ^C are not
+    # the run they asked for.
+    return 1 if stop in ("limits", "interrupted") else 0
+
+
 def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
     """Run the read-only dashboard.
 
@@ -557,6 +697,30 @@ def main(argv: list[str] | None = None) -> int:
                            help="shown to every later run on the repo")
     irun = isub.add_parser("run", help="run the improve station on one repo now")
     irun.add_argument("--repo", required=True, help="repo key from config")
+    ben = sub.add_parser(
+        "bench", help="replay past tickets to compare triage models and prompts")
+    bsub = ben.add_subparsers(dest="action", required=True)
+    btri = bsub.add_parser("triage", help="replay past triage inputs under each variant")
+    btri.add_argument("--model", action="append", dest="models", default=[],
+                      help="a model to try (repeatable); the configured one is "
+                      "always the baseline")
+    btri.add_argument("--prompt", action="append", dest="prompts", default=[],
+                      help="a file to use in place of the built-in triage prompt, "
+                      "or 'builtin' (repeatable); start one from `deputy bench prompt`")
+    btri.add_argument("--current-repos", action="store_true",
+                      help="offer each repo with today's language and notes from "
+                      "config instead of the ones triage saw")
+    btri.add_argument("--limit", type=int, default=50, help="most recent N tickets")
+    btri.add_argument("--repeat", type=int, default=1, help="calls per ticket per variant")
+    btri.add_argument("--max-usd", type=float, default=5.0,
+                      help="stop starting tickets once this much is spent")
+    btri.add_argument("--dry-run", action="store_true",
+                      help="show the suite and the answer key; call nothing")
+    blist = bsub.add_parser("list", help="recent benchmark runs")
+    blist.add_argument("--limit", type=int, default=20)
+    bshow = bsub.add_parser("show", help="one run's results and its disagreements")
+    bshow.add_argument("id", type=int, nargs="?", help="default: the latest run")
+    bsub.add_parser("prompt", help="print the built-in triage prompt, to start a variant from")
     serve = sub.add_parser("serve", help="read-only dashboard on localhost")
     serve.add_argument("--port", type=int, default=8787)
     serve.add_argument("--host", default="127.0.0.1")
@@ -575,10 +739,10 @@ def main(argv: list[str] | None = None) -> int:
     # be exported before it will start is a credential demand with nothing
     # behind it, and it blocks the dashboard in exactly the interactive shell
     # where cron's environment is absent.
-    # `score` reads the store and the logs and calls the agent; like
-    # `serve`, it never builds a provider.
+    # `score` and `bench` read the store and the logs and call the agent;
+    # like `serve`, they never build a provider.
     cfg = Config.load(args.config,
-                      require_env=(args.cmd not in ("serve", "score", "improve")))
+                      require_env=(args.cmd not in ("serve", "score", "improve", "bench")))
     _logging(cfg, args.verbose)
     log = logging.getLogger("cli")
 
@@ -606,6 +770,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "improve":
         return _improve(cfg, args)
+
+    if args.cmd == "bench":
+        return _bench(cfg, args)
 
     if args.force:
         cfg.data.setdefault("runner", {})["windows"] = {

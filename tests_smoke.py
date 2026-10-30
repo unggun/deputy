@@ -4054,6 +4054,471 @@ for label, ok in _i_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+# --- triage benchmark --------------------------------------------------------
+print("\ntriage benchmark")
+from runner import bench as _bench
+from runner import triage as _triage_mod
+from runner.jsonio import StationError as _StationError
+
+_b_checks = []
+
+
+class _TriageScript:
+    """reason() answers per ticket key, from a script, the way history ran."""
+    def __init__(self, script, cost=0.01):
+        self.script = {k: list(v) for k, v in script.items()}
+        self.cost = cost
+        self.calls = []
+
+    def reason(self, prompt, *, max_turns=1, model=None, system_prompt=None):
+        key = prompt.split("Ticket: ", 1)[1].split(" ", 1)[0]
+        self.calls.append({"key": key, "model": model, "prompt": prompt})
+        queue = self.script.get(key) or [{"decision": "clarify", "confidence": 0.5}]
+        reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        text = reply if isinstance(reply, str) else json.dumps(reply)
+        return AgentResult(ok=True, cost_usd=self.cost, text=text,
+                           usage=TokenUsage(input_tokens=100, output_tokens=20))
+
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        raise AssertionError("the benchmark never calls work()")
+
+
+def _ex(*repos, scope="xs"):
+    return {"decision": "execute", "confidence": 0.95, "scope": scope,
+            "plan": ["do it"], "acceptance_criteria": ["it works"], "repos": list(repos)}
+
+
+_CLARIFY = {"decision": "clarify", "confidence": 0.4, "scope": "m",
+            "questions": ["Which metric?"]}
+_HUMAN = {"decision": "human_only", "confidence": 0.9, "scope": "m",
+          "hints": ["needs the vendor console"]}
+_HISTORY = {
+    "B1": [_ex("pulse-backend")],                       # merged in one repo
+    "B2": [_CLARIFY, _ex("pulse-backend")],             # asked, answered, queued
+    "B3": [_HUMAN, _HUMAN],                             # reset, then stood
+    "B4": [_ex("pulse-backend")],                       # the denylist decides
+    "B5": [_HUMAN],                                     # stood
+    "B6": [_CLARIFY],                                   # nobody answered
+    "B7": [_ex("pulse-backend", "pulse-frontend")],     # merged in both
+    "B8": [_ex("pulse-backend", "pulse-frontend")],     # merged in one of two
+    "B9": [_ex("pulse-backend")],                       # ended blocked
+}
+
+
+def _bench_world(tmp):
+    """Real ticks with a scripted triage, then hand-written outcomes.
+
+    The triage runs, snapshots, clarifications and the reset are the
+    pipeline's own; only what happens after a row is queued (the PR and its
+    merge) is written by hand, since that needs git and GitHub.
+    """
+    cfg, src = _two_repo_cfg(tmp)
+    # Nothing planned may start: the outcomes below stand in for the work.
+    cfg.data["runner"]["windows"]["execute"] = ["23:00-23:01"]
+    tasks = [mk("B1", "Add CSV export", "an endpoint that returns CSV"),
+             mk("B2", "Improve the dashboard", "make it better"),
+             mk("B3", "Rotate the on-call schedule", "in the vendor console"),
+             mk("B4", "Fix prod database migration", "run it on production data"),
+             mk("B5", "Renew the vendor contract", "talk to sales"),
+             mk("B6", "Make search faster", "it is slow"),
+             mk("B7", "CSV export, end to end", "endpoint plus a download button"),
+             mk("B8", "Export button", "endpoint plus a download button"),
+             mk("B9", "Fix the flaky test", "it fails sometimes")]
+    prov = FakeProvider(tasks)
+    store = Store(f"{tmp}/s.db")
+    pipe = Pipeline(cfg, src, prov, _TriageScript(_HISTORY), store)
+    when = dt.datetime(2026, 8, 10, 7, 0)
+    pipe.tick(when)
+    prov.human_reply("B2", "Load time of the overview page")
+    prov.tasks["B3"].ai_state = AIState.NEW          # a human's reset
+    pipe.tick(when)
+    for key, repo, end in (("B1", "pulse-backend", "done"),
+                           ("B7", "pulse-backend", "done"),
+                           ("B7", "pulse-frontend", "done"),
+                           ("B8", "pulse-backend", "done"),
+                           ("B8", "pulse-frontend", "blocked"),
+                           ("B9", "pulse-backend", "blocked")):
+        store.record("state", rid(key, repo), f"pr-open->{end}")
+        store.upsert(rid(key, repo), state=end)
+    return cfg, store, prov
+
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg, _st, _prov = _bench_world(_tmp)
+    _logs = Path(_tmp) / "l"
+    _now = int(time.time())
+    _later = _now + 8 * 86400
+    _policy = _cfg.get("policy", {})
+    _cases, _out = _bench.load(_logs, _st, now=_later, policy=_policy)
+    _why = {c.name: c.why for c in _cases}
+    _b_checks.append(("the history ran as scripted",
+                      _prov.states.get("B2") == AIState.PLANNING
+                      and _prov.states.get("B3") == AIState.HUMAN_ONLY
+                      and len(list((_logs / "triage").glob("B3__*.json"))) == 2))
+    _b_checks.append(("history grades a merge, an answer, a reset and a verdict that stood",
+                      _why == {"B1__mycorp__triage-1": "merged",
+                               "B2__mycorp__triage-1": "answered",
+                               "B3__mycorp__triage-1": "reset",
+                               "B3__mycorp__triage-2": "stood",
+                               "B5__mycorp__triage-1": "stood",
+                               "B7__mycorp__triage-1": "merged",
+                               "B8__mycorp__triage-1": "merged in part"}))
+    _by = {c.name: c for c in _cases}
+    # Not _cases[:1]: two snapshots written in the same second sort by name, so
+    # which one is newest depends on where the clock ticked over.
+    _one = [_by["B8__mycorp__triage-1"]]
+    _b_checks.append(("what each outcome accepts",
+                      _by["B1__mycorp__triage-1"].expected == ["execute"]
+                      and _by["B2__mycorp__triage-1"].expected == ["clarify"]
+                      and _by["B3__mycorp__triage-1"].expected == ["execute", "clarify"]
+                      and _by["B5__mycorp__triage-1"].expected == ["human_only"]))
+    _b_checks.append(("the merged repos are the routing key; a partial merge has none",
+                      _by["B1__mycorp__triage-1"].repos == ["pulse-backend"]
+                      and _by["B7__mycorp__triage-1"].repos == ["pulse-backend", "pulse-frontend"]
+                      and _by["B8__mycorp__triage-1"].repos is None))
+    _b_checks.append(("what history cannot grade is left out, and counted",
+                      _out == {"the denylist decides it": 1, "still in flight": 1,
+                               "nobody answered": 1, "ended blocked": 1}))
+    _soon, _soon_out = _bench.load(_logs, _st, now=_now, policy=_policy)
+    _b_checks.append(("an unreset human_only only counts once it has stood a week",
+                      len(_soon) == 5 and _soon_out["too recent"] == 2))
+    _b_checks.append(("newest snapshot first",
+                      [int(c.snap["ts"]) for c in _cases]
+                      == sorted((int(c.snap["ts"]) for c in _cases), reverse=True)))
+    _b_checks.append(("--source keeps other workspaces out",
+                      _bench.load(_logs, _st, now=_later, policy=_policy,
+                                  sources=["elsewhere"])[0] == []))
+    _foreign = dict(_by["B1__mycorp__triage-1"].snap, ts=_now - 86400)
+    _b_checks.append(("a ledger from another history grades nothing",
+                      _bench.answer_key(_st.ticket_history(_foreign["row_id"]), _foreign,
+                                        now=_later, repo_of=_st.repo_of)[2] == "no history"))
+    _waived = dict(_by["B1__mycorp__triage-1"].snap)
+    _waived["task"] = dict(_waived["task"], title="prod database fix", tags=["ai-override"])
+    _b_checks.append(("today's denylist leaves a ticket out, the override tag lets it in",
+                      _bench._denylisted(dict(_waived, task=dict(_waived["task"], tags=[])), _policy)
+                      and not _bench._denylisted(_waived, _policy)))
+
+    # --- variants ------------------------------------------------------
+    _vfile = Path(_tmp) / "careful.md"
+    _vfile.write_text("CLASSIFY WITH CARE.\nReply with one JSON object.", encoding="utf-8")
+    _vs = _bench.variants(["fast", "sonnet"], [], default_model="sonnet")
+    _b_checks.append(("the baseline comes first, and asking for it again adds nothing",
+                      [v.label.split(" · ")[0] for v in _vs] == ["sonnet", "fast"]
+                      and _vs[0].model is None and _vs[0].system == _triage_mod.SYSTEM))
+    _vp = _bench.variants([], [str(_vfile)], default_model="sonnet")
+    _b_checks.append(("a prompt file is a variant on the configured model, labelled by its text",
+                      len(_vp) == 2 and _vp[1].model is None
+                      and _vp[1].label.startswith("sonnet · careful@")
+                      and _vp[1].sha != _vp[0].sha))
+    _vx = _bench.variants(["fast"], ["builtin", str(_vfile)], default_model="sonnet")
+    _b_checks.append(("models times prompts", len(_vx) == 3))
+    try:
+        _bench.variants([], [str(Path(_tmp) / "missing.md")], default_model="sonnet")
+        _bad_prompt = False
+    except ValueError as _e:
+        _bad_prompt = "cannot read prompt" in str(_e)
+    _b_checks.append(("a prompt file that cannot be read is refused up front", _bad_prompt))
+
+    # --- replay --------------------------------------------------------
+    _answers = {"B1": [_ex("pulse-backend")], "B2": [_CLARIFY], "B3": [_HUMAN],
+                "B5": [_HUMAN], "B7": [_ex("pulse-backend", "pulse-frontend")],
+                "B8": [_ex("pulse-backend", "pulse-frontend")]}
+
+    class _Variants(_TriageScript):
+        """The baseline answers as history did; `fast` asks about everything."""
+        def reason(self, prompt, *, max_turns=1, model=None, system_prompt=None):
+            if model == "fast":
+                self.calls.append({"key": prompt.split("Ticket: ", 1)[1].split(" ", 1)[0],
+                                   "model": model, "prompt": prompt})
+                return AgentResult(ok=True, cost_usd=self.cost, text=json.dumps(_CLARIFY))
+            return super().reason(prompt, max_turns=max_turns, model=model)
+
+    _ag = _Variants(_answers)
+    _repos_now = {(s.key, r["key"]): r for s in _cfg.sources() for r in s.repos}
+    _seen = []
+    _ev_before = _st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    _run, _run_stop = _bench.run(
+        _ag, _st, _cases, _vs, policy=_policy, repos_now=_repos_now, repeat=1, max_usd=5.0,
+        limits_check=lambda: None, secrets=[],
+        on_trial=lambda c, f, sp: _seen.append(f["variant"]))
+    _trials = [_bench.decode(t) for t in _st.bench_trials(_run)]
+    _sum = {r["variant"].split(" · ")[0]: r for r in _bench.summarize(_trials)}
+    _b_checks.append(("every variant on a ticket before the next ticket",
+                      all(a["key"] == b["key"] for a, b in zip(_ag.calls[::2], _ag.calls[1::2]))
+                      and [x["model"] for x in _ag.calls] == [None, "fast"] * 7
+                      and len(_seen) == 14))
+    _b_checks.append(("the baseline is graded against history, routing included",
+                      (_sum["sonnet"]["correct"], _sum["sonnet"]["n"]) == (6, 7)
+                      and (_sum["sonnet"]["routed_ok"], _sum["sonnet"]["routed_n"]) == (2, 2)
+                      and (_sum["sonnet"]["same"], _sum["sonnet"]["compared"]) == (7, 7)))
+    _b_checks.append(("a variant that always asks is right only where asking was",
+                      (_sum["fast"]["correct"], _sum["fast"]["n"]) == (2, 7)
+                      and _sum["fast"]["routed_n"] == 0 and _sum["fast"]["same"] == 1))
+    _b_checks.append(("every rate carries its range",
+                      _sum["sonnet"]["low"] is not None
+                      and _sum["sonnet"]["low"] < 6 / 7 < _sum["sonnet"]["high"]))
+    _ledger = [dict(r) for r in _st.conn.execute(
+        "SELECT * FROM events WHERE kind = 'bench' ORDER BY id")]
+    _b_checks.append(("each call is on the ledger as bench, with no task, so the limits see it",
+                      len(_ledger) == 14 and all(r["task_id"] is None for r in _ledger)
+                      and abs(sum(r["cost_usd"] for r in _ledger) - 0.14) < 1e-9
+                      and _st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                      == _ev_before + 14))
+    _b_checks.append(("a replay changes no ticket",
+                      _prov.states.get("B5") == AIState.HUMAN_ONLY
+                      and all(_st.get(r["task_id"])["state"] == r["state"]
+                              for r in [dict(x) for x in _st.conn.execute(
+                                  "SELECT task_id, state FROM tasks")])))
+    _r = _st.bench_run(_run)
+    _b_checks.append(("the run is closed with no note when it ran to the end",
+                      _r["finished"] is not None and _r["note"] is None and _r["cases"] == 7
+                      and _run_stop is None))
+    _miss = _bench.misses(_trials)
+    _b_checks.append(("misses are the trials that disagreed with history",
+                      len(_miss) == 6 and all(t["correct"] == 0 for t in _miss)))
+
+    # the prompt a variant replaces, and today's repo notes
+    _pv = _bench.variants([], [str(_vfile)], default_model="sonnet")[1:]
+    _ag2 = _Variants(_answers)
+    _bench.run(_ag2, _st, _one, _pv, policy=_policy, repos_now=_repos_now, repeat=1,
+               max_usd=5.0, limits_check=lambda: None, secrets=[])
+    _b_checks.append(("a prompt variant replaces the built-in prompt, not the ticket",
+                      _ag2.calls[0]["prompt"].startswith("CLASSIFY WITH CARE.")
+                      and _triage_mod.SYSTEM[:80] not in _ag2.calls[0]["prompt"]
+                      and "=== TICKET ===" in _ag2.calls[0]["prompt"]))
+    _cur = dict(_repos_now)
+    _cur[("mycorp", "pulse-backend")] = dict(_cur[("mycorp", "pulse-backend")],
+                                             notes="THE NEW NOTES")
+    _ag3 = _Variants(_answers)
+    _bench.run(_ag3, _st, _one,
+               _bench.variants([], [], default_model="sonnet", current_repos=True),
+               policy=_policy, repos_now=_cur, repeat=1, max_usd=5.0,
+               limits_check=lambda: None, secrets=[])
+    _ag4 = _Variants(_answers)
+    _bench.run(_ag4, _st, _one, _vs[:1], policy=_policy, repos_now=_cur, repeat=1,
+               max_usd=5.0, limits_check=lambda: None, secrets=[])
+    _b_checks.append(("--current-repos offers today's notes; without it, the snapshot's",
+                      "THE NEW NOTES" in _ag3.calls[0]["prompt"]
+                      and "THE NEW NOTES" not in _ag4.calls[0]["prompt"]))
+    _old_notes = next(r["notes"] for r in _one[0].snap["repos"]
+                      if r["key"] == "pulse-backend")
+    _gone = dict(_repos_now)
+    _gone[("mycorp", "pulse-backend")] = {
+        k: v for k, v in _gone[("mycorp", "pulse-backend")].items() if k != "notes"}
+    _ag9 = _Variants(_answers)
+    _bench.run(_ag9, _st, _one,
+               _bench.variants([], [], default_model="sonnet", current_repos=True),
+               policy=_policy, repos_now=_gone, repeat=1, max_usd=5.0,
+               limits_check=lambda: None, secrets=[])
+    _b_checks.append(("...and a note deleted from config is gone from the replay too",
+                      bool(_old_notes) and _old_notes not in _ag9.calls[0]["prompt"]
+                      and "- key: pulse-backend" in _ag9.calls[0]["prompt"]))
+
+    # caps and limits are checked before each case, never inside one
+    _ag5 = _Variants(_answers, cost=0.015)
+    _capped, _capped_stop = _bench.run(
+        _ag5, _st, _cases, _vs, policy=_policy, repos_now=_repos_now, repeat=1,
+        max_usd=0.02, limits_check=lambda: None, secrets=[])
+    _b_checks.append(("the cap stops between triage runs, leaving none half-compared",
+                      len(_st.bench_trials(_capped)) == 2
+                      and _capped_stop == "cap"
+                      and "stopped at the $0.02 cap after 1 of 7 triage runs"
+                      in _st.bench_run(_capped)["note"]))
+    _ag6 = _Variants(_answers)
+    _limited, _limited_stop = _bench.run(
+        _ag6, _st, _cases, _vs, policy=_policy, repos_now=_repos_now, repeat=1,
+        max_usd=5.0, secrets=[],
+        limits_check=lambda: "daily budget exhausted (20.00 / 20.00 USD)")
+    _b_checks.append(("the daily limits stop it before the first call",
+                      _ag6.calls == [] and _st.bench_trials(_limited) == []
+                      and _limited_stop == "limits"
+                      and "daily budget exhausted" in _st.bench_run(_limited)["note"]))
+    _ag7 = _Variants(_answers)
+    _rep = _bench.run(_ag7, _st, _cases[:2], _vs[:1], policy=_policy, repos_now=_repos_now,
+                      repeat=3, max_usd=5.0, limits_check=lambda: None, secrets=[])[0]
+    _b_checks.append(("--repeat asks each variant several times",
+                      [t["rep"] for t in _st.bench_trials(_rep)] == [1, 2, 3, 1, 2, 3]))
+
+    # a failed trial is counted beside the rate, never in it, and its spend kept
+    _ag8 = _TriageScript({"B8": ["no json here"]}, cost=0.03)
+    _bad = _bench.run(_ag8, _st, _one, _vs[:1], policy=_policy, repos_now=_repos_now,
+                      repeat=1, max_usd=5.0, limits_check=lambda: None,
+                      secrets=["sekrit-123"])[0]
+    _bt = [_bench.decode(t) for t in _st.bench_trials(_bad)]
+    _bs = _bench.summarize(_bt)[0]
+    _b_checks.append(("an unusable reply is an error that keeps its cost",
+                      _bt[0]["decision"] is None and "unusable" in (_bt[0]["error"] or "")
+                      and _bt[0]["cost_usd"] == 0.03
+                      and _bs["errors"] == 1 and _bs["n"] == 0 and _bs["accuracy"] is None))
+
+    class _Leaky(_TriageScript):
+        def reason(self, prompt, *, max_turns=1, model=None, system_prompt=None):
+            return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(
+                dict(_HUMAN, reasoning="token sekrit-123 is in the ticket")))
+
+    _leak = _bench.run(_Leaky({}), _st, _one, _vs[:1], policy=_policy,
+                       repos_now=_repos_now, repeat=1, max_usd=5.0,
+                       limits_check=lambda: None, secrets=["sekrit-123"])[0]
+    _b_checks.append(("a trial's reasoning is redacted before it is stored",
+                      "sekrit-123" not in (_st.bench_trials(_leak)[0]["reasoning"] or "")))
+
+    # --- the CLI -------------------------------------------------------
+    import argparse as _argparse
+    import contextlib as _ctx
+    from runner import cli as _cli
+
+    def _bcli(action, **kw):
+        ns = _argparse.Namespace(action=action, sources=None, models=[], prompts=[],
+                                 current_repos=False, limit=50, repeat=1, max_usd=5.0,
+                                 dry_run=False, id=None)
+        for k, v in kw.items():
+            setattr(ns, k, v)
+        out, err = io.StringIO(), io.StringIO()
+        with _ctx.redirect_stdout(out), _ctx.redirect_stderr(err):
+            rc = _cli._bench(_cfg, ns)
+        return rc, out.getvalue(), err.getvalue()
+
+    _cli_agent = _Variants(_answers)
+    _real_agent = _cli.ClaudeCodeAgent
+    _real_time = _cli.time.time
+    _cli.ClaudeCodeAgent = lambda acfg: _cli_agent
+    _cli.time.time = lambda: _later
+    try:
+        _rc_d, _out_d, _ = _bcli("triage", dry_run=True, models=["fast"])
+        _b_checks.append(("--dry-run shows the suite and what it would cost, and calls nothing",
+                          _rc_d == 0 and _cli_agent.calls == []
+                          and "7 past triage runs history can grade (of 11 snapshots" in _out_d
+                          and "merged 2" in _out_d and "1 the denylist decides it" in _out_d
+                          and "14 calls; triage averaged $0.0100 a call, so about $0.14"
+                          in _out_d and "nothing was called or recorded" in _out_d))
+        _rc_t, _out_t, _ = _bcli("triage", models=["fast"], limit=3)
+        _b_checks.append(("--limit replays the newest, and says so",
+                          "7 past triage runs history can grade" in _out_t
+                          and "replaying the newest 3" in _out_t))
+        _new = _st.bench_runs(1)[0]["id"]
+        _b_checks.append(("deputy bench triage replays, prints the table and records the run",
+                          _rc_t == 0 and len(_cli_agent.calls) == 6
+                          and "accuracy" in _out_t and "sonnet · builtin@" in _out_t
+                          and f"recorded as bench #{_new}" in _out_t))
+        _rc_s, _out_s, _ = _bcli("show", id=_new)
+        _b_checks.append(("deputy bench show lists where a variant disagreed with history",
+                          _rc_s == 0 and "where a variant disagreed with history" in _out_s
+                          and "fast · builtin@" in _out_s))
+        _rc_l, _out_l, _ = _bcli("list", limit=20)
+        _rc_p, _out_p, _ = _bcli("prompt")
+        _rc_x, _, _err_x = _bcli("show", id=99999)
+        _rc_v, _, _err_v = _bcli("triage", prompts=[str(Path(_tmp) / "nope.md")])
+        _b_checks.append(("list, prompt, and the errors a person can act on",
+                          _rc_l == 0 and f"#{_new}" in _out_l and "3 triage runs" in _out_l
+                          and _rc_p == 0 and _out_p.strip() == _triage_mod.SYSTEM.strip()
+                          and _rc_x == 1 and "no benchmark run 99999" in _err_x
+                          and _rc_v == 1 and "cannot read prompt" in _err_v))
+        _cfg.data["runner"]["limits"]["daily_budget_usd"] = 0.01
+        _calls = len(_cli_agent.calls)
+        _rc_b, _out_b, _ = _bcli("triage")
+        _b_checks.append(("deputy bench triage stops at the daily budget",
+                          _rc_b == 1 and len(_cli_agent.calls) == _calls
+                          and "daily budget exhausted" in _out_b))
+    finally:
+        _cli.ClaudeCodeAgent = _real_agent
+        _cli.time.time = _real_time
+
+# a human_only whose comment failed to post is retried by the tick, not reset
+class _FlakyComments(FakeProvider):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.fail = 1
+
+    def add_comment(self, tid, md):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("provider 502")
+        return super().add_comment(tid, md)
+
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg = Config.load("config.example.yaml")
+    _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                               log_dir=f"{_tmp}/l", brain_dir=f"{_tmp}/b")
+    _st = Store(f"{_tmp}/s.db")
+    _prov = _FlakyComments([mk("B20", "Renew the vendor contract", "talk to sales")])
+    _pipe = Pipeline(_cfg, _cfg.sources(only=["mycorp"])[0], _prov,
+                     _TriageScript({"B20": [_HUMAN]}), _st)
+    _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    _c, _o = _bench.load(Path(_tmp) / "l", _st, now=int(time.time()) + 8 * 86400,
+                         policy=_cfg.get("policy", {}))
+    _b_checks.append(("a human_only that never landed is retried, not graded as a reset",
+                      _prov.states.get("B20") == AIState.HUMAN_ONLY
+                      and [c.why for c in _c] == ["stood"]
+                      and _c[0].name == "B20__mycorp__triage-2"
+                      and _o == {"verdict not applied": 1}))
+
+
+# a two-repo route that failed part-way is not graded as a merge of one
+class _FlakyState(FakeProvider):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.fail = 1
+
+    def set_ai_state(self, tid, state):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("provider 502")
+        return super().set_ai_state(tid, state)
+
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg, _src = _two_repo_cfg(_tmp)
+    _cfg.data["runner"]["windows"]["execute"] = ["23:00-23:01"]
+    _st = Store(f"{_tmp}/s.db")
+    _prov = _FlakyState([mk("B21", "Export button", "endpoint plus a download button")])
+    Pipeline(_cfg, _src, _prov,
+             _TriageScript({"B21": [_ex("pulse-backend", "pulse-frontend")]}),
+             _st).tick(dt.datetime(2026, 8, 10, 7, 0))
+    _moved = [r["task_id"] for r in _st.conn.execute(
+        "SELECT task_id FROM events WHERE kind = 'state'")]
+    _st.record("state", _moved[0], "pr-open->done")
+    _st.upsert(_moved[0], state="done")
+    _c, _o = _bench.load(Path(_tmp) / "l", _st, now=int(time.time()) + 8 * 86400,
+                         policy=_cfg.get("policy", {}))
+    _b_checks.append(("a routed repo that never moved keeps the ticket in flight",
+                      len(_moved) == 1 and _moved[0] == rid("B21", "pulse-backend")
+                      and _st.get(rid("B21", "pulse-frontend"))["state"] == "new"
+                      and _c == [] and _o == {"still in flight": 1}))
+
+# triage keeps the spend of a reply it cannot use
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg = Config.load("config.example.yaml")
+    _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                               log_dir=f"{_tmp}/l", brain_dir=f"{_tmp}/b")
+    _st = Store(f"{_tmp}/s.db")
+    _prov = FakeProvider([mk("T400", "Some ticket", "x")])
+    Pipeline(_cfg, _cfg.sources(only=["mycorp"])[0], _prov,
+             _TriageScript({"T400": ["sorry, no JSON today"]}, cost=0.02),
+             _st).tick(dt.datetime(2026, 8, 10, 7, 0))
+    _line = _st.conn.execute(
+        "SELECT detail, cost_usd FROM events WHERE kind = 'triage'").fetchone()
+    _snap = next(iter((Path(_tmp) / "l" / "triage").glob("T400__*.json")), None)
+    _b_checks.append(("an unusable triage reply is on the ledger with its cost, and snapshotted",
+                      _line is not None and _line["detail"].startswith("failed: triage reply")
+                      and _line["cost_usd"] == 0.02 and _snap is not None
+                      and bool(json.loads(_snap.read_text())["error"])
+                      and bool(_st.get("mycorp:T400")["last_error"])))
+    try:
+        _triage_mod.triage(_TriageScript({"T401": ['{"decision": "execute", "confidence": "high"}']},
+                                         cost=0.02),
+                           mk("T401", "x", "y"), [], [], {})
+        _raised = None
+    except _StationError as _e:
+        _raised = _e
+    _b_checks.append(("...a malformed field too",
+                      _raised is not None and _raised.cost_usd == 0.02))
+
+for label, ok in _b_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 # --- a limit-terminated agent run says which limit ---------------------------
 print("\nfailed agent runs say why")
 from runner.agents.claude_code import _failure_reason

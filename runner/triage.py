@@ -85,7 +85,8 @@ actual code change is clear, scoped and doable from the repository.
 
 
 def _build_prompt(task: Task, comments: list[Comment],
-                  repos: list[dict[str, Any]], override: bool = False) -> str:
+                  repos: list[dict[str, Any]], override: bool = False,
+                  system: str = SYSTEM) -> str:
     thread = "\n".join(
         f"[{'AI' if c.is_bot else c.author}] {c.text.strip()}" for c in comments[-20:]
     ) or "(no comments)"
@@ -99,7 +100,7 @@ def _build_prompt(task: Task, comments: list[Comment],
             for r in repos
         ) + "\n"
     return (
-        f"{SYSTEM}\n\n=== TICKET ===\n{task.as_prompt_block()}\n"
+        f"{system}\n\n=== TICKET ===\n{task.as_prompt_block()}\n"
         f"=== REPOS ===\n{repo_note}\n=== COMMENT THREAD ===\n{thread}\n\n"
         f"{OVERRIDE_NOTE + chr(10) if override else ''}"
         "Return the JSON object now."
@@ -173,7 +174,16 @@ def _match_excerpt(task: Task, pattern: str,
 
 def triage(agent: CodingAgent, task: Task, comments: list[Comment],
            repos: list[dict[str, Any]] | dict[str, Any] | None,
-           policy: dict[str, Any]) -> tuple[TriageResult, float]:
+           policy: dict[str, Any], *, model: str | None = None,
+           system: str | None = None) -> tuple[TriageResult, Spend]:
+    """Classify and route one ticket.
+
+    `model` and `system` are the triage benchmark's variants: another model
+    for the `reason()` call, another text in place of `SYSTEM`. The tick
+    passes neither. Everything else -- the denylist, the override tag, the
+    post-conditions below -- is the same for both callers on purpose, so a
+    replayed verdict is the verdict the tick would have reached.
+    """
     # Callers used to pass a single repo dict (or None). Accept both shapes so
     # a stale caller routes to one repo instead of failing obscurely.
     if repos is None:
@@ -203,24 +213,33 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
             risk_flags=["policy-denylist"],
         ), Spend()
 
-    res = agent.reason(_build_prompt(task, comments, repos, override=override))
+    prompt = _build_prompt(task, comments, repos, override=override,
+                           system=SYSTEM if system is None else system)
+    # `model` only when asked for: the tick's call stays exactly the call it
+    # always was.
+    res = agent.reason(prompt, **({"model": model} if model else {}))
     if not res.ok:
         raise StationError(f"triage agent failed: {res.error}", Spend.of(res))
-    data = parse_json_object(res.text)
-
-    out = TriageResult(
-        decision=str(data.get("decision", "clarify")),
-        confidence=float(data.get("confidence", 0.0)),
-        scope=str(data.get("scope", "m")),
-        reasoning=str(data.get("reasoning", "")),
-        questions=[str(x) for x in data.get("questions", [])],
-        hints=[str(x) for x in data.get("hints", [])],
-        risk_flags=[str(x) for x in data.get("risk_flags", [])],
-        plan=[str(x) for x in data.get("plan", [])],
-        acceptance_criteria=[str(x) for x in data.get("acceptance_criteria", [])],
-        repo_keys=_pick_repos(data, repos),
-        policy_override=bool(hit and override),
-    )
+    try:
+        data = parse_json_object(res.text)
+        out = TriageResult(
+            decision=str(data.get("decision", "clarify")),
+            confidence=float(data.get("confidence", 0.0)),
+            scope=str(data.get("scope", "m")),
+            reasoning=str(data.get("reasoning", "")),
+            questions=[str(x) for x in data.get("questions", [])],
+            hints=[str(x) for x in data.get("hints", [])],
+            risk_flags=[str(x) for x in data.get("risk_flags", [])],
+            plan=[str(x) for x in data.get("plan", [])],
+            acceptance_criteria=[str(x) for x in data.get("acceptance_criteria", [])],
+            repo_keys=_pick_repos(data, repos),
+            policy_override=bool(hit and override),
+        )
+    except (ValueError, TypeError) as exc:
+        # The run happened and was paid for; only its answer is unusable.
+        # As a StationError it carries that spend to the ledger, where a bare
+        # ValueError used to drop it on the floor -- along with the snapshot.
+        raise StationError(f"triage reply was unusable: {exc}", Spend.of(res)) from exc
 
     # Post-conditions the model does not get to override.
     min_conf = float(policy.get("min_execute_confidence", 0.75))

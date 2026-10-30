@@ -14,7 +14,7 @@ PR through CI/review until merge.
 ```
 runner/
   __init__.py  cli.py  config.py  graph.py  models.py  pipeline.py  state.py  triage.py  vcs.py
-  analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py  improve.py
+  analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py  improve.py  bench.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
   providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
   web/       __init__.py  api.py  db.py  logs.py  static/ (committed build output)
@@ -52,6 +52,8 @@ deputy graph                      # print the live transition table as Mermaid
 deputy score NAME [--run ID] [--record]   # judge real runs with one scorer; records nothing by default
 deputy improve list|show ID|accept ID|reject ID [--reason ..]   # proposed brain notes
 deputy improve run --repo KEY             # one improve run now, skipping the "is it due" check
+deputy bench triage [--model M] [--prompt FILE] [--dry-run]   # replay past triage runs, graded by history
+deputy bench list|show [ID]|prompt       # past benchmark runs; the built-in triage prompt
 python3 tests_smoke.py                    # offline state-machine tests (fake provider + fake agent)
 ```
 
@@ -214,6 +216,11 @@ six effectively independent seams:
   change nothing. `improve_model` falls back to `agent.model`. Like the analyst it is
   `work()`, not `reason()`, and deliberately not isolated: the repo's own `CLAUDE.md`
   is what it needs to see to avoid proposing what is already written down.
+
+The triage benchmark is not a seventh seam. `deputy bench triage` calls
+`triage.triage()` itself with `model=` and `system=` overrides, which reach
+`reason(model=...)` and stand in for `triage.SYSTEM` in the rendered prompt;
+the isolation, the system prompt and the post-conditions are triage's own.
 
 `triage_model` falls back to `model` when unset. `allowed_tools` includes `Agent`, which
 is what permits `work()` to dispatch subagents — the tool is named `Agent`, not `Task`.
@@ -709,7 +716,7 @@ Invariants, each easy to undo by accident:
 - **Scoring spend is on the ledger, not the row.** `score_run` records kind
   `score` with `task_id` NULL: it counts against both daily limits (and every
   judge call is behind `_budget_available`), shows in the grey overhead band on
-  the Spend chart (shared with `improve` runs), and stays out of a PR's cost and out of `runs_recorded()`. It is
+  the Spend chart (shared with `improve` and `bench` runs), and stays out of a PR's cost and out of `runs_recorded()`. It is
   not in `_RUN_KINDS`, so judges do not appear on the Runs tab.
 - **One path for the tick and the CLI.** `scorers.score_run()` is what both
   `Pipeline._score_runs()` and `deputy score` call, so a verdict tried at the
@@ -794,7 +801,7 @@ accident:
   `runner.log_dir` named by `agent_log_name(source, repo, "improve-N")`. It
   counts against both daily limits, `_budget_available` is checked before
   each run, and it is not in `_RUN_KINDS`. It shares the grey overhead band
-  with `score` on the Spend chart, and the Improvements tab's cost reads the
+  with `score` and `bench` on the Spend chart, and the Improvements tab's cost reads the
   same ledger lines by run time, never the proposal rows (which are dated by
   decision and keep an old pending one whatever the range).
 - **`improve.settings()` never raises.** It runs in `Pipeline.__init__`,
@@ -813,10 +820,87 @@ accident:
 - **One path for the tick and the CLI.** `deputy improve run` builds the same
   `improve.Context` and calls `run_for_repo()`; it skips `due()` on purpose
   (it is how an operator sees what the station makes of their history before
-  turning it on) and never `limits_exceeded()`.
+  turning it on), but never `limits_exceeded()`.
 - **Brain notes only, for now.** `target` is always `brain`. Opening a PR
   against the target repo's own `CLAUDE.md` was considered and deferred; the
   column exists so it can be added without a migration.
+
+### Benchmarks
+
+`runner/bench.py` replays past triage runs under other models or prompts and
+grades each call against what happened to the ticket. It answers "should
+triage switch model or prompt" with the developer's own tickets. Invariants,
+each easy to undo by accident:
+
+- **The inputs are the snapshots, never the provider.** Each case is one file
+  `_snapshot_triage` wrote. Re-fetching the ticket would hand the model the
+  replies written after triage ran, including the answers to its own
+  questions. Nothing in `bench.py` builds a provider.
+- **History is the answer key, and only where it can say.** `answer_key()`
+  reads the ticket's ledger (`Store.ticket_history`: the placeholder's events
+  plus every `{id}#{repo}` row's, which outlive a reset that deleted the rows)
+  between this triage run and the next. Execute whose routed rows all reached
+  `done` wants execute and those repos (`merged`); execute with some `done`
+  wants execute and has no routing key (`merged in part`); a clarify whose
+  placeholder went `needs-input->new` before another run wants clarify
+  (`answered`); a human_only followed by another run was reset by a human and
+  wants anything else (`reset`); a human_only nobody reset for
+  `SETTLED_AFTER` stands (`stood`). Both human_only grades need the
+  placeholder's `->human-only` move in between: a verdict comment that failed
+  to post leaves the row `new`, and the tick's own retry is not a reset. Both
+  execute grades need a move from every repo in the snapshot's `repo_keys`:
+  `_route()` creates every row before it moves any, so a provider error
+  part-way leaves one at `new` with no event, and the repos that did move
+  would read as the whole ticket. Every other snapshot is left out and
+  counted by reason. A grade on a guess would be worse than no grade.
+- **A snapshot is matched to its ledger line by run number and time.** The
+  `n`th triage event on the placeholder, within `SNAPSHOT_SLACK` of the
+  snapshot. A database recreated since has other history under the same ids,
+  and grading against it would grade someone else's outcome.
+- **The tick's own triage, varied in two places.** Every trial is
+  `triage.triage(..., model=, system=)`, so the denylist, the override tag,
+  `min_execute_confidence`, `block_large_scope` and `_pick_repos` all apply as
+  in production. A ticket today's denylist stops is left out: no variant
+  decides it. A prompt variant replaces `triage.SYSTEM` only; the ticket, the
+  repos and the comments are rendered by `_build_prompt` as always.
+  `--current-repos` takes `language` and `notes` from today's config whole,
+  absent where config has none, so a deleted hint does not ride along from
+  the snapshot; a repo gone from config keeps what triage saw.
+- **The baseline is always first.** `variants()` starts with the configured
+  triage model and the built-in prompt, then every model × prompt asked for,
+  without repeats. A prompt's label carries a hash of its text, so an edited
+  file is a new variant rather than the old name on a new prompt.
+- **Variant by variant within a case, case by case across the run.** The
+  `--max-usd` cap and `pipeline.limits_exceeded()` (passed in as
+  `limits_check`, so `bench.py` never imports `pipeline`) are checked before
+  each case, never inside one: a stopped run still compares every variant on
+  the same cases. `run()` returns why it stopped; the CLI exits non-zero only
+  for the daily limits or an interrupt, since the cap is the person's choice.
+- **Spend is on the ledger, not a row.** Kind `bench`, `task_id` NULL, one
+  line per call. It counts against both daily limits, shares the grey
+  overhead band with `score` and `improve`, and is not in `_RUN_KINDS`. It is
+  never part of the tick: `doctor`-like, operator-run, and spends only when
+  asked.
+- **A failed call never moves accuracy.** It is recorded with `decision`
+  NULL and its spend, and `summarize()` counts it beside the rate. An
+  unusable reply is a `StationError` carrying the run's spend: `triage()`
+  converts a parse failure itself, which also put the tick's own unparseable
+  triage replies on the ledger and in a snapshot, where a bare `ValueError`
+  had dropped both.
+- **One summary for the terminal and the tab.** `bench.summarize()` is what
+  `deputy bench` prints and what `Reader.bench()` returns, and both use
+  `models.wilson` for the range, so they cannot disagree. `db.py` may import
+  `bench` because it imports nothing heavier than `triage`.
+- **Redacted before it is stored**, and again by `Reader.bench()` on the way
+  out. A database from before benchmarks has no tables; that is an empty
+  answer, as with scores.
+- **Routing is only judged with a choice.** With one candidate `_pick_repos`
+  never consults the model, so a routing rate over single-repo tickets would
+  be 100% by construction.
+
+The implementation benchmark (replaying merged tickets at `meta.base_sha` in
+a scratch worktree) is not built. It would live outside the tick in the same
+way, and `bench_runs.suite` exists so it can share the tables.
 
 `runner/web/static/` is committed build output, not source. `web/vite.config.ts`
 points `build.outDir` at it directly rather than the default `web/dist`,

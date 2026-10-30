@@ -318,6 +318,7 @@ deputy run --source acme            # limit to one workspace
 deputy status                       # what is in flight, across sources
 deputy score NAME                   # try a scorer on the latest runs (see Scorers)
 deputy improve list                 # brain notes proposed for you (see Improvements)
+deputy bench triage --dry-run       # what a triage benchmark would replay (see Benchmarks)
 python3 tests_smoke.py                      # offline state-machine tests
 ```
 
@@ -404,6 +405,62 @@ run that fails spends no evidence; the tick leaves that repo alone for a day.
 Accepting goes through the brain's size cap: at the cap nothing is written and
 the proposal stays pending until you prune the brain and accept again.
 
+## Benchmarks
+
+Should triage run on haiku instead of sonnet? Would a stricter prompt ask
+fewer pointless questions? A benchmark answers that with your own tickets
+instead of a hunch. It replays past triage runs under each variant and grades
+every call against what actually happened to the ticket:
+
+| What happened next | The right call was |
+|---|---|
+| Triage said execute and every repo it chose merged | execute, to those repos |
+| Triage asked a question and someone answered | clarify |
+| Triage said human_only and someone set AI State back to `new` | anything but human_only |
+| Triage said human_only and nobody reset it for a week | human_only |
+
+Everything else is left out and counted, because history does not say what the
+right call was: a question nobody answered, a ticket still in flight, an execute
+that ended blocked or came back after a rejected plan. So is a ticket today's
+denylist stops before the model sees it.
+
+```bash
+deputy bench triage --dry-run                  # the suite, the answer key, the estimated cost
+deputy bench triage --model haiku              # the configured model and prompt, then haiku
+deputy bench prompt > careful.md               # start a prompt variant from the built-in one
+deputy bench triage --prompt careful.md        # ... and replay it on the configured model
+deputy bench triage --model haiku --model opus --prompt builtin --prompt careful.md
+deputy bench triage --current-repos            # offer today's repo notes, not the ones triage saw
+deputy bench list                              # recent runs
+deputy bench show 3                            # one run, and every call that disagreed with history
+```
+
+The configured triage model with the built-in prompt is always the first
+variant, the baseline. `--model` and `--prompt` add every combination of the
+ones you name. A prompt file replaces the classification instructions only;
+the ticket, the repos and the comments are rendered exactly as triage
+renders them, and the denylist, the override tag and the confidence and
+scope checks apply as they do in the tick. A prompt is labelled with a hash of
+its text, so an edited file shows up as a new variant.
+
+The inputs are the snapshots triage keeps under `{runner.log_dir}/triage/`,
+which hold the ticket as triage saw it, so replies written afterwards never
+leak into the replay. Tickets triaged before snapshots existed cannot be
+replayed; the suite grows as tickets finish.
+
+For each variant you get accuracy against history with its 95% range and n,
+routing accuracy on tickets that offered more than one repo, how often it
+agreed with what triage decided at the time, failed calls (counted beside
+accuracy, never in it) and the average cost and tokens per call. The
+Benchmarks tab on the dashboard shows the same numbers.
+
+It never runs in the tick. Each call is on the ledger, so it counts toward
+the daily limits, which it respects, and `--max-usd` (default 5) stops it
+from starting another triage run once that much is spent. Both are checked
+between triage runs, never in the middle of one, so a stopped benchmark still
+compares every variant on the same tickets. `--limit` (default 50) replays
+the newest; `--repeat N` asks each variant N times per run.
+
 ## Dashboard
 
 ```bash
@@ -424,11 +481,12 @@ acting on the runner stays in the task manager and the CLI.
 | Runs | Every agent run: station, outcome, wall time, turns, the model that answered (⚠ when it differs from the one requested), tokens, cost; click one to open its log. `#id` is what `deputy score --run` takes |
 | Scorers | Per scorer: pass rate with its 95% range and n, passed/failed, insufficient evidence and judge errors beside it, judging cost; pass rate by day; every verdict with the judge's reasoning, opening the run's log |
 | Improvements | Proposed brain notes waiting for you, with the evidence they cite (each opens that run's log) and the commands to accept or reject them; the acceptance rate with its 95% range; runs that proposed nothing, and why |
-| Spend, Throughput | Tokens and dollars per station per day, with judging and improve runs as one grey overhead band; outcomes and cycle times |
+| Benchmarks | Per `deputy bench` run: each variant's accuracy against history with its 95% range, next to its average cost per call; routing, agreement with the original call, failed calls and the models that answered; every call that disagreed with history, with its reasoning |
+| Spend, Throughput | Tokens and dollars per station per day, with judging, improve and benchmark runs as one grey overhead band; outcomes and cycle times |
 | Graph | The live state machine as a table |
 
 The date range (7, 14, 30 or 90 days) applies to Flow, Runs, Scorers,
-Improvements, Spend and Throughput. A row's detail sheet shows its history as lanes on one time axis —
+Improvements, Benchmarks, Spend and Throughput. A row's detail sheet shows its history as lanes on one time axis —
 the state it was in, the PR milestones, one bar per agent run — above the same
 history as a list.
 
@@ -438,9 +496,9 @@ rather than a guess. Stage times come from ticks, so they are only as precise
 as the cron interval.
 
 Triage also keeps what it saw and what it decided, redacted, under
-`{runner.log_dir}/triage/` — one JSON file per triage run. Nothing reads them
-yet; they are the inputs a later triage benchmark replays. Prune them by hand
-like any other log.
+`{runner.log_dir}/triage/` — one JSON file per triage run. They are what
+`deputy bench triage` replays, so pruning them shrinks the benchmark; prune
+them by hand like any other log.
 
 `serve` refuses to start against a missing or unusable database rather than
 serving a dashboard full of zeros — those are indistinguishable from a runner

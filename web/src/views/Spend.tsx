@@ -14,11 +14,13 @@ const round2 = (v: number) => Math.round(v * 100) / 100;
 /** One chart row: the day label plus one numeric field per station kind. */
 type SpendRow = Record<string, string | number>;
 
-// The judges' runs (ledger kind `score`) and the improve station's
-// (`improve`), stacked on top as one band in the neutral tone: overhead on the
-// work, not a sixth station, so it takes no series slot. One band, not two,
-// because two bands in the same neutral tone could not be told apart.
-const OVERHEAD: Record<string, string> = { score: "scoring", improve: "improving" };
+// The judges' runs (ledger kind `score`), the improve station's (`improve`)
+// and `deputy bench` calls (`bench`), stacked on top as one band in the
+// neutral tone: overhead on the work, not a sixth station, so it takes no
+// series slot. One band, not three, because bands in the same neutral tone
+// could not be told apart.
+const OVERHEAD: Record<string, string> = {
+  score: "scoring", improve: "improving", bench: "benchmarking" };
 const OVER = "overhead";
 
 export function Spend({ days = 30 }: { days?: number }) {
@@ -44,9 +46,9 @@ export function Spend({ days = 30 }: { days?: number }) {
     return out;
   });
 
-  // Overhead only joins the stack once a judge or an improve run has spent
-  // something, so a setup with neither keeps the five-station legend it has
-  // always had; the band's name says which of the two it holds.
+  // Overhead only joins the stack once one of them has spent something, so a
+  // setup with none keeps the five-station legend it has always had; the
+  // band's name says which of them it holds.
   const seen = Object.keys(OVERHEAD).filter((k) => data.days.some((d) => d.kinds?.[k]));
   const overName = seen.map((k) => OVERHEAD[k]).join(" + ");
   const kinds: readonly string[] = seen.length ? [...STATIONS, OVER] : STATIONS;

@@ -195,6 +195,14 @@ def build_app(cfg: Config) -> FastAPI:
         out["settings"] = improve_settings
         return out
 
+    @app.get("/api/bench")
+    def bench_runs(days: int = 30) -> dict[str, Any]:
+        r = reader()
+        try:
+            return r.bench(days)
+        finally:
+            r.close()
+
     @app.get("/api/graph")
     def state_graph() -> dict[str, Any]:
         # Structured, so the UI can render a table without a diagram engine.

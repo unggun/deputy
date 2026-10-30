@@ -927,6 +927,81 @@ else:
               and on["settings"]["min_evidence"] == 3
               and on["settings"]["max_age_days"] == 7)
 
+# --- benchmarks ---------------------------------------------------------------
+print("\nbenchmarks")
+from runner import bench as _bench_mod
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    st.upsert("acme:50#api", source="acme", provider_task_id="50", task_key="DEV-50",
+              title="exported", state="done", repo_key="api")
+    rid = st.start_bench("triage", [{"label": "sonnet · builtin@aaaaaaaa"},
+                                    {"label": "haiku · builtin@aaaaaaaa"}], 2)
+    common = dict(case_name="DEV-50__acme__triage-1", task_id="acme:50", task_key="DEV-50",
+                  why="merged", expected=["execute"], expected_repos=["api"],
+                  recorded="execute", rep=1)
+    st.record_trial(rid, variant="sonnet · builtin@aaaaaaaa", decision="execute",
+                    repos=["api"], correct=1, routed=1, cost_usd=0.01, tokens=100, **common)
+    st.record_trial(rid, variant="haiku · builtin@aaaaaaaa", decision="clarify",
+                    repos=["api"], correct=0, routed=None, cost_usd=0.002, tokens=90,
+                    reasoning="the token ghp_abcdefghijklmnopqrstuvwxyz0123456789 is odd",
+                    **common)
+    st.record_trial(rid, variant="haiku · builtin@aaaaaaaa", decision=None, repos=[],
+                    correct=None, routed=None, error="triage agent failed: timeout",
+                    cost_usd=0.001, tokens=10,
+                    **dict(common, case_name="DEV-51__acme__triage-1", task_id="acme:51",
+                           task_key="DEV-51", why="answered", expected=["clarify"],
+                           expected_repos=None, recorded="clarify"))
+    st.finish_bench(rid, "stopped at the $0.01 cap after 2 of 2 tickets")
+    st.start_bench("triage", [], 0)              # killed: never finished
+    out = Reader(path, limits={}).bench(7)
+    run = next(r for r in out["runs"] if r["id"] == rid)
+    by = {v["variant"]: v for v in run["variants"]}
+    check("bench runs list newest first, a killed one included",
+          [r["id"] for r in out["runs"]] == [rid + 1, rid]
+          and out["runs"][0]["finished"] is None)
+    check("each variant is summarised by the CLI's own function",
+          run["variants"] == _bench_mod.summarize(
+              [_bench_mod.decode(t) for t in st.bench_trials(rid)]))
+    check("a failed trial sits beside the accuracy, never in it",
+          (by["haiku · builtin@aaaaaaaa"]["n"], by["haiku · builtin@aaaaaaaa"]["errors"])
+          == (1, 1) and by["sonnet · builtin@aaaaaaaa"]["accuracy"] == 1.0)
+    check("a run's cost is the sum of its trials",
+          abs(run["cost_usd"] - 0.013) < 1e-9 and run["tokens"] == 200)
+    miss = run["misses"]
+    check("misses are the disagreements, linked to a row the sheet can open",
+          len(miss) == 1 and miss[0]["decision"] == "clarify"
+          and miss[0]["open_id"] == "acme:50#api" and miss[0]["title"] == "exported"
+          and miss[0]["expected"] == ["execute"])
+    check("a miss's reasoning is redacted on the way out",
+          "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (miss[0]["reasoning"] or ""))
+    check("the note says why a run stopped",
+          run["note"] == "stopped at the $0.01 cap after 2 of 2 tickets")
+    st.record("bench", None, "#1 DEV-50 sonnet: execute", 0.01, 100)
+    kinds = set()
+    for d in Reader(path, limits={}).spend_by_day(7):
+        kinds |= set(d["kinds"])
+    check("benchmark spend shows in the spend chart as its own kind", "bench" in kinds)
+    check("...and never as a run on the Runs tab",
+          all(r["kind"] != "bench" for r in Reader(path, limits={}).runs(7)))
+
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TABLE bench_trials")
+    raw.commit()
+    raw.close()
+    check("a database from before benchmarks is an empty answer, not an error",
+          Reader(path, limits={}).bench(7) == {"runs": []})
+
+if _TC is not None:
+    with tempfile.TemporaryDirectory() as tmp:
+        Store(f"{tmp}/s.db")
+        cfg = _C(data={"runner": {"db_path": f"{tmp}/s.db", "log_dir": f"{tmp}/l",
+                                  "limits": {}}, "vcs_profiles": {}, "sources": []},
+                 source_path=Path(tmp) / "config.yaml")
+        check("/api/bench answers with no runs yet",
+              _TC(_api.build_app(cfg)).get("/api/bench?days=7").json() == {"runs": []})
+
 # --- numbered station logs ----------------------------------------------------
 from runner.models import run_station
 with tempfile.TemporaryDirectory() as tmp:
