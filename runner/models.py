@@ -316,3 +316,31 @@ def run_station(station: str, n: int) -> str:
     if station == "fix" or n > 1:
         return f"{station}-{max(n, 1)}"
     return station
+
+
+def run_outcome(kind: str, detail: str | None) -> tuple[str, bool]:
+    """(one-word outcome, failed?) for an agent run's ledger line.
+
+    Every station writes `failed: ...` when its agent run itself failed.
+    Otherwise implement and fix write `ok` or the error (fix prefixed with
+    its cause, `ci: ok`), and the rest write their verdict.
+
+    Shared by the dashboard's Runs tab and the scoring phase, which skips
+    failed runs, so "failed" cannot mean two things.
+    """
+    text = (detail or "").strip()
+    if text.startswith("failed"):
+        return "failed", True
+    if kind in ("implement", "fix"):
+        result = text.split(": ", 1)[1] if kind == "fix" and fix_cause(text) else text
+        return ("ok", False) if result == "ok" else ("failed", True)
+    if kind == "triage":
+        return text.split(" ", 1)[0] or "?", False
+    return text or "?", False
+
+
+def fix_cause(detail: str | None) -> set[str] | None:
+    """`{"ci"}`, `{"feedback"}`, both, or None for a line that predates causes."""
+    head, sep, _ = (detail or "").partition(": ")
+    parts = set(head.split("+")) if sep else set()
+    return parts if parts and parts <= {"ci", "feedback"} else None

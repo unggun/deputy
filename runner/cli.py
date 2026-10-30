@@ -9,11 +9,11 @@ import sys
 import time
 from pathlib import Path
 
-from . import brain, graph, providers, vcs
+from . import brain, graph, providers, scorers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .models import AgentResult, AIState
-from .pipeline import Pipeline
+from .pipeline import Pipeline, limits_exceeded
 from .state import Store
 
 BOT_MARKER_DEFAULT = "<!-- ai-runner -->"
@@ -168,6 +168,19 @@ def _doctor(cfg: Config) -> int:
             log.info("  brain %-17s %d/%d bytes%s", repo["key"], size, cap,
                      "  (at cap — prune it)" if size >= cap else "")
 
+    # Scorers: list what will be judged, and fail on a file that will not
+    # load -- the tick skips it with a warning nobody reads.
+    sdir = cfg.get("runner.scorers_dir", scorers.DEFAULT_DIR)
+    found, errors = scorers.load(sdir)
+    if not found and not errors:
+        log.info("scorers: none in %s (scoring is off)", sdir)
+    for sc in found:
+        log.info("scorer %-24s %s, %d%% sampled, labels %s (passes at %g)",
+                 sc.name, "/".join(sc.stations), sc.sample_rate,
+                 ", ".join(f"{k}={v:g}" for k, v in sc.labels.items()),
+                 sc.pass_score)
+    problems += [f"scorer {e}" for e in errors]
+
     # Every ticket now costs a review run, and scope-gated ones a planning run
     # too. On subscription auth that spend is invisible to daily_budget_usd.
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -198,6 +211,108 @@ def _doctor(cfg: Config) -> int:
             log.error("%s", p)
         return 1
     log.info("all good — mode=%s", cfg.get("runner.mode"))
+    return 0
+
+
+def _score(cfg: Config, name: str, run_ids: list[int], last: int,
+           record: bool) -> int:
+    """Judge real runs with one scorer and print the verdicts.
+
+    For writing a rubric: point it at a draft file and the runs it should
+    pass and fail, read the reasoning, edit, repeat. Nothing is recorded
+    unless `record` is set, and then exactly as the tick would record it
+    (claimed first, so a run already judged is reported, not judged again).
+    The judge's spend goes on the ledger either way, so the daily limits see
+    it.
+    """
+    sdir = cfg.get("runner.scorers_dir", scorers.DEFAULT_DIR)
+    path = Path(name).expanduser()
+    try:
+        if path.suffix == ".md" and path.is_file():
+            sc = scorers.parse(path.read_text(encoding="utf-8"), path)
+        else:
+            found, errors = scorers.load(sdir)
+            sc = next((s for s in found if s.name == name), None)
+            if sc is None:
+                print(f"no scorer named {name} in {sdir}"
+                      + (f" ({len(errors)} file(s) failed to load; run "
+                         f"`deputy doctor`)" if errors else ""), file=sys.stderr)
+                return 1
+    except (OSError, ValueError) as exc:
+        print(f"{name}: {exc}", file=sys.stderr)
+        return 1
+
+    store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
+
+    def row_of(ev: dict) -> dict:
+        return store.get(ev["task_id"] or "") or {}
+
+    if run_ids:
+        found_runs = [store.event(i) for i in run_ids]
+        missing = [i for i, ev in zip(run_ids, found_runs) if ev is None]
+        if missing:
+            print(f"no run with id {', '.join(map(str, missing))}", file=sys.stderr)
+            return 1
+        runs = [ev for ev in found_runs if ev]
+        # The scorer's own scope applies here exactly as in the tick: a
+        # verdict on a run the scorer does not cover would land in its pass
+        # rate with `--record`, and tells a rubric author nothing without it.
+        refusals = [
+            f"{sc.name} judges {'/'.join(sc.stations)} runs; run {ev['id']} "
+            f"is a {ev['kind']} run" for ev in runs if not sc.judges(ev["kind"])
+        ] + [
+            f"{sc.name} covers {', '.join(sc.repos)}; run {ev['id']} is in "
+            f"{row_of(ev).get('repo_key')}" for ev in runs if not sc.covers(row_of(ev))
+        ] + [
+            f"run {ev['id']} failed, and the tick never records a verdict on a "
+            f"failed run" for ev in runs if record and not scorers.judgeable(ev)
+        ]
+        if refusals:
+            print(refusals[0], file=sys.stderr)
+            return 1
+    else:
+        runs = [ev for ev in store.recent_runs(sc.stations, 500)
+                if scorers.judgeable(ev) and sc.covers(row_of(ev))][:last]
+        if not runs:
+            print(f"no finished {'/'.join(sc.stations)} runs with a log yet")
+            return 0
+
+    agent = ClaudeCodeAgent(cfg.get("agent", {}) or {})
+    repos = {(src.key, r["key"]): r for src in cfg.sources() for r in src.repos}
+    secrets: list[str] = []
+    for repo in repos.values():
+        try:
+            secrets.extend(vcs.profile_env(cfg.profile_for_repo(repo)).values())
+        except Exception:  # noqa: BLE001
+            continue
+    log_root = Path(str(cfg.get("runner.log_dir", "~/.deputy/logs"))).expanduser()
+    limits = cfg.get("runner.limits", {}) or {}
+    for ev in runs:
+        # Operator-run, but it spends the same quota: held to the same daily
+        # limits as the tick, checked before every judge call.
+        spent = limits_exceeded(store, limits, dt.datetime.now())
+        if spent:
+            print(f"{spent}; not judging further runs today", file=sys.stderr)
+            return 1
+        row = row_of(ev)
+        verdict = scorers.score_run(
+            agent, store, sc, ev, log_root=log_root,
+            repo=repos.get((row.get("source"), row.get("repo_key"))),
+            model=(cfg.get("agent", {}) or {}).get("scorer_model"),
+            record=record, secrets=secrets)
+        head = (f"run {ev['id']}  {row.get('task_key') or ev['task_id']} "
+                f"{row.get('repo_key') or ''} {ev['log']}")
+        if verdict is None:
+            print(f"{head}\n  already judged by {sc.name}; not judged again\n")
+            continue
+        mark = ("" if verdict.passed is None
+                else " PASS" if verdict.passed else " FAIL")
+        cost = (f"  ${verdict.spend.cost_usd:.4f}, {verdict.spend.tokens:,} tokens"
+                if verdict.spend else "  (no judge run)")
+        score = "" if verdict.score is None else f" ({verdict.score:g})"
+        print(f"{head}\n  {verdict.label}{score}{mark}{cost}\n  {verdict.reasoning}\n")
+    if not record:
+        print("not recorded; pass --record to store these verdicts")
     return 0
 
 
@@ -278,6 +393,16 @@ def main(argv: list[str] | None = None) -> int:
     daemon.add_argument("--dry-run", action="store_true")
     sub.add_parser("status", help="show in-flight tasks")
     sub.add_parser("graph", help="print the workflow state graph as Mermaid")
+    score = sub.add_parser(
+        "score", help="judge real runs with one scorer (for writing rubrics)")
+    score.add_argument("scorer", help="a scorer name, or the path of a .md file")
+    score.add_argument("--run", type=int, action="append", dest="runs", default=[],
+                       metavar="ID", help="ledger id of a run (repeatable; the "
+                       "Runs and Scorers tabs show it)")
+    score.add_argument("--last", type=int, default=3,
+                       help="without --run, judge this many recent runs")
+    score.add_argument("--record", action="store_true",
+                       help="store the verdicts, as the tick would")
     serve = sub.add_parser("serve", help="read-only dashboard on localhost")
     serve.add_argument("--port", type=int, default=8787)
     serve.add_argument("--host", default="127.0.0.1")
@@ -296,7 +421,9 @@ def main(argv: list[str] | None = None) -> int:
     # be exported before it will start is a credential demand with nothing
     # behind it, and it blocks the dashboard in exactly the interactive shell
     # where cron's environment is absent.
-    cfg = Config.load(args.config, require_env=(args.cmd != "serve"))
+    # `score` reads the store and the logs and calls the agent; like
+    # `serve`, it never builds a provider.
+    cfg = Config.load(args.config, require_env=(args.cmd not in ("serve", "score")))
     _logging(cfg, args.verbose)
     log = logging.getLogger("cli")
 
@@ -318,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "serve":
         return _serve(cfg, args.host, args.port, not args.no_open)
+
+    if args.cmd == "score":
+        return _score(cfg, args.scorer, args.runs, max(1, args.last), args.record)
 
     if args.force:
         cfg.data.setdefault("runner", {})["windows"] = {

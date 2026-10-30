@@ -55,6 +55,27 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source, state);
 CREATE INDEX IF NOT EXISTS idx_tasks_ticket ON tasks(source, provider_task_id);
+-- One verdict per (scorer, agent run). `label` is NULL while a judge holds
+-- the claim, `insufficient_evidence` or `error` when there is no score.
+CREATE TABLE IF NOT EXISTS scores (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,       -- claimed at, then judged at
+    scorer     TEXT NOT NULL,
+    event_id   INTEGER NOT NULL,       -- events.id of the run judged
+    task_id    TEXT,
+    station    TEXT,                   -- events.kind
+    log        TEXT,                   -- events.log
+    label      TEXT,
+    score      REAL,
+    passed     INTEGER,
+    pass_score REAL,
+    reasoning  TEXT,
+    cost_usd   REAL NOT NULL DEFAULT 0,
+    tokens     INTEGER NOT NULL DEFAULT 0,
+    model      TEXT,
+    UNIQUE (scorer, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_scores_ts ON scores(ts);
 CREATE TABLE IF NOT EXISTS posted_comments (
     idempotency_key TEXT PRIMARY KEY,
     task_id TEXT,
@@ -255,6 +276,98 @@ class Store:
             "SELECT COALESCE(SUM(tokens), 0) s FROM events WHERE ts >= ?", (epoch,)
         ).fetchone()
         return int(row["s"])
+
+    # --- scores ---------------------------------------------------------
+    # A claim older than this with no label belongs to a judge that died
+    # (a killed tick). Twice `reason()`'s own 300 s timeout, so a live judge
+    # is never reclaimed from under itself.
+    SCORE_CLAIM_TTL = 600
+
+    def claim_score(self, scorer: str, event_id: int, *, task_id: str | None,
+                    station: str | None, log: str | None) -> bool:
+        """Take the right to judge one run. False if it is judged or held.
+
+        Claimed before the judge runs, like `claim_comment`, so two
+        overlapping ticks cannot both pay for the same verdict. A stale
+        unlabelled claim is retaken rather than left to block the run forever.
+        """
+        now = _now()
+        cur = self.conn.execute(
+            "INSERT INTO scores (ts, scorer, event_id, task_id, station, log)"
+            " VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(scorer, event_id) DO UPDATE SET ts = excluded.ts"
+            " WHERE scores.label IS NULL AND scores.ts < ?",
+            (now, scorer, int(event_id), task_id, station, log,
+             now - self.SCORE_CLAIM_TTL))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def finish_score(self, scorer: str, event_id: int, *, label: str,
+                     score: float | None, passed: bool | None,
+                     pass_score: float | None, reasoning: str,
+                     cost_usd: float = 0.0, tokens: int = 0,
+                     model: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE scores SET ts = ?, label = ?, score = ?, passed = ?,"
+            " pass_score = ?, reasoning = ?, cost_usd = ?, tokens = ?, model = ?"
+            " WHERE scorer = ? AND event_id = ?",
+            (_now(), label, score, None if passed is None else int(passed),
+             pass_score, reasoning[:4000], cost_usd, int(tokens), model,
+             scorer, int(event_id)))
+        self.conn.commit()
+
+    def unscored_runs(self, scorer: str, source: str, kinds: list[str],
+                      since: int) -> list[dict[str, Any]]:
+        """Runs of `kinds` on `source` since `since` that `scorer` has not
+        judged, newest first. Only runs with a log: no transcript, no verdict.
+        """
+        ph = ",".join("?" * len(kinds))
+        prefix = f"{source}:"
+        rows = self.conn.execute(
+            "SELECT e.* FROM events e LEFT JOIN scores s"
+            "   ON s.event_id = e.id AND s.scorer = ?"
+            f" WHERE e.kind IN ({ph}) AND e.log IS NOT NULL AND e.ts >= ?"
+            "   AND substr(e.task_id, 1, ?) = ?"
+            "   AND (s.id IS NULL OR (s.label IS NULL AND s.ts < ?))"
+            " ORDER BY e.ts DESC, e.id DESC",
+            (scorer, *kinds, int(since), len(prefix), prefix,
+             _now() - self.SCORE_CLAIM_TTL)).fetchall()
+        return [dict(r) for r in rows]
+
+    def routed_after(self, task_id: str, event_id: int) -> bool:
+        """Whether triage routed `task_id` again after ledger line `event_id`.
+
+        `_route()` replaces a row's `meta` as it moves the row out of `new`
+        into `planning` or `queued`: on a re-triage after a rejected plan, and
+        on a human reset, which deletes the row but keeps its events. A run
+        recorded before that was given a plan the row no longer holds. Ids,
+        not timestamps: the ledger is append-only, and a fast tick records a
+        run and the next transition inside the same second.
+        """
+        routed = [f"{AIState.NEW.value}->{s.value}"
+                  for s in (AIState.PLANNING, AIState.QUEUED)]
+        return self.conn.execute(
+            "SELECT 1 FROM events WHERE task_id = ? AND kind = 'state' AND id > ?"
+            " AND detail IN (?, ?) LIMIT 1",
+            (task_id, int(event_id), *routed)).fetchone() is not None
+
+    def last_scored(self) -> dict[str, int]:
+        """When each scorer last claimed a run: who has waited longest."""
+        return {r["scorer"]: int(r["ts"]) for r in self.conn.execute(
+            "SELECT scorer, MAX(ts) ts FROM scores GROUP BY scorer")}
+
+    def event(self, event_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM events WHERE id = ?", (int(event_id),)).fetchone()
+        return dict(row) if row else None
+
+    def recent_runs(self, kinds: list[str], limit: int) -> list[dict[str, Any]]:
+        """The latest runs of `kinds` that left a log, newest first."""
+        ph = ",".join("?" * len(kinds))
+        rows = self.conn.execute(
+            f"SELECT * FROM events WHERE kind IN ({ph}) AND log IS NOT NULL"
+            " ORDER BY ts DESC, id DESC LIMIT ?", (*kinds, int(limit))).fetchall()
+        return [dict(r) for r in rows]
 
     # --- comment idempotency -------------------------------------------
     def claim_comment(self, key: str, task_id: str) -> bool:

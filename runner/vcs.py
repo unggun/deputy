@@ -356,6 +356,17 @@ def pr_commits(wt: Path, number: int,
             if isinstance(c, dict) and c.get("oid")]
 
 
+def pr_size(wt: Path, number: int,
+            env: dict[str, str] | None = None) -> dict[str, int]:
+    """Lines added and deleted, and files changed, as GitHub counts the PR."""
+    out = run(["gh", "pr", "view", str(number), "--json",
+               "additions,deletions,changedFiles"], cwd=wt, env=env).stdout
+    data = json.loads(out)
+    return {"additions": int(data.get("additions") or 0),
+            "deletions": int(data.get("deletions") or 0),
+            "files": int(data.get("changedFiles") or 0)}
+
+
 def first_human_activity(wt: Path, number: int, allowlist: list[str],
                          env: dict[str, str] | None = None) -> tuple[str, str] | None:
     """(ISO time, login) of the earliest human review, comment or reaction.

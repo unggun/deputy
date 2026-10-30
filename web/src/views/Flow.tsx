@@ -143,6 +143,38 @@ export function Flow({ days, onOpen }: { days: number; onOpen: (id: string) => v
       </div>
 
       <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base">Cost per merged PR, by size</CardTitle></CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader><TableRow>
+              <TableHead>lines changed</TableHead><TableHead>PRs</TableHead>
+              <TableHead>median cost</TableHead><TableHead>median tokens</TableHead>
+              <TableHead>total cost</TableHead>
+            </TableRow></TableHeader>
+            <TableBody>
+              {s.cost_by_size.map((b) => (
+                <TableRow key={b.size} className="tabular-nums">
+                  <TableCell className="font-mono text-xs">{b.size}</TableCell>
+                  <TableCell>{b.n}</TableCell>
+                  <TableCell>{b.median_cost_usd == null ? "—" : `$${b.median_cost_usd.toFixed(2)}`}</TableCell>
+                  <TableCell>{b.median_tokens == null ? "—" : Math.round(b.median_tokens).toLocaleString()}</TableCell>
+                  <TableCell>${b.total_cost_usd.toFixed(2)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Size is additions plus deletions on the PR as merged, as GitHub
+            counts them. Cost is the row's own plan, implement, review and fix
+            runs; triage covers the whole ticket and judging is overhead, so
+            neither is charged to one PR. "unknown" is a PR merged before size
+            was recorded.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
         <CardHeader className="pb-2"><CardTitle className="text-base">Merged PRs</CardTitle></CardHeader>
         <CardContent>
           <Table>
@@ -151,7 +183,8 @@ export function Flow({ days, onOpen }: { days: number; onOpen: (id: string) => v
               <TableHead>total</TableHead><TableHead>to PR</TableHead>
               <TableHead>PR to review</TableHead><TableHead>review to merge</TableHead>
               <TableHead>waiting</TableHead><TableHead>touches</TableHead>
-              <TableHead>autonomous</TableHead>
+              <TableHead>autonomous</TableHead><TableHead>lines</TableHead>
+              <TableHead>cost</TableHead>
             </TableRow></TableHeader>
             <TableBody>
               {rows.map((r) => (
@@ -180,6 +213,8 @@ export function Flow({ days, onOpen }: { days: number; onOpen: (id: string) => v
                                     + ` · ${r.fix_feedback} PR fixes · ${r.human_commits ?? "?"} commits`}>
                     {touches(r)}{r.human_commits == null && "+?"}</TableCell>
                   <TableCell><Autonomous v={r.autonomous} /></TableCell>
+                  <TableCell>{r.lines == null ? "—" : r.lines.toLocaleString()}</TableCell>
+                  <TableCell>${r.cost_usd.toFixed(2)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

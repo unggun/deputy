@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import analyst, brain, graph, review, vcs
+from . import analyst, brain, graph, review, scorers, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
 from .jsonio import StationError
@@ -37,6 +37,26 @@ def _midnight_epoch(now: dt.datetime) -> int:
     return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
+def limits_exceeded(store: Store, limits: dict[str, Any],
+                    now: dt.datetime) -> str | None:
+    """The daily-limit gate itself; see `Pipeline._limits_exceeded`.
+
+    Module-level so `deputy score`, which spends without a pipeline, is held
+    to the same two limits by the same code.
+    """
+    midnight = _midnight_epoch(now)
+    budget = float(limits.get("daily_budget_usd", 20))
+    spent = store.spend_since(midnight)
+    if spent >= budget:
+        return f"daily budget exhausted ({spent:.2f} / {budget:.2f} USD)"
+    cap = int(limits.get("daily_tokens", 0) or 0)
+    if cap:
+        used = store.tokens_since(midnight)
+        if used >= cap:
+            return f"daily token cap exhausted ({used:,} / {cap:,} tokens)"
+    return None
+
+
 class Pipeline:
     def __init__(self, cfg: Config, source: Source, provider: TaskProvider,
                  agent: CodingAgent, store: Store, dry_run: bool = False) -> None:
@@ -58,6 +78,13 @@ class Pipeline:
         # Lazily gathered on first use: building it touches every vcs
         # profile, and a shadow-mode tick may never need one.
         self._secrets: list[str] | None = None
+        # No directory, or no files in it, is the off switch: nothing is
+        # judged and nothing is spent. Bad files are skipped; `doctor` names
+        # them.
+        self.scorers, errors = scorers.load(
+            cfg.get("runner.scorers_dir", scorers.DEFAULT_DIR))
+        for err in errors:
+            log.warning("scorer skipped: %s", err)
 
     # --- source-scoped helpers ----------------------------------------
     def _row_id(self, provider_task_id: str, repo_key: str | None = None) -> str:
@@ -148,6 +175,12 @@ class Pipeline:
         # 2. Triage new tickets.
         if _in_window(now, windows.get("triage", [])):
             self._triage_new()
+
+        # 3. Judge finished runs. Last on purpose: it moves no ticket, so it
+        #    only ever gets the budget the work left over.
+        if self.scorers and _in_window(
+                now, windows.get("score", windows.get("triage", []))):
+            self._score_runs(now)
 
     # ==================================================================
     def _triage_new(self) -> None:
@@ -972,6 +1005,50 @@ class Pipeline:
             log.warning("[%s] could not remove planning worktree %s",
                        row.get("task_key"), wt, exc_info=True)
 
+    # --- scoring -------------------------------------------------------
+    def _score_runs(self, now: dt.datetime) -> None:
+        """Judge up to `limits.max_scores_per_run` finished runs.
+
+        Scorers take turns, newest runs first, so one scorer with a backlog
+        cannot take every slot -- and the turn order starts with whichever
+        scorer has waited longest, read from the store, so a cap smaller than
+        the number of scorers rotates across ticks instead of giving the
+        first file every slot every time. Each judge call is budget-checked
+        like every other agent run, and each run is claimed before it is
+        judged, so a crash or an overlapping tick never pays twice for one
+        verdict.
+        """
+        cap = int(self.limits.get("max_scores_per_run", 5) or 0)
+        if cap <= 0:
+            return
+        since = int(now.timestamp()) - 86400 * int(
+            self.limits.get("score_lookback_days", 14) or 14)
+        last = self.store.last_scored()
+        queues = [[(sc, ev) for ev in self.store.unscored_runs(
+                       sc.name, self.source.key, sc.stations, since)
+                   if scorers.sampled(sc, ev["id"]) and scorers.judgeable(ev)]
+                  for sc in sorted(self.scorers, key=lambda sc: last.get(sc.name, 0))]
+        judged = 0
+        while judged < cap and any(queues):
+            for queue in queues:
+                if judged >= cap or not queue:
+                    continue
+                sc, ev = queue.pop(0)
+                row = self.store.get(ev["task_id"] or "")
+                if not row or not row.get("repo_key") or not sc.covers(row):
+                    continue
+                if not self._budget_available(now):
+                    return
+                verdict = scorers.score_run(
+                    self.agent, self.store, sc, ev, log_root=self.log_root,
+                    repo=self.source.repo_by_key(row["repo_key"]),
+                    model=self.acfg.get("scorer_model"),
+                    secrets=self._known_secrets())
+                if verdict is not None:
+                    judged += 1
+                    log.info("[%s] %s on %s: %s", row.get("task_key"),
+                             sc.name, ev["log"], verdict.label)
+
     # --- helpers -------------------------------------------------------
     def _limits_exceeded(self, now: dt.datetime) -> str | None:
         """Which daily limit, if any, is spent. Returns a reason or None.
@@ -984,17 +1061,7 @@ class Pipeline:
         same units as the quota, so it is the limit that bites on the setup
         most people actually have. Whichever trips first stops the tick.
         """
-        midnight = _midnight_epoch(now)
-        budget = float(self.limits.get("daily_budget_usd", 20))
-        spent = self.store.spend_since(midnight)
-        if spent >= budget:
-            return f"daily budget exhausted ({spent:.2f} / {budget:.2f} USD)"
-        cap = int(self.limits.get("daily_tokens", 0) or 0)
-        if cap:
-            used = self.store.tokens_since(midnight)
-            if used >= cap:
-                return f"daily token cap exhausted ({used:,} / {cap:,} tokens)"
-        return None
+        return limits_exceeded(self.store, self.limits, now)
 
     def _budget_available(self, now: dt.datetime) -> bool:
         """Re-checked immediately before every agent run (analyst, implementer,
@@ -1121,8 +1188,16 @@ class Pipeline:
         own = set(meta.get("own_commits") or [])
         on_pr = self._measure("pr-commits", vcs.pr_commits, wt, number, env=env)
         if not own or meta.get("own_commits_incomplete") or on_pr is None:
-            return "human_commits=?"
-        return f"human_commits={sum(1 for sha in on_pr if sha not in own)}"
+            detail = "human_commits=?"
+        else:
+            detail = f"human_commits={sum(1 for sha in on_pr if sha not in own)}"
+        # The PR's size as merged, human commits included: what the Flow tab
+        # buckets cost by. Absent, not zero, when GitHub cannot say.
+        size = self._measure("pr-size", vcs.pr_size, wt, number, env=env)
+        if size:
+            detail += (f" additions={size['additions']} deletions={size['deletions']}"
+                       f" files={size['files']}")
+        return detail
 
     def _note_first_review(self, rid: str, meta: dict[str, Any], wt: Path,
                            number: int, allowlist: list[str],

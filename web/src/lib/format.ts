@@ -33,7 +33,7 @@ export function median(values: number[]): number | null {
   return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
 }
 
-/** Mirror of `db._outcome`'s failed flag, for ledger lines the sheet renders
+/** Mirror of `models.run_outcome`'s failed flag, for ledger lines the sheet renders
  *  without going through `/api/runs`. */
 export function runFailed(kind: string, detail: string | null | undefined): boolean {
   const text = (detail ?? "").trim();

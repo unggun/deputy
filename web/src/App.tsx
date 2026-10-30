@@ -5,6 +5,7 @@ import { Overview } from "@/views/Overview";
 import { Board } from "@/views/Board";
 import { Flow } from "@/views/Flow";
 import { Runs } from "@/views/Runs";
+import { Scorers } from "@/views/Scorers";
 import { Spend } from "@/views/Spend";
 import { Throughput } from "@/views/Throughput";
 import { GraphTab } from "@/views/GraphTab";
@@ -15,7 +16,7 @@ const qc = new QueryClient();
 const RANGES = [7, 14, 30, 90] as const;
 // Overview, Board and Graph show the present, not a window; the range picker
 // says so by going inert there rather than appearing to filter them.
-const RANGED = new Set(["flow", "runs", "spend", "throughput"]);
+const RANGED = new Set(["flow", "runs", "scorers", "spend", "throughput"]);
 
 export default function App() {
   const [tab, setTab] = useState("overview");
@@ -35,6 +36,7 @@ export default function App() {
               <TabsTrigger value="board">Board</TabsTrigger>
               <TabsTrigger value="flow">Flow</TabsTrigger>
               <TabsTrigger value="runs">Runs</TabsTrigger>
+              <TabsTrigger value="scorers">Scorers</TabsTrigger>
               <TabsTrigger value="spend">Spend</TabsTrigger>
               <TabsTrigger value="throughput">Throughput</TabsTrigger>
               <TabsTrigger value="graph">Graph</TabsTrigger>
@@ -55,6 +57,7 @@ export default function App() {
           <TabsContent value="board"><Board onOpen={onOpen} /></TabsContent>
           <TabsContent value="flow"><Flow days={days} onOpen={onOpen} /></TabsContent>
           <TabsContent value="runs"><Runs days={days} onOpen={onOpen} /></TabsContent>
+          <TabsContent value="scorers"><Scorers days={days} onOpen={onOpen} /></TabsContent>
           <TabsContent value="spend"><Spend days={days} /></TabsContent>
           <TabsContent value="throughput"><Throughput days={days} /></TabsContent>
           <TabsContent value="graph"><GraphTab /></TabsContent>

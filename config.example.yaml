@@ -14,12 +14,18 @@ runner:
   work_dir: ~/.deputy/work    # isolated git worktrees live here
   log_dir: ~/.deputy/logs
   brain_dir: ~/.deputy/brain  # durable per-repo notes, one .md per repo
+  # Scorer files (a rubric each) that judge finished plan/implement/review/fix
+  # runs from their logs. No directory, or no files in it, means scoring is
+  # off and costs nothing. Starters are in examples/scorers/; try one with
+  # `deputy score NAME` before copying it in.
+  # scorers_dir: ~/.deputy/scorers
   bot_marker: "<!-- ai-runner -->"
   days: [mon, tue, wed, thu, fri]
   windows:                   # local time; the OS scheduler fires every 15 min
     advance: ["07:00-20:00"] # PR/CI polling — cheap, no LLM
     triage:  ["06:30-08:30", "11:00-12:00", "14:00-15:30"]
     execute: ["06:30-16:00"] # hard stop so every PR gets same-day review time
+    # score: [...]           # when scorers judge runs; defaults to `triage`
   limits:
     max_active_tasks: 3      # across ALL sources — this caps load on this laptop
     max_new_triage_per_run: 10
@@ -40,6 +46,11 @@ runner:
     daily_tokens: 0
     brain_max_bytes: 8000    # per-repo note file cap; at the cap appends are
                              # refused and logged, never silently evicted
+    # Judge runs per tick, across all scorers, and how far back to look for
+    # runs not yet judged. Each judge is one tool-less turn on the scorer's
+    # model, counted against both daily limits like any other agent run.
+    max_scores_per_run: 5
+    score_lookback_days: 14
 
 agent:
   type: claude_code
@@ -58,6 +69,9 @@ agent:
   # the implementer if you can afford it: catching a bad change is worth more
   # than writing one slightly faster.
   reviewer_model: sonnet
+  # The scoring judge, unless a scorer file names its own `model:`. Falls back
+  # to `triage_model`: it is the same one-turn, tool-less, isolated call.
+  # scorer_model: haiku
   max_turns: 60
   permission_mode: dontAsk
   timeout_minutes: 45

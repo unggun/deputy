@@ -14,6 +14,12 @@ const round2 = (v: number) => Math.round(v * 100) / 100;
 /** One chart row: the day label plus one numeric field per station kind. */
 type SpendRow = Record<string, string | number>;
 
+// The judges' own runs (ledger kind `score`), stacked on top in the neutral
+// tone: overhead on the work, not a sixth station, so it takes no series slot.
+const SCORING = "score";
+const KINDS = [...STATIONS, SCORING] as const;
+const label = (k: string) => (k === SCORING ? "scoring" : k);
+
 export function Spend({ days = 30 }: { days?: number }) {
   const { data, isError, error } = useSpend(days);
   const m = useColorMode();
@@ -27,20 +33,23 @@ export function Spend({ days = 30 }: { days?: number }) {
   // which is the truth.
   const rows: SpendRow[] = data.days.map((d) => {
     const out: SpendRow = { day: d.day.slice(5) };
-    for (const s of STATIONS) {
+    for (const s of KINDS) {
       out[`${s}_tok`] = d.kinds?.[s]?.tokens ?? 0;
       out[`${s}_usd`] = round2(d.kinds?.[s]?.cost_usd ?? 0);
     }
     return out;
   });
 
+  // Scoring only joins the stack once a judge has run, so a setup with no
+  // scorers keeps the five-station legend it has always had.
+  const kinds = data.days.some((d) => d.kinds?.[SCORING]) ? KINDS : STATIONS;
   const bars = (suffix: "tok" | "usd") =>
-    STATIONS.map((s, i) => (
-      <Bar key={s} dataKey={`${s}_${suffix}`} name={s} stackId="a"
-           fill={SERIES[m][i]}
+    kinds.map((s, i) => (
+      <Bar key={s} dataKey={`${s}_${suffix}`} name={label(s)} stackId="a"
+           fill={s === SCORING ? MUTED : SERIES[m][i]}
            // 2px surface gap between stacked segments.
            stroke={SURFACE[m]} strokeWidth={2}
-           radius={i === STATIONS.length - 1 ? [4, 4, 0, 0] : 0} />
+           radius={i === kinds.length - 1 ? [4, 4, 0, 0] : 0} />
     ));
 
   const axis = { stroke: MUTED, fontSize: 11, tickLine: false, axisLine: false };
@@ -50,8 +59,8 @@ export function Spend({ days = 30 }: { days?: number }) {
       {/* Tokens and dollars are different scales. Two charts, one x-range --
           never one chart with two y-axes. */}
       <ChartFrame title="Tokens per day, by station"
-        columns={["day", ...STATIONS]}
-        rows={rows.map((r) => [r.day, ...STATIONS.map((s) => r[`${s}_tok`])])}>
+        columns={["day", ...kinds.map(label)]}
+        rows={rows.map((r) => [r.day, ...kinds.map((s) => r[`${s}_tok`])])}>
         <ResponsiveContainer width="100%" height={240}>
           <BarChart data={rows}>
             <CartesianGrid stroke={GRID[m]} vertical={false} />
@@ -65,9 +74,9 @@ export function Spend({ days = 30 }: { days?: number }) {
       </ChartFrame>
 
       <ChartFrame title="Spend per day, by station"
-        columns={["day", ...STATIONS]}
+        columns={["day", ...kinds.map(label)]}
         rows={rows.map((r) => [r.day,
-                               ...STATIONS.map((s) => Number(r[`${s}_usd`]).toFixed(2))])}>
+                               ...kinds.map((s) => Number(r[`${s}_usd`]).toFixed(2))])}>
         <ResponsiveContainer width="100%" height={240}>
           <BarChart data={rows}>
             <CartesianGrid stroke={GRID[m]} vertical={false} />

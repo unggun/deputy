@@ -45,7 +45,15 @@ export type FlowRow = {
   title: string | null; pr_url: string | null; pr_number: number | null;
   done_at: number; in_state: Record<string, number>;
   human_commits: number | null; autonomous: boolean | null;
+  // Lines changed on the merged PR (additions + deletions), null when GitHub
+  // could not say; `size` is its bucket. Cost is the row's own runs.
+  lines: number | null; size: string; cost_usd: number; tokens: number;
 } & Record<FlowStage, number | null> & Record<Touch, number>;
+
+export type SizeBucket = {
+  size: string; n: number; median_cost_usd: number | null;
+  median_tokens: number | null; total_cost_usd: number;
+};
 
 export type FlowData = {
   rows: FlowRow[];
@@ -58,7 +66,39 @@ export type FlowData = {
     autonomy: { known: number; autonomous: number; rate: number | null };
     touches: Record<Touch, number>;
     human_commits: number;
+    cost_by_size: SizeBucket[];
   };
+};
+
+/** One scorer's verdicts in the window. `rate` is over passed + failed only;
+ *  `low`/`high` are its 95% Wilson interval, null with no scored runs. */
+export type ScoreCard = {
+  scorer: string; stations: string[];
+  n: number; passed: number; failed: number;
+  insufficient: number; errors: number; pending: number;
+  rate: number | null; low: number | null; high: number | null;
+  cost_usd: number; tokens: number; labels: Record<string, number>;
+  trend: { day: string; passed: number; failed: number }[];
+};
+
+export type ScoreResult = {
+  id: number; event_id: number; run_ts: number; scorer: string;
+  station: string | null; log: string | null;
+  label: string | null; score: number | null; passed: boolean | null;
+  reasoning: string | null;
+  task_id: string; open_id: string | null; task_key: string | null;
+  repo_key: string | null; title: string | null;
+  cost_usd: number; tokens: number; model: string | null;
+};
+
+export type ConfiguredScorer = {
+  name: string; stations: string[]; labels: Record<string, number>;
+  pass_score: number; sample_rate: number; repos: string[];
+};
+
+export type ScoresData = {
+  cards: ScoreCard[]; results: ScoreResult[];
+  configured: ConfiguredScorer[]; errors: string[]; scorers_dir: string;
 };
 
 export type Overview = {
@@ -175,6 +215,11 @@ export const useRuns = (days = 30) =>
 export const useFlow = (days = 30) =>
   useQuery({ queryKey: ["flow", days],
              queryFn: () => get<FlowData>(`/api/flow?days=${days}`),
+             refetchInterval: 30000 });
+
+export const useScores = (days = 30) =>
+  useQuery({ queryKey: ["scores", days],
+             queryFn: () => get<ScoresData>(`/api/scores?days=${days}`),
              refetchInterval: 30000 });
 
 export type GraphTransition = { from: string; to: string; label: string };

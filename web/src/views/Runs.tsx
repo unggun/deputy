@@ -177,7 +177,9 @@ export function Runs({ days, onOpen }: {
                       </div>
                       {r.title && <div className="truncate text-xs">{r.title}</div>}
                     </TableCell>
-                    <TableCell className="font-mono text-xs">{r.log ?? r.kind}</TableCell>
+                    {/* The ledger id is what `deputy score NAME --run ID` takes. */}
+                    <TableCell className="font-mono text-xs">{r.log ?? r.kind}
+                      <span className="ml-1 text-muted-foreground">#{r.id}</span></TableCell>
                     <TableCell className="text-xs"><Outcome r={r} /></TableCell>
                     <TableCell>{measured(r) ? duration(r.duration_ms / 1000) : "—"}</TableCell>
                     <TableCell>{measured(r) ? r.turns : "—"}</TableCell>
