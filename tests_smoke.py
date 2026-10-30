@@ -2790,7 +2790,9 @@ try:
         _mv.diff_stat = lambda *a, **k: "1 file changed"
         _mv.create_pr = lambda *a, **k: (7, "http://pr/7")
         _mv.remove_worktree = lambda *a, **k: None
-        _mv.merge_base = lambda *a, **k: "fork0"
+        # A fresh branch's HEAD is its fork point; tracking that starts there
+        # is complete.
+        _mv.merge_base = lambda *a, **k: "base0"
         # Each implement pass adds one commit on top of whatever HEAD was.
         _mv.head_sha = lambda *a, **k: next(_heads)
         _mv.commits_since = lambda wt, since, env=None: [f"after-{since}"]
@@ -2817,7 +2819,7 @@ try:
         _m_checks.append(("the requested model is recorded beside it",
                           all(x["model_requested"] for x in _runs)))
         _m_checks.append(("the fork point is kept for replays",
-                          _meta.get("base_sha") == "fork0"))
+                          _meta.get("base_sha") == "base0"))
         _m_checks.append(("each push's own commits are remembered",
                           _meta.get("own_commits") == ["after-base0", "after-impl1"]))
         _snaps = list((Path(_tmp) / "l" / "triage").glob("*.json"))
@@ -2870,7 +2872,8 @@ try:
                           and _merged["detail"] == "human_commits=1"
                           and _store.get(rid("T70"))["state"] == AIState.DONE.value))
 
-    # A bot's approval alone is not a human review: nothing is latched.
+    # A bot's approval alone is not a human review: nothing is latched --
+    # neither a review app's APPROVED decision nor its thumbs-up reaction.
     with tempfile.TemporaryDirectory() as _tmp:
         _cfg = Config.load("config.example.yaml")
         _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
@@ -2887,7 +2890,7 @@ try:
             "review_decision": "APPROVED", "ci": "passing",
             "failed_checks": [], "url": "http://pr/8"}
         _mv.human_feedback = lambda *a, **k: []
-        _mv.approving_reactions = lambda *a, **k: []
+        _mv.approving_reactions = lambda *a, **k: ["chatgpt-codex-connector[bot]"]
         _mv.first_human_activity = lambda *a, **k: None
         _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
         _n = _store.conn.execute(
@@ -2910,6 +2913,52 @@ try:
         _m_checks.append(("a merge whose commits cannot be read is unknown",
                           _d is not None and _d["detail"] == "human_commits=?"
                           and _store.get(rid("T71"))["state"] == AIState.DONE.value))
+
+    # A PR opened before SHA tracking: its first tracked push is a fix, so
+    # the original implementation's commits were never recorded as the
+    # runner's. The merge must stay unknown, not count them as a human's.
+    # It is also reviewed and merged between two ticks, so the first human
+    # review is only findable on the merged path.
+    with tempfile.TemporaryDirectory() as _tmp:
+        _cfg = Config.load("config.example.yaml")
+        _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                                   log_dir=f"{_tmp}/l", mode="execute")
+        _src = _cfg.sources(only=["mycorp"])[0]
+        _task = mk("T72", "x", "y")
+        _store = Store(f"{_tmp}/s.db")
+        _pipe = Pipeline(_cfg, _src, FakeProvider([_task]), FakeAgent({}), _store)
+        _store.upsert(rid("T72"), source="mycorp", provider_task_id="T72",
+                      task_key="T72", repo_key="pulse-backend", branch="ai/t72",
+                      state=AIState.PR_OPEN.value, pr_number=9, meta={})
+        _st = {"state": "OPEN", "merged": False, "draft": False,
+               "review_decision": None, "ci": "failing",
+               "failed_checks": ["lint"], "url": "http://pr/9"}
+        _mv.pr_status = lambda *a, **k: dict(_st)
+        _mv.human_feedback = lambda *a, **k: []
+        _mv.approving_reactions = lambda *a, **k: []
+        _mv.first_human_activity = lambda *a, **k: None
+        _mv.head_sha = lambda *a, **k: "old-impl"
+        _mv.commits_since = lambda wt, since, env=None: [f"after-{since}"]
+        _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        _meta = json.loads(_store.get(rid("T72"))["meta"])
+        _m_checks.append(("tracking that starts after the fork is incomplete",
+                          _meta.get("own_commits") == ["after-old-impl"]
+                          and _meta.get("own_commits_incomplete") is True))
+
+        _st.update(merged=True, state="MERGED", ci="passing")
+        _mv.pr_commits = lambda *a, **k: ["old-impl", "after-old-impl"]
+        _mv.first_human_activity = lambda *a, **k: ("2026-08-10T06:30:00Z", "erin")
+        _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        _d = _store.conn.execute(
+            "SELECT detail FROM events WHERE kind = 'pr_merged'").fetchone()
+        _m_checks.append(("a pre-tracking PR's merge is unknown, not human",
+                          _d is not None and _d["detail"] == "human_commits=?"))
+        _rv = _store.conn.execute(
+            "SELECT detail, ts FROM events WHERE kind = 'pr_review'").fetchone()
+        _m_checks.append(("a review and merge between ticks still records the review",
+                          _rv is not None and _rv["detail"] == "erin"
+                          and _rv["ts"] == int(dt.datetime(
+                              2026, 8, 10, 6, 30, tzinfo=dt.timezone.utc).timestamp())))
 finally:
     for _n_, _f_ in _m_real.items():
         setattr(_mv, _n_, _f_)

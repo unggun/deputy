@@ -599,13 +599,22 @@ the obvious version measured the wrong thing.
   and append `rev-list before..HEAD` to `meta.own_commits` after the push; at
   merge, `_merge_detail()` counts PR commits not in that list. If any capture
   failed, `meta.own_commits_incomplete` makes the answer `?` instead of a guess.
+  Coverage has to start at the fork: the first note is complete only when the
+  pre-run HEAD *is* the fork point, so a PR implemented before tracking existed
+  does not have its original runner commits counted as a human's on its first
+  fix pass.
   `meta.base_sha` is the merge-base the first run forked from, kept for a
   later benchmark that needs to replay a ticket against the code it saw.
 - **The first human review latches once**, into `meta.first_review_at`, and
   only for a human: `vcs.first_human_activity()` never counts a `[bot]` login
-  and honours the reviewer allowlist. A bot's `APPROVED` review decision with
-  no human activity found does not latch — it would otherwise record the
-  bot's approval as the start of human review.
+  and honours the reviewer allowlist. A bot's `APPROVED` review decision or
+  thumbs-up reaction with no human activity found does not latch — it would
+  otherwise record the bot's approval as the start of human review.
+  `approving_reactions()` keeps bots on purpose (a Codex 👍 means "nothing to
+  flag"), so the poll filters `[bot]` logins itself before treating a reaction
+  as evidence of a person. The merged path asks GitHub once too, before the
+  row goes terminal: a PR reviewed and merged between two ticks is never seen
+  open with a review on it.
 - **Fix passes carry their cause**: `detail` is `ci: …`, `feedback: …` or
   `ci+feedback: …`. A fix line with no cause prefix predates this and makes the
   row's autonomy unknown rather than assumed.

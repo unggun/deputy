@@ -679,7 +679,8 @@ class Pipeline:
 
         vcs.push(wt, branch, env=env)
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
-        self._note_own_commits(meta, wt, before, env)
+        self._note_own_commits(meta, wt, before, env,
+                               fork=forked_at or meta.get("base_sha"))
         if forked_at:
             # The commit a replay of this ticket would start from.
             meta["base_sha"] = forked_at
@@ -811,8 +812,21 @@ class Pipeline:
         if not wt.exists():
             wt = vcs.ensure_worktree(repo, row["branch"], self.work_root, env=env)
 
+        profile = self.cfg.profile_for_repo(repo)
+        allowlist = (repo.get("reviewer_allowlist")
+                     or profile.get("reviewer_allowlist")
+                     or self.cfg.get("vcs.reviewer_allowlist", []) or [])
+        meta = json.loads(row["meta"] or "{}")
+
         st = vcs.pr_status(wt, number, env=env)
         if st["merged"]:
+            if not meta.get("first_review_at"):
+                # Reviewed and merged between two ticks: no poll ever saw the
+                # PR open with a review on it, and the row is about to become
+                # terminal. Ask GitHub once, now, or the review is lost and
+                # the whole ready-to-merge wait is counted as waiting.
+                self._note_first_review(rid, meta, wt, number, allowlist, env,
+                                        seen_human=False)
             self.store.record("pr_merged", rid, self._merge_detail(row, wt, number, env))
             self._set(rid, AIState.DONE)
             # Gated: on a two-repo ticket the first merge must not close the
@@ -826,12 +840,6 @@ class Pipeline:
             return
         if st["ci"] == "pending":
             return
-
-        profile = self.cfg.profile_for_repo(repo)
-        allowlist = (repo.get("reviewer_allowlist")
-                     or profile.get("reviewer_allowlist")
-                     or self.cfg.get("vcs.reviewer_allowlist", []) or [])
-        meta = json.loads(row["meta"] or "{}")
         # Only feedback newer than the last round we acted on. Without this a
         # comment that needs no code change is re-read on every poll and runs
         # the fix agent again, forever, at full agent cost per tick.
@@ -842,8 +850,13 @@ class Pipeline:
         if not meta.get("first_review_at") and (
                 feedback or approvals
                 or st.get("review_decision") in ("APPROVED", "CHANGES_REQUESTED")):
-            self._note_first_review(rid, meta, wt, number, allowlist, env,
-                                    seen_human=bool(feedback or approvals))
+            # `approving_reactions` keeps bots on purpose (a Codex thumbs-up
+            # is how it says "nothing to flag"), so only a human's reaction
+            # is evidence here. `human_feedback` already drops bots.
+            self._note_first_review(
+                rid, meta, wt, number, allowlist, env,
+                seen_human=bool(feedback) or any(
+                    not a.endswith("[bot]") for a in approvals))
         needs_fix = st["ci"] == "failing" or bool(feedback)
 
         if approvals and not feedback and st["ci"] != "failing":
@@ -893,7 +906,7 @@ class Pipeline:
             "%Y-%m-%dT%H:%M:%SZ")
         if res.ok and vcs.commit_all(wt, f"{row['task_key']}: address review/CI feedback", env=env):
             vcs.push(wt, row["branch"], env=env)
-            self._note_own_commits(meta, wt, before, env)
+            self._note_own_commits(meta, wt, before, env, fork=meta.get("base_sha"))
             self._comment(rid, f"fix-{number}-{attempts}",
                           f"Pushed fixes (attempt {attempts}).\n\n{res.text[:1200]}")
             self.store.upsert(rid, attempts=attempts, meta=meta)
@@ -1069,7 +1082,8 @@ class Pipeline:
 
     # --- measurement ---------------------------------------------------
     def _note_own_commits(self, meta: dict[str, Any], wt: Path,
-                          before: str | None, env: dict[str, str]) -> None:
+                          before: str | None, env: dict[str, str], *,
+                          fork: str | None) -> None:
         """Remember the SHAs this runner put on the branch, in `meta`.
 
         At merge, any commit on the PR that is not in this list was pushed by
@@ -1078,12 +1092,20 @@ class Pipeline:
         with the developer's own GitHub identity, so a login cannot tell the
         two apart. Without a `before` SHA the list is left alone, and the
         merge is then reported as unknown rather than guessed.
+
+        Coverage has to start at the fork. The first note on a row is only
+        complete when `before` *is* the fork point: a branch that already had
+        commits when tracking began -- implemented before this existed, now
+        on its first fix pass -- would otherwise have its original runner
+        commits counted as a human's.
         """
         added = self._measure("own-commits", vcs.commits_since, wt, before,
                               env=env) if before else None
         if added is None:
             meta["own_commits_incomplete"] = True
             return
+        if "own_commits" not in meta and (not fork or before != fork):
+            meta["own_commits_incomplete"] = True
         meta["own_commits"] = list(dict.fromkeys(
             list(meta.get("own_commits") or []) + added))
 
