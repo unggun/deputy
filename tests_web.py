@@ -818,6 +818,115 @@ else:
               and len(body["errors"]) == 1 and body["errors"][0].startswith("bad.md")
               and body["cards"] == [] and body["scorers_dir"] == str(sdir))
 
+# --- improvements -------------------------------------------------------------
+print("\nimprovements")
+import json as _json
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    now = int(time.time())
+    st.upsert("acme:40#api", source="acme", provider_task_id="40", task_key="DEV-40",
+              title="reviewed", state="done", repo_key="api")
+    st.record("review", "acme:40#api", "request_changes", log="review", ts=now - 300)
+    rev = st.conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+    st.record("implement", "acme:40#api", "ok", log="implement", ts=now - 600)
+    imp = st.conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+    st.claim_score("ran-tests", imp, task_id="acme:40#api", station="implement",
+                   log="implement")
+    st.finish_score("ran-tests", imp, label="did_not_run", score=0, passed=False,
+                    pass_score=1, reasoning="no test run")
+    sid = st.conn.execute("SELECT id FROM scores").fetchone()[0]
+
+    def _proposal(status, note, *, cited=(), decided=None, ts=None, reason=None):
+        iid = st.claim_improvement("acme", f"api-{note}", ttl=60)
+        st.finish_improvement(iid, "pending" if status in ("accepted", "rejected")
+                              else status, note=note, problem="p", solution="s",
+                              reasoning=f"looked at {note}", evidence=list(cited),
+                              cited=list(cited), cost_usd=0.25, tokens=1000)
+        if status in ("accepted", "rejected"):
+            st.decide_improvement(iid, status, reason)
+        if ts is not None or decided is not None:
+            st.conn.execute("UPDATE improvements SET ts = ?, decided_at = ? WHERE id = ?",
+                            (ts or now, decided, iid))
+            st.conn.commit()
+        return iid
+
+    p1 = _proposal("pending", "run pnpm test",
+                   cited=[f"review:{rev}", f"score:{sid}", "review:99999"],
+                   ts=now - 86400 * 60)
+    _proposal("accepted", "a1")
+    _proposal("accepted", "a2")
+    _proposal("rejected", "r1", reason="token ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB leaked")
+    _proposal("none", "n1")
+    _proposal("error", "e1")
+    _proposal("accepted", "old", ts=now - 86400 * 40, decided=now - 86400 * 40)
+    gone = st.claim_improvement("acme", "api-x", ttl=60)
+    st.finish_improvement(gone, "abandoned")
+    out = Reader(path, limits={}).improvements(30)
+    by_note = {i["note"]: i for i in out["items"]}
+    check("a pending proposal is listed whatever the range; abandoned claims never",
+          "run pnpm test" in by_note and "old" not in by_note
+          and not any(i["status"] == "abandoned" for i in out["items"]))
+    check("the acceptance rate is accepted over decided, with its interval",
+          (out["accepted"], out["rejected"], out["pending"], out["none"], out["errors"],
+           out["n"]) == (2, 1, 1, 1, 1, 3)
+          and abs(out["rate"] - 2 / 3) < 1e-9 and out["low"] is not None)
+    ev = {e["ref"]: e for e in by_note["run pnpm test"]["evidence"]}
+    check("evidence resolves to the run it came from, and what is gone says so",
+          ev[f"review:{rev}"]["open_id"] == "acme:40#api"
+          and ev[f"review:{rev}"]["log"] == "review"
+          and ev[f"review:{rev}"]["label"] == "request_changes"
+          and ev[f"score:{sid}"]["scorer"] == "ran-tests"
+          and ev[f"score:{sid}"]["label"] == "did_not_run"
+          and ev[f"score:{sid}"]["task_key"] == "DEV-40"
+          and ev["review:99999"] == {"ref": "review:99999", "kind": "review"}
+          and by_note["run pnpm test"]["shown"] == 3)
+    check("a rejection reason is redacted on the way out",
+          all("ghp_BBBB" not in (i["reason"] or "") for i in out["items"])
+          and any("leaked" in (i["reason"] or "") for i in out["items"]))
+    check("improve spend is the ledger's in the range, not the rows' whatever their age",
+          out["cost_usd"] == 0 and out["tokens"] == 0)
+    st.record("improve", None, "acme:api #1: pending", 0.25, 1000, ts=now)
+    st.record("improve", None, "acme:api #0: pending", 0.5, 2000, ts=now - 86400 * 60)
+    spent = Reader(path, limits={}).improvements(30)
+    check("an improve run is charged to the day it ran, as on the Spend chart",
+          spent["cost_usd"] == 0.25 and spent["tokens"] == 1000)
+    kinds = set()
+    for d in Reader(path, limits={}).spend_by_day(7):
+        kinds |= set(d["kinds"])
+    check("improve spend shows in the spend chart as its own kind", "improve" in kinds)
+    check("improve runs are not agent runs on the Runs tab",
+          all(r.get("station") != "improve" and r.get("kind") != "improve"
+              for r in Reader(path, limits={}).runs(7)))
+
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TABLE improvements")
+    raw.commit()
+    raw.close()
+    empty = Reader(path, limits={}).improvements(30)
+    check("a database with no improvements table is an empty answer, not an error",
+          empty["items"] == [] and empty["n"] == 0 and empty["rate"] is None)
+
+if _TC is None:
+    print("  /api/improvements check skipped -- fastapi (the `web` extra) is not installed")
+else:
+    with tempfile.TemporaryDirectory() as tmp:
+        Store(f"{tmp}/s.db")
+        base = {"db_path": f"{tmp}/s.db", "log_dir": f"{tmp}/l", "limits": {}}
+        off = _TC(_api.build_app(_C(data={"runner": base, "vcs_profiles": {}, "sources": []},
+                                    source_path=Path(tmp) / "config.yaml"))
+                  ).get("/api/improvements").json()
+        on = _TC(_api.build_app(_C(data={"runner": {**base, "improve": {
+                     "enabled": True, "min_evidence": 3}}, "vcs_profiles": {},
+                     "sources": []}, source_path=Path(tmp) / "config.yaml"))
+                 ).get("/api/improvements").json()
+        check("/api/improvements says whether the station is on, and its triggers",
+              off["settings"]["enabled"] is False and off["items"] == []
+              and on["settings"]["enabled"] is True
+              and on["settings"]["min_evidence"] == 3
+              and on["settings"]["max_age_days"] == 7)
+
 # --- numbered station logs ----------------------------------------------------
 from runner.models import run_station
 with tempfile.TemporaryDirectory() as tmp:

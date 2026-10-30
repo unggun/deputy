@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import re
 import sqlite3
@@ -566,6 +567,98 @@ class Reader:
                 "model": r["model"],
             })
         return {"cards": out_cards, "results": results}
+
+    # --- improvements --------------------------------------------------
+    # Shown on the tab. `running` is a run in progress; `abandoned` is a claim
+    # a killed tick left behind, which says nothing about the proposals.
+    _IMPROVE_SHOWN = ("pending", "accepted", "rejected", "none", "error", "running")
+
+    def improvements(self, days: int = 30) -> dict[str, Any]:
+        """Proposals and the runs that made none, with the acceptance rate.
+
+        Pending proposals are listed whatever the range: they are waiting on a
+        person, which is the one thing this tab exists to say. The rest are
+        dated by when they were decided, or when the run finished. The rate is
+        accepted over decided, with its Wilson interval and n, like a scorer's.
+
+        A database from before this table existed answers empty, as `scores()`
+        does: `mode=ro` cannot create it.
+        """
+        has = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'improvements'"
+        ).fetchone()
+        empty = {"items": [], "accepted": 0, "rejected": 0, "pending": 0,
+                 "none": 0, "errors": 0, "n": 0, "rate": None, "low": None,
+                 "high": None, "cost_usd": 0.0, "tokens": 0}
+        if not has:
+            return empty
+        ph = ",".join("?" * len(self._IMPROVE_SHOWN))
+        rows = [dict(r) for r in self.conn.execute(
+            f"SELECT * FROM improvements WHERE status IN ({ph})"
+            " AND (status = 'pending' OR COALESCE(decided_at, ts) >= ?)"
+            " ORDER BY COALESCE(decided_at, ts) DESC, id DESC",
+            (*self._IMPROVE_SHOWN, self._since(days)))]
+        by_id, by_ticket = self._task_index()
+
+        def refs(raw: str | None) -> list[str]:
+            try:
+                return [str(x) for x in json.loads(raw or "[]")]
+            except (TypeError, ValueError):
+                return []
+
+        def evidence(ref: str) -> dict[str, Any]:
+            kind, _, num = ref.partition(":")
+            src = None
+            if num.isdigit() and kind == "score":
+                src = self.conn.execute(
+                    "SELECT task_id, log, label, scorer, event_id FROM scores"
+                    " WHERE id = ?", (int(num),)).fetchone()
+            elif num.isdigit() and kind == "review":
+                src = self.conn.execute(
+                    "SELECT task_id, log, detail label, NULL scorer, id event_id"
+                    " FROM events WHERE id = ?", (int(num),)).fetchone()
+            if src is None:
+                return {"ref": ref, "kind": kind}
+            tid = src["task_id"] or ""
+            owner = by_id.get(tid) or by_ticket.get(_placeholder(tid)) or {}
+            return {"ref": ref, "kind": kind, "event_id": src["event_id"],
+                    "label": src["label"], "scorer": src["scorer"], "log": src["log"],
+                    "task_id": tid, "open_id": owner.get("task_id"),
+                    "task_key": owner.get("task_key"), "title": owner.get("title")}
+
+        items = []
+        for r in rows:
+            cited = refs(r["cited"])
+            items.append({
+                "id": r["id"], "ts": r["ts"], "decided_at": r["decided_at"],
+                "source": r["source"], "repo_key": r["repo_key"],
+                "status": r["status"], "target": r["target"],
+                **{k: self._clean(r[k]) for k in
+                   ("problem", "solution", "note", "reasoning", "reason")},
+                "evidence": [evidence(x) for x in cited],
+                "shown": len(refs(r["evidence"])),
+                "cost_usd": float(r["cost_usd"] or 0), "tokens": int(r["tokens"] or 0),
+                "model": r["model"], "log": r["log"],
+            })
+        count = {s: sum(1 for r in rows if r["status"] == s) for s in self._IMPROVE_SHOWN}
+        n = count["accepted"] + count["rejected"]
+        ci = _wilson(count["accepted"], n)
+        # Spend is dated by when the run ran, from the ledger, exactly as the
+        # Spend chart dates it. The rows above are dated by decision, and keep
+        # an old pending proposal whatever the range, so summing their cost
+        # would charge a months-old run to this week.
+        spent = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) c, COALESCE(SUM(tokens), 0) t"
+            " FROM events WHERE kind = 'improve' AND ts >= ?",
+            (self._since(days),)).fetchone()
+        return {
+            "items": items, "accepted": count["accepted"],
+            "rejected": count["rejected"], "pending": count["pending"],
+            "none": count["none"], "errors": count["error"], "n": n,
+            "rate": (count["accepted"] / n) if n else None,
+            "low": ci[0] if ci else None, "high": ci[1] if ci else None,
+            "cost_usd": round(float(spent["c"]), 6), "tokens": int(spent["t"]),
+        }
 
     def review_cycles(self, days: int = 30) -> list[dict[str, Any]]:
         rows = self.conn.execute(

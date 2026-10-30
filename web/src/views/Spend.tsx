@@ -14,11 +14,12 @@ const round2 = (v: number) => Math.round(v * 100) / 100;
 /** One chart row: the day label plus one numeric field per station kind. */
 type SpendRow = Record<string, string | number>;
 
-// The judges' own runs (ledger kind `score`), stacked on top in the neutral
-// tone: overhead on the work, not a sixth station, so it takes no series slot.
-const SCORING = "score";
-const KINDS = [...STATIONS, SCORING] as const;
-const label = (k: string) => (k === SCORING ? "scoring" : k);
+// The judges' runs (ledger kind `score`) and the improve station's
+// (`improve`), stacked on top as one band in the neutral tone: overhead on the
+// work, not a sixth station, so it takes no series slot. One band, not two,
+// because two bands in the same neutral tone could not be told apart.
+const OVERHEAD: Record<string, string> = { score: "scoring", improve: "improving" };
+const OVER = "overhead";
 
 export function Spend({ days = 30 }: { days?: number }) {
   const { data, isError, error } = useSpend(days);
@@ -33,20 +34,27 @@ export function Spend({ days = 30 }: { days?: number }) {
   // which is the truth.
   const rows: SpendRow[] = data.days.map((d) => {
     const out: SpendRow = { day: d.day.slice(5) };
-    for (const s of KINDS) {
+    for (const s of STATIONS) {
       out[`${s}_tok`] = d.kinds?.[s]?.tokens ?? 0;
       out[`${s}_usd`] = round2(d.kinds?.[s]?.cost_usd ?? 0);
     }
+    const over = Object.keys(OVERHEAD).map((k) => d.kinds?.[k]);
+    out[`${OVER}_tok`] = over.reduce((a, k) => a + (k?.tokens ?? 0), 0);
+    out[`${OVER}_usd`] = round2(over.reduce((a, k) => a + (k?.cost_usd ?? 0), 0));
     return out;
   });
 
-  // Scoring only joins the stack once a judge has run, so a setup with no
-  // scorers keeps the five-station legend it has always had.
-  const kinds = data.days.some((d) => d.kinds?.[SCORING]) ? KINDS : STATIONS;
+  // Overhead only joins the stack once a judge or an improve run has spent
+  // something, so a setup with neither keeps the five-station legend it has
+  // always had; the band's name says which of the two it holds.
+  const seen = Object.keys(OVERHEAD).filter((k) => data.days.some((d) => d.kinds?.[k]));
+  const overName = seen.map((k) => OVERHEAD[k]).join(" + ");
+  const kinds: readonly string[] = seen.length ? [...STATIONS, OVER] : STATIONS;
+  const label = (k: string) => (k === OVER ? overName : k);
   const bars = (suffix: "tok" | "usd") =>
     kinds.map((s, i) => (
       <Bar key={s} dataKey={`${s}_${suffix}`} name={label(s)} stackId="a"
-           fill={s === SCORING ? MUTED : SERIES[m][i]}
+           fill={s === OVER ? MUTED : SERIES[m][i]}
            // 2px surface gap between stacked segments.
            stroke={SURFACE[m]} strokeWidth={2}
            radius={i === kinds.length - 1 ? [4, 4, 0, 0] : 0} />

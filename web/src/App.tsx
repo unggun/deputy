@@ -4,6 +4,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Overview } from "@/views/Overview";
 import { Board } from "@/views/Board";
 import { Flow } from "@/views/Flow";
+import { Improvements } from "@/views/Improvements";
 import { Runs } from "@/views/Runs";
 import { Scorers } from "@/views/Scorers";
 import { Spend } from "@/views/Spend";
@@ -16,7 +17,7 @@ const qc = new QueryClient();
 const RANGES = [7, 14, 30, 90] as const;
 // Overview, Board and Graph show the present, not a window; the range picker
 // says so by going inert there rather than appearing to filter them.
-const RANGED = new Set(["flow", "runs", "scorers", "spend", "throughput"]);
+const RANGED = new Set(["flow", "runs", "scorers", "improvements", "spend", "throughput"]);
 
 export default function App() {
   const [tab, setTab] = useState("overview");
@@ -31,12 +32,15 @@ export default function App() {
       <div className="min-h-screen bg-background text-foreground p-4 md:p-6">
         <Tabs value={tab} onValueChange={setTab}>
           <div className="flex flex-wrap items-center gap-3">
-            <TabsList>
+            {/* Nine tabs are wider than a phone: the list scrolls sideways
+                instead of pushing the whole page past the viewport. */}
+            <TabsList className="max-w-full justify-start overflow-x-auto">
               <TabsTrigger value="overview">Overview</TabsTrigger>
               <TabsTrigger value="board">Board</TabsTrigger>
               <TabsTrigger value="flow">Flow</TabsTrigger>
               <TabsTrigger value="runs">Runs</TabsTrigger>
               <TabsTrigger value="scorers">Scorers</TabsTrigger>
+              <TabsTrigger value="improvements">Improvements</TabsTrigger>
               <TabsTrigger value="spend">Spend</TabsTrigger>
               <TabsTrigger value="throughput">Throughput</TabsTrigger>
               <TabsTrigger value="graph">Graph</TabsTrigger>
@@ -58,6 +62,8 @@ export default function App() {
           <TabsContent value="flow"><Flow days={days} onOpen={onOpen} /></TabsContent>
           <TabsContent value="runs"><Runs days={days} onOpen={onOpen} /></TabsContent>
           <TabsContent value="scorers"><Scorers days={days} onOpen={onOpen} /></TabsContent>
+          <TabsContent value="improvements">
+            <Improvements days={days} onOpen={onOpen} /></TabsContent>
           <TabsContent value="spend"><Spend days={days} /></TabsContent>
           <TabsContent value="throughput"><Throughput days={days} /></TabsContent>
           <TabsContent value="graph"><GraphTab /></TabsContent>

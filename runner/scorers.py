@@ -124,9 +124,14 @@ class Verdict:
 # --- loading ------------------------------------------------------------
 def parse(text: str, path: Path | None = None) -> Scorer:
     """One scorer file. Raises ValueError with a sentence an operator can fix."""
+    # Editors on Windows save UTF-8 with a byte-order mark, which would hide
+    # the opening --- from the check below.
+    text = text.removeprefix("\ufeff")
     if not text.startswith("---"):
         raise ValueError("no YAML frontmatter (the file must start with ---)")
     _, sep, rest = text.partition("\n")
+    if rest.startswith("---"):
+        raise ValueError("frontmatter is empty: stations and labels are required")
     head, sep, body = rest.partition("\n---")
     if not sep:
         raise ValueError("frontmatter is not closed with ---")
@@ -264,7 +269,7 @@ def log_path(log_root: Path, row: dict[str, Any], log_name: str) -> Path:
 
 
 # --- transcript ---------------------------------------------------------
-def _clip(text: str, n: int) -> str:
+def clip(text: str, n: int) -> str:
     """Head and tail of `text`, at most about `n` characters, marked."""
     text = text.strip()
     if len(text) <= n:
@@ -312,15 +317,41 @@ def condense(path: Path, level: int = 0) -> str:
             out.append("[LOG TRUNCATED: recording stopped here; the run "
                        "continued unrecorded]")
         elif kind == "run_failed":
-            out.append(f"[RUN FAILED TO START: {_clip(str(rec.get('error')), 300)}]")
+            out.append(f"[RUN FAILED TO START: {clip(str(rec.get('error')), 300)}]")
         elif kind == "output" and rec.get("stream") == "stderr":
             text = str(rec.get("text") or "").strip()
             if text:
-                out.append(f"STDERR: {_clip(text, max(result_n, 120))}")
+                out.append(f"STDERR: {clip(text, max(result_n, 120))}")
         elif kind == "output":
             out.extend(_stream_line(str(rec.get("text") or ""),
                                     text_n, input_n, result_n, final_n))
     return "\n".join(out)
+
+
+def final_text(path: Path) -> str | None:
+    """The run's final reply, unclipped: the `result` event's text.
+
+    A station's structured answer (the reviewer's findings, the analyst's
+    plan) is that reply, so this is how a run's output is read back after the
+    row has moved on. None when the log is gone or never reached a result --
+    a killed run, or a log truncated at its cap.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    final = None
+    for raw in lines:
+        try:
+            rec = json.loads(raw)
+            ev = (json.loads(str(rec.get("text") or ""))
+                  if rec.get("type") == "output" and rec.get("stream") != "stderr"
+                  else None)
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            final = str(ev.get("result") or "")
+    return final
 
 
 def _stream_line(text: str, text_n: int, input_n: int, result_n: int,
@@ -340,20 +371,20 @@ def _stream_line(text: str, text_n: int, input_n: int, result_n: int,
             if not isinstance(c, dict):
                 continue
             if c.get("type") == "text" and str(c.get("text") or "").strip():
-                out.append(f"ASSISTANT: {_clip(str(c['text']), text_n)}")
+                out.append(f"ASSISTANT: {clip(str(c['text']), text_n)}")
             elif c.get("type") == "tool_use":
                 args = json.dumps(c.get("input") or {}, ensure_ascii=False)
-                out.append(f"TOOL CALL {c.get('name')}: {_clip(args, input_n)}")
+                out.append(f"TOOL CALL {c.get('name')}: {clip(args, input_n)}")
     elif kind == "user" and isinstance(content, list):
         for c in content:
             if isinstance(c, dict) and c.get("type") == "tool_result":
                 body = _result_text(c.get("content"))
                 tag = "TOOL RESULT (error)" if c.get("is_error") else "TOOL RESULT"
-                out.append(f"{tag}: {_clip(body, result_n)}" if result_n
+                out.append(f"{tag}: {clip(body, result_n)}" if result_n
                            else f"{tag}: [{len(body)} chars]")
     elif kind == "result":
         out.append(f"FINAL ({ev.get('subtype')}, {ev.get('num_turns')} turns): "
-                   f"{_clip(str(ev.get('result') or ''), final_n)}")
+                   f"{clip(str(ev.get('result') or ''), final_n)}")
     return out
 
 

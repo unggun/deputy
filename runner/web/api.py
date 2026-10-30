@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import graph
+from .. import improve as improve_conf
 from .. import scorers as scorer_files
 from ..config import Config
 from . import logs as weblogs
@@ -55,6 +56,7 @@ def build_app(cfg: Config) -> FastAPI:
     scorers_dir = Path(str(cfg.get("runner.scorers_dir", scorer_files.DEFAULT_DIR))
                        ).expanduser()
     secrets = _secrets(cfg)
+    improve_settings = improve_conf.settings(cfg.get("runner.improve"))
 
     app = FastAPI(title="deputy", docs_url=None, redoc_url=None)
 
@@ -180,6 +182,17 @@ def build_app(cfg: Config) -> FastAPI:
             for sc in found]
         out["errors"] = errors
         out["scorers_dir"] = str(scorers_dir)
+        return out
+
+    @app.get("/api/improvements")
+    def improvements(days: int = 30) -> dict[str, Any]:
+        r = reader()
+        try:
+            out = r.improvements(days)
+        finally:
+            r.close()
+        # So an empty tab can tell "off" from "on, nothing proposed yet".
+        out["settings"] = improve_settings
         return out
 
     @app.get("/api/graph")

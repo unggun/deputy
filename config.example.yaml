@@ -19,6 +19,18 @@ runner:
   # off and costs nothing. Starters are in examples/scorers/; try one with
   # `deputy score NAME` before copying it in.
   # scorers_dir: ~/.deputy/scorers
+  # The improve station: reads one repo's failed scorer verdicts and the
+  # reviews that asked for changes, and proposes at most one brain note that
+  # would have prevented them. It only proposes: `deputy improve accept ID`
+  # is what writes the brain. Off unless enabled; try it on one repo first
+  # with `deputy improve run --repo KEY`.
+  # improve:
+  #   enabled: false
+  #   min_evidence: 5        # failures no earlier run has seen, on one repo...
+  #   max_age_days: 7        # ...or one this old, before a run
+  #   lookback_days: 30      # older failures are not evidence any more
+  #   max_per_run: 1         # improve runs per tick, per source
+  #   max_evidence: 20       # failures shown to one run, oldest first
   bot_marker: "<!-- ai-runner -->"
   days: [mon, tue, wed, thu, fri]
   windows:                   # local time; the OS scheduler fires every 15 min
@@ -26,6 +38,7 @@ runner:
     triage:  ["06:30-08:30", "11:00-12:00", "14:00-15:30"]
     execute: ["06:30-16:00"] # hard stop so every PR gets same-day review time
     # score: [...]           # when scorers judge runs; defaults to `triage`
+    # improve: [...]         # when the improve station runs; defaults to `triage`
   limits:
     max_active_tasks: 3      # across ALL sources — this caps load on this laptop
     max_new_triage_per_run: 10
@@ -72,6 +85,10 @@ agent:
   # The scoring judge, unless a scorer file names its own `model:`. Falls back
   # to `triage_model`: it is the same one-turn, tool-less, isolated call.
   # scorer_model: haiku
+  # The improve station: work() with `planner_tools`, in a read-only checkout
+  # of the base branch, like the analyst. Falls back to `model`. A stronger
+  # model pays off here: it runs rarely, and a bad note reaches every prompt.
+  # improve_model: opus
   max_turns: 60
   permission_mode: dontAsk
   timeout_minutes: 45

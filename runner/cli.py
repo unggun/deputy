@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import brain, graph, providers, scorers, vcs
+from . import analyst, brain, graph, improve, providers, scorers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .models import AgentResult, AIState
@@ -180,6 +180,14 @@ def _doctor(cfg: Config) -> int:
                  ", ".join(f"{k}={v:g}" for k, v in sc.labels.items()),
                  sc.pass_score)
     problems += [f"scorer {e}" for e in errors]
+    conf = improve.settings(cfg.get("runner.improve"))
+    if conf["enabled"]:
+        log.info("improve: on, %d run(s) per tick; a repo is due at %d uncited "
+                 "failures or one %d days old", conf["max_per_run"],
+                 conf["min_evidence"], conf["max_age_days"])
+    else:
+        log.info("improve: off (runner.improve.enabled); `deputy improve run "
+                 "--repo KEY` still works on demand")
 
     # Every ticket now costs a review run, and scope-gated ones a planning run
     # too. On subscription auth that spend is invisible to daily_budget_usd.
@@ -212,6 +220,18 @@ def _doctor(cfg: Config) -> int:
         return 1
     log.info("all good — mode=%s", cfg.get("runner.mode"))
     return 0
+
+
+def _repo_secrets(cfg: Config) -> list[str]:
+    """Every token the vcs profiles inject, for redaction, as the tick does."""
+    out: list[str] = []
+    for src in cfg.sources():
+        for repo in src.repos:
+            try:
+                out.extend(vcs.profile_env(cfg.profile_for_repo(repo)).values())
+            except Exception:  # noqa: BLE001
+                continue
+    return sorted(set(out), key=len, reverse=True)
 
 
 def _score(cfg: Config, name: str, run_ids: list[int], last: int,
@@ -279,12 +299,7 @@ def _score(cfg: Config, name: str, run_ids: list[int], last: int,
 
     agent = ClaudeCodeAgent(cfg.get("agent", {}) or {})
     repos = {(src.key, r["key"]): r for src in cfg.sources() for r in src.repos}
-    secrets: list[str] = []
-    for repo in repos.values():
-        try:
-            secrets.extend(vcs.profile_env(cfg.profile_for_repo(repo)).values())
-        except Exception:  # noqa: BLE001
-            continue
+    secrets = _repo_secrets(cfg)
     log_root = Path(str(cfg.get("runner.log_dir", "~/.deputy/logs"))).expanduser()
     limits = cfg.get("runner.limits", {}) or {}
     for ev in runs:
@@ -314,6 +329,128 @@ def _score(cfg: Config, name: str, run_ids: list[int], last: int,
     if not record:
         print("not recorded; pass --record to store these verdicts")
     return 0
+
+
+def _age(ts: int | None) -> str:
+    if not ts:
+        return "-"
+    secs = max(0, int(time.time()) - int(ts))
+    return f"{secs // 86400}d" if secs >= 86400 else f"{secs // 3600}h"
+
+
+def _improve(cfg: Config, args: argparse.Namespace) -> int:
+    """`deputy improve`: review proposals, or ask for one now.
+
+    `list`, `show`, `accept` and `reject` only read and write the store and
+    the brain. `run` is the tick's own path (`improve.run_for_repo`) for one
+    repo, skipping the "is it due" check on purpose -- it is how a person
+    sees what the station makes of their history before turning it on -- and
+    never the daily limits.
+    """
+    import json
+
+    store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
+    limits = cfg.get("runner.limits", {}) or {}
+    brain_root = Path(str(cfg.get("runner.brain_dir", "~/.deputy/brain"))).expanduser()
+
+    def refs(row: dict, col: str) -> list[str]:
+        try:
+            return [str(x) for x in json.loads(row.get(col) or "[]")]
+        except ValueError:
+            return []
+
+    def headline(r: dict) -> str:
+        what = r["note"] or r["reasoning"] or ""
+        return (f"#{r['id']:<5} {r['source']}/{r['repo_key']:<18} {r['status']:<9} "
+                f"{_age(r['ts']):>4}  {len(refs(r, 'cited'))}/{len(refs(r, 'evidence'))} "
+                f"cited  {what[:90]}")
+
+    if args.action == "list":
+        rows = store.improvements(statuses=None if args.all else ("pending",),
+                                  limit=args.limit)
+        if not rows:
+            print("no improve runs yet" if args.all else "no proposals waiting")
+            return 0
+        for r in rows:
+            print(headline(r))
+        if any(r["status"] == "pending" for r in rows):
+            print("\nread one with `deputy improve show ID`, then `deputy improve "
+                  "accept ID` or `deputy improve reject ID --reason \"...\"`")
+        return 0
+
+    if args.action in ("show", "accept", "reject"):
+        row = store.improvement(args.id)
+        if row is None:
+            print(f"no proposal {args.id}", file=sys.stderr)
+            return 1
+        if args.action == "show":
+            print(headline(row))
+            for label, col in (("Problem", "problem"), ("Solution", "solution"),
+                               ("Note", "note"), ("Reasoning", "reasoning"),
+                               ("Rejected because", "reason")):
+                if row.get(col):
+                    print(f"\n{label}:\n  {row[col]}")
+            cited = refs(row, "cited")
+            if cited:
+                print("\nEvidence it cites:")
+                for ref in cited:
+                    print(f"  {improve.describe(store, ref)}")
+            rest = [r for r in refs(row, "evidence") if r not in cited]
+            if rest:
+                print(f"\nAlso shown ({len(rest)}): {', '.join(rest)}")
+            if row.get("log"):
+                log_root = Path(str(cfg.get("runner.log_dir", "~/.deputy/logs"))).expanduser()
+                print(f"\nLog: {log_root / row['log']}  "
+                      f"(${float(row['cost_usd'] or 0):.4f}, {int(row['tokens'] or 0):,} tokens)")
+            return 0
+        if args.action == "accept":
+            ok, msg = improve.accept(
+                store, args.id, brain_root,
+                max_bytes=int(limits.get("brain_max_bytes", brain.DEFAULT_MAX_BYTES)))
+        else:
+            ok, msg = improve.reject(store, args.id, args.reason)
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    # run
+    matches = [(src, r) for src in cfg.sources(only=args.sources) for r in src.repos
+               if r.get("key") == args.repo]
+    if not matches:
+        print(f"no repo {args.repo} in any source", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        print(f"{args.repo} is in {', '.join(s.key for s, _ in matches)}; pick one "
+              f"with --source", file=sys.stderr)
+        return 1
+    src, repo = matches[0]
+    spent = limits_exceeded(store, limits, dt.datetime.now())
+    if spent:
+        print(f"{spent}; not running", file=sys.stderr)
+        return 1
+    acfg = cfg.get("agent", {}) or {}
+    found, _ = scorers.load(cfg.get("runner.scorers_dir", scorers.DEFAULT_DIR))
+    ctx = improve.Context(
+        agent=ClaudeCodeAgent(acfg), store=store, source_key=src.key,
+        log_root=cfg.path("runner.log_dir", "~/.deputy/logs"),
+        work_root=cfg.path("runner.work_dir", "~/.deputy/work"),
+        brain_root=brain_root,
+        settings=improve.settings(cfg.get("runner.improve")),
+        model=acfg.get("improve_model") or acfg.get("model"),
+        tools=list(acfg.get("planner_tools") or analyst.PLANNER_TOOLS),
+        secrets=_repo_secrets(cfg), rubrics={sc.name: sc.rubric for sc in found},
+        claim_ttl=improve.claim_ttl(acfg))
+    row = improve.run_for_repo(ctx, repo, vcs.profile_env(cfg.profile_for_repo(repo)),
+                               dt.datetime.now())
+    if row is None:
+        print(f"nothing new to look at on {src.key}/{args.repo}, or another run "
+              f"holds it")
+        return 0
+    print(headline(row))
+    if row["status"] == "pending":
+        print(f"\nread it with `deputy improve show {row['id']}`")
+    elif row.get("reasoning"):
+        print(f"  {row['reasoning']}")
+    return 1 if row["status"] == "error" else 0
 
 
 def _serve(cfg: Config, host: str, port: int, open_browser: bool) -> int:
@@ -403,6 +540,23 @@ def main(argv: list[str] | None = None) -> int:
                        help="without --run, judge this many recent runs")
     score.add_argument("--record", action="store_true",
                        help="store the verdicts, as the tick would")
+    imp = sub.add_parser(
+        "improve", help="review proposed brain notes, or ask for one now")
+    isub = imp.add_subparsers(dest="action", required=True)
+    ilist = isub.add_parser("list", help="proposals waiting for you")
+    ilist.add_argument("--all", action="store_true",
+                       help="every improve run, not only pending proposals")
+    ilist.add_argument("--limit", type=int, default=50)
+    for name, text in (("show", "one proposal and its evidence"),
+                       ("accept", "write the note to its repo's brain"),
+                       ("reject", "decline it; later runs are told why")):
+        p = isub.add_parser(name, help=text)
+        p.add_argument("id", type=int)
+        if name == "reject":
+            p.add_argument("--reason", default=None,
+                           help="shown to every later run on the repo")
+    irun = isub.add_parser("run", help="run the improve station on one repo now")
+    irun.add_argument("--repo", required=True, help="repo key from config")
     serve = sub.add_parser("serve", help="read-only dashboard on localhost")
     serve.add_argument("--port", type=int, default=8787)
     serve.add_argument("--host", default="127.0.0.1")
@@ -423,7 +577,8 @@ def main(argv: list[str] | None = None) -> int:
     # where cron's environment is absent.
     # `score` reads the store and the logs and calls the agent; like
     # `serve`, it never builds a provider.
-    cfg = Config.load(args.config, require_env=(args.cmd not in ("serve", "score")))
+    cfg = Config.load(args.config,
+                      require_env=(args.cmd not in ("serve", "score", "improve")))
     _logging(cfg, args.verbose)
     log = logging.getLogger("cli")
 
@@ -448,6 +603,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "score":
         return _score(cfg, args.scorer, args.runs, max(1, args.last), args.record)
+
+    if args.cmd == "improve":
+        return _improve(cfg, args)
 
     if args.force:
         cfg.data.setdefault("runner", {})["windows"] = {

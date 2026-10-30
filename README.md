@@ -106,6 +106,10 @@ appends are capped at `limits.brain_max_bytes`. At the cap, appends are
 refused and logged rather than silently evicting older notes; prune it by
 hand when that happens.
 
+The other way in is a proposal you accept (see *Improvements*): a note drafted
+from what keeps failing in the repo, written only when you run
+`deputy improve accept`, through the same cap.
+
 ## Config keys added by the station release
 
 | Key | Meaning |
@@ -125,6 +129,9 @@ hand when that happens.
 | `limits.max_scores_per_run` | judge runs per tick, across all scorers (default 5) |
 | `limits.score_lookback_days` | how far back unjudged runs are picked up (default 14) |
 | `agent.scorer_model` | the judge's model unless a scorer names its own; falls back to `triage_model` |
+| `runner.improve` | the improve station (see *Improvements*); `enabled: false` by default, plus its triggers and caps |
+| `runner.windows.improve` | when the improve station runs; defaults to the `triage` window |
+| `agent.improve_model` | the improve station's model; falls back to `agent.model` |
 
 ## Two daily limits, because dollars are the wrong unit
 
@@ -310,6 +317,7 @@ deputy run                          # one tick, respects time windows
 deputy run --source acme            # limit to one workspace
 deputy status                       # what is in flight, across sources
 deputy score NAME                   # try a scorer on the latest runs (see Scorers)
+deputy improve list                 # brain notes proposed for you (see Improvements)
 python3 tests_smoke.py                      # offline state-machine tests
 ```
 
@@ -365,6 +373,37 @@ already counts them. Triage leaves no transcript, so it cannot be scored yet.
 `deputy doctor` lists the scorers it loaded and fails on a file it cannot
 parse, since the tick only skips it with a warning.
 
+## Improvements
+
+Scorers say what went wrong; the improve station turns it into something the
+next run is told. It reads one repo's recent failures (failed scorer verdicts,
+and reviews that asked for changes or rejected the approach), checks them
+against a read-only checkout of the base branch, and proposes at most one note
+for the repo's brain, citing the failures it addresses. Nothing changes until
+you accept it:
+
+```bash
+deputy improve run --repo pulse-backend    # one run now, whether or not it is due
+deputy improve list                        # proposals waiting for you (--all: every run)
+deputy improve show 7                      # the note, why, and the runs it cites
+deputy improve accept 7                    # append it to the repo's brain
+deputy improve reject 7 --reason "we moved to vitest"
+```
+
+It is off until `runner.improve.enabled: true`. Then, after scoring and inside
+the `improve` window (default: the triage window), a repo is due once it has
+`min_evidence` failures (5) that no earlier run has seen, or one that is
+`max_age_days` old (7). Failures older than `lookback_days` (30) are not
+evidence. At most `max_per_run` runs (1) happen per tick per source, each
+budget-checked and on the ledger as its own kind, not charged to any row.
+
+Each failure is shown to one run only, whatever came of it, so a quiet repo
+costs nothing and a rejected idea is not re-derived from the same failures.
+A rejected note and its reason are shown to every later run on the repo. A
+run that fails spends no evidence; the tick leaves that repo alone for a day.
+Accepting goes through the brain's size cap: at the cap nothing is written and
+the proposal stays pending until you prune the brain and accept again.
+
 ## Dashboard
 
 ```bash
@@ -384,11 +423,12 @@ acting on the runner stays in the task manager and the CLI.
 | Flow | For merged PRs: median time to PR, PR to first human review, review to merge; the share of cycle time spent waiting on people; human touches; how many merged with no human fix or commit; median cost per PR by size (lines changed, as GitHub counts them at merge) |
 | Runs | Every agent run: station, outcome, wall time, turns, the model that answered (⚠ when it differs from the one requested), tokens, cost; click one to open its log. `#id` is what `deputy score --run` takes |
 | Scorers | Per scorer: pass rate with its 95% range and n, passed/failed, insufficient evidence and judge errors beside it, judging cost; pass rate by day; every verdict with the judge's reasoning, opening the run's log |
-| Spend, Throughput | Tokens and dollars per station per day, with judging as its own grey `scoring` band; outcomes and cycle times |
+| Improvements | Proposed brain notes waiting for you, with the evidence they cite (each opens that run's log) and the commands to accept or reject them; the acceptance rate with its 95% range; runs that proposed nothing, and why |
+| Spend, Throughput | Tokens and dollars per station per day, with judging and improve runs as one grey overhead band; outcomes and cycle times |
 | Graph | The live state machine as a table |
 
-The date range (7, 14, 30 or 90 days) applies to Flow, Runs, Scorers, Spend
-and Throughput. A row's detail sheet shows its history as lanes on one time axis —
+The date range (7, 14, 30 or 90 days) applies to Flow, Runs, Scorers,
+Improvements, Spend and Throughput. A row's detail sheet shows its history as lanes on one time axis —
 the state it was in, the PR milestones, one bar per agent run — above the same
 history as a list.
 

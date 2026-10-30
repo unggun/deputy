@@ -101,6 +101,44 @@ export type ScoresData = {
   configured: ConfiguredScorer[]; errors: string[]; scorers_dir: string;
 };
 
+/** One failure a proposal cites. Only `ref` and `kind` when the verdict or
+ *  run it names is no longer recorded. */
+export type ImprovementEvidence = {
+  ref: string; kind: string; event_id?: number;
+  label?: string | null; scorer?: string | null; log?: string | null;
+  task_id?: string; open_id?: string | null;
+  task_key?: string | null; title?: string | null;
+};
+
+export type ImprovementStatus =
+  "running" | "pending" | "none" | "error" | "accepted" | "rejected";
+
+/** One improve run on one repo, and the brain note it proposed, if any.
+ *  `evidence` is what the note cites; `shown` counts everything the run saw. */
+export type Improvement = {
+  id: number; ts: number; decided_at: number | null;
+  source: string; repo_key: string; status: ImprovementStatus; target: string;
+  problem: string | null; solution: string | null; note: string | null;
+  reasoning: string | null; reason: string | null;
+  evidence: ImprovementEvidence[]; shown: number;
+  cost_usd: number; tokens: number; model: string | null; log: string | null;
+};
+
+export type ImproveSettings = {
+  enabled: boolean; min_evidence: number; max_age_days: number;
+  lookback_days: number; max_per_run: number; max_evidence: number;
+};
+
+/** `rate` is accepted over decided (accepted + rejected); `low`/`high` its
+ *  95% Wilson interval, null with nothing decided. */
+export type ImprovementsData = {
+  items: Improvement[];
+  accepted: number; rejected: number; pending: number; none: number;
+  errors: number; n: number;
+  rate: number | null; low: number | null; high: number | null;
+  cost_usd: number; tokens: number; settings: ImproveSettings;
+};
+
 export type Overview = {
   active: number; max_active_tasks: number;
   today: { cost_usd: number; tokens: number };
@@ -220,6 +258,11 @@ export const useFlow = (days = 30) =>
 export const useScores = (days = 30) =>
   useQuery({ queryKey: ["scores", days],
              queryFn: () => get<ScoresData>(`/api/scores?days=${days}`),
+             refetchInterval: 30000 });
+
+export const useImprovements = (days = 30) =>
+  useQuery({ queryKey: ["improvements", days],
+             queryFn: () => get<ImprovementsData>(`/api/improvements?days=${days}`),
              refetchInterval: 30000 });
 
 export type GraphTransition = { from: string; to: string; label: string };

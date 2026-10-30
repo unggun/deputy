@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import analyst, brain, graph, review, scorers, vcs
+from . import analyst, brain, graph, improve, review, scorers, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
 from .jsonio import StationError
@@ -85,6 +85,8 @@ class Pipeline:
             cfg.get("runner.scorers_dir", scorers.DEFAULT_DIR))
         for err in errors:
             log.warning("scorer skipped: %s", err)
+        # Off by default, like scoring: see improve.DEFAULTS.
+        self.improve = improve.settings(cfg.get("runner.improve"))
 
     # --- source-scoped helpers ----------------------------------------
     def _row_id(self, provider_task_id: str, repo_key: str | None = None) -> str:
@@ -181,6 +183,13 @@ class Pipeline:
         if self.scorers and _in_window(
                 now, windows.get("score", windows.get("triage", []))):
             self._score_runs(now)
+
+        # 4. Propose brain notes from repeated failures. After scoring, so
+        #    this tick's verdicts count as evidence; like scoring, it moves
+        #    no ticket and gets only the budget the work left.
+        if self.improve["enabled"] and _in_window(
+                now, windows.get("improve", windows.get("triage", []))):
+            self._improve(now)
 
     # ==================================================================
     def _triage_new(self) -> None:
@@ -1048,6 +1057,49 @@ class Pipeline:
                     judged += 1
                     log.info("[%s] %s on %s: %s", row.get("task_key"),
                              sc.name, ev["log"], verdict.label)
+
+    def _improve_ctx(self) -> improve.Context:
+        return improve.Context(
+            agent=self.agent, store=self.store, source_key=self.source.key,
+            log_root=self.log_root, work_root=self.work_root,
+            brain_root=self.brain_root, settings=self.improve,
+            model=self.acfg.get("improve_model") or self.acfg.get("model"),
+            tools=list(self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS),
+            secrets=self._known_secrets(),
+            rubrics={sc.name: sc.rubric for sc in self.scorers},
+            claim_ttl=improve.claim_ttl(self.acfg))
+
+    def _improve(self, now: dt.datetime) -> None:
+        """Up to `improve.max_per_run` improve runs, one repo each.
+
+        A repo is due when it has enough failures no earlier run has seen, or
+        an old enough one (`improve.due`). Its evidence is spent by the run,
+        so a repo is not due again until new failures arrive -- which is also
+        why taking repos in config order cannot starve the later ones.
+        """
+        cap = self.improve["max_per_run"]
+        ran = 0
+        for repo in self.source.repos:
+            if ran >= cap:
+                return
+            if not improve.due(self.store, self.source.key, repo["key"], now,
+                               self.improve):
+                continue
+            if not self._budget_available(now):
+                return
+            try:
+                env = self._env_for(repo)
+            except Exception as exc:  # noqa: BLE001
+                # Last in the tick: a missing token must not fail the work
+                # this tick already did, only this repo's improve run.
+                log.warning("[%s] improve skipped on %s: %s", self.source.key,
+                            repo["key"], exc)
+                continue
+            row = improve.run_for_repo(self._improve_ctx(), repo, env, now)
+            if row is not None:
+                ran += 1
+                log.info("[%s] improve run %s on %s: %s", self.source.key,
+                         row["id"], repo["key"], row["status"])
 
     # --- helpers -------------------------------------------------------
     def _limits_exceeded(self, now: dt.datetime) -> str | None:
