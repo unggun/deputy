@@ -13,7 +13,8 @@ from . import analyst, brain, graph, review, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
 from .jsonio import StationError
-from .models import AIState, AnalysisResult, ReviewResult, Task, TriageResult, agent_log_name
+from .models import (AIState, AnalysisResult, ReviewResult, Spend, Task, TriageResult,
+                     agent_log_name, run_station)
 from .providers.base import TaskProvider
 from .redact import redact
 from .state import Store
@@ -90,6 +91,32 @@ class Pipeline:
 
     def _status(self, name: str, default: str) -> str:
         return str(self.pcfg.get(name, default))
+
+    def _run_log(self, rid: str, task_key: str, repo_key: str,
+                 station: str) -> tuple[str, Path]:
+        """(station name, path) for the next run of `station` on this row.
+
+        The one place a station log path is built. Numbered from the ledger
+        (`run_station`), so a second implement or review pass gets its own
+        file instead of truncating the first pass's transcript -- `_EventLog`
+        opens with "w". The name also goes on the run's ledger line, which is
+        how the Runs tab links a run to its log.
+        """
+        name = run_station(station, self.store.runs_recorded(rid, station) + 1)
+        return name, self.log_root / agent_log_name(task_key, repo_key, name)
+
+    def _measure(self, what: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run one measurement-only git/gh call; None if it fails.
+
+        Everything this guards feeds the dashboard, not the work. A missing
+        SHA or an unreadable PR must cost a metric, never a tick -- the same
+        rule `blocked_by()` and `TokenUsage.from_payload` follow.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("measurement %s skipped: %s", what, exc)
+            return None
 
     # ==================================================================
     def tick(self, now: dt.datetime | None = None) -> None:
@@ -289,10 +316,59 @@ class Pipeline:
         for tid in wanted:
             self._set(tid, state)
 
+    def _snapshot_triage(self, task: Task, comments: list[Any],
+                         repos: list[dict[str, Any]], n: int,
+                         result: TriageResult | None, spend: Spend, *,
+                         error: str | None = None) -> None:
+        """Keep what triage saw and what it decided, as a JSON file.
+
+        Triage writes no agent log, and the ticket it judged keeps changing
+        afterwards: re-fetching it later returns comments written *after*
+        triage ran. A replay that wants to compare triage models or prompts
+        on past tickets needs the inputs as they were, so they are kept here,
+        redacted like every other thing this runner writes down. Inputs, not
+        the rendered prompt: a prompt variant has to be re-rendered from them.
+
+        Never raises. A full disk costs a benchmark sample, not a triage.
+        """
+        try:
+            record = {
+                "ts": int(time.time()), "source": self.source.key,
+                "row_id": self._row_id(task.id), "run": n,
+                "task": {"id": task.id, "key": task.key, "title": task.title,
+                         "description": task.description, "status": task.status,
+                         "url": task.url, "list_id": task.list_id,
+                         "list_name": task.list_name, "tags": task.tags},
+                "comments": [{"author": c.author, "is_bot": c.is_bot,
+                              "created_at": c.created_at, "text": c.text}
+                             for c in comments],
+                "repos": [{"key": r.get("key"), "language": r.get("language"),
+                           "notes": r.get("notes")} for r in repos],
+                "result": None if result is None else {
+                    "decision": result.decision, "confidence": result.confidence,
+                    "scope": result.scope, "repo_keys": result.repo_keys,
+                    "questions": result.questions, "reasoning": result.reasoning,
+                    "risk_flags": result.risk_flags,
+                    "policy_override": result.policy_override},
+                "error": error,
+                "cost_usd": spend.cost_usd, "tokens": spend.tokens,
+                **spend.run_fields(),
+            }
+            path = (self.log_root / "triage"
+                    / agent_log_name(task.key, self.source.key, f"triage-{n}")
+                    ).with_suffix(".json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self._clean(json.dumps(record, indent=1)),
+                            encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            log.warning("[%s] could not keep the triage snapshot", task.key,
+                        exc_info=True)
+
     def _do_triage(self, task: Task) -> None:
         rid = self._row_id(task.id)
         comments = self.provider.list_comments(task.id)
         repos = self._candidate_repos(task)
+        n = self.store.runs_recorded(rid, "triage") + 1
         try:
             result, spend = triage(self.agent, task, comments, repos, self.policy)
         except StationError as exc:
@@ -300,10 +376,14 @@ class Pipeline:
             # Record what it cost before this propagates to the generic
             # per-row handler in tick() — otherwise a failing triage run
             # spends money `daily_budget_usd` never finds out about.
-            self.store.record("triage", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
+            self.store.record("triage", rid, f"failed: {exc}", exc.cost_usd,
+                              exc.tokens, **exc.spend.run_fields())
+            self._snapshot_triage(task, comments, repos, n, None, exc.spend,
+                                  error=str(exc))
             raise
         self.store.record("triage", rid, f"{result.decision} ({result.scope})",
-                          spend.cost_usd, spend.tokens)
+                          spend.cost_usd, spend.tokens, **spend.run_fields())
+        self._snapshot_triage(task, comments, repos, n, result, spend)
         log.info("[%s] triage -> %s (conf %.2f)", task.key, result.decision, result.confidence)
 
         if result.decision == "human_only":
@@ -507,6 +587,7 @@ class Pipeline:
         # recomputes the same count before anything new is posted, so the
         # idempotency claim in `_comment` still suppresses the duplicate.
         round_key = len(comments)
+        run_log, log_path = self._run_log(rid, task.key, repo["key"], "plan")
         try:
             result, spend = analyst.analyse(
                 self.agent, task, comments, repo,
@@ -514,12 +595,14 @@ class Pipeline:
                 cwd=wt,
                 model=self.acfg.get("model"),
                 tools=self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS,
-                log_path=self.log_root / agent_log_name(task.key, repo["key"], "plan"),
+                log_path=log_path,
             )
         except StationError as exc:
-            self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
+            self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd,
+                              exc.tokens, log=run_log, **exc.spend.run_fields())
             raise
-        self.store.record("plan", rid, result.verdict, spend.cost_usd, spend.tokens)
+        self.store.record("plan", rid, result.verdict, spend.cost_usd, spend.tokens,
+                          log=run_log, **spend.run_fields())
         # The analyst produced output without crashing: this station's own
         # crash budget resets so the next station starts with a clean slate
         # instead of inheriting attempts spent recovering earlier crashes.
@@ -576,10 +659,16 @@ class Pipeline:
             prompt = _revision_prompt(task, repo, meta, revision, brain_block)
         else:
             prompt = _work_prompt(task, repo, meta, brain_block)
-        res = self.agent.work(prompt, wt,
-                              log_path=self.log_root / agent_log_name(task.key, repo["key"], "implement"))
+        # Measured before the agent touches the worktree: what this run adds
+        # on top of `before` is this runner's work, and anything else that
+        # later shows up on the PR was pushed by a person.
+        before = self._measure("head", vcs.head_sha, wt, env=env)
+        forked_at = (None if meta.get("base_sha") else self._measure(
+            "merge-base", vcs.merge_base, wt, repo.get("base_branch", "main"), env=env))
+        run_log, log_path = self._run_log(rid, task.key, repo["key"], "implement")
+        res = self.agent.work(prompt, wt, log_path=log_path)
         self.store.record("implement", rid, res.error or "ok", res.cost_usd,
-                          res.usage.total)
+                          res.usage.total, log=run_log, **Spend.of(res).run_fields())
 
         if not res.ok:
             self._escalate(rid, f"Agent run failed: {res.error}")
@@ -590,6 +679,10 @@ class Pipeline:
 
         vcs.push(wt, branch, env=env)
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
+        self._note_own_commits(meta, wt, before, env)
+        if forked_at:
+            # The commit a replay of this ticket would start from.
+            meta["base_sha"] = forked_at
         cycle = int((meta.get("revision") or {}).get("cycle", 0))
         meta.pop("revision", None)          # the reviewer judges a clean row
         meta["impl_summary"] = res.text[:4000]
@@ -619,6 +712,7 @@ class Pipeline:
         meta = json.loads((self.store.get(rid) or {}).get("meta") or "{}")
 
         wt = vcs.ensure_review_worktree(repo, branch, self.work_root, env=env)
+        run_log, log_path = self._run_log(rid, task.key, repo["key"], "review")
         try:
             result, spend = review.review(
                 self.agent, task.key, meta.get("acceptance_criteria", []),
@@ -627,12 +721,14 @@ class Pipeline:
                 cwd=wt,
                 model=self.acfg.get("reviewer_model") or self.acfg.get("model"),
                 tools=review.tools_for(repo, self.acfg.get("reviewer_tools")),
-                log_path=self.log_root / agent_log_name(task.key, repo["key"], "review"),
+                log_path=log_path,
             )
         except StationError as exc:
-            self.store.record("review", rid, f"failed: {exc}", exc.cost_usd, exc.tokens)
+            self.store.record("review", rid, f"failed: {exc}", exc.cost_usd,
+                              exc.tokens, log=run_log, **exc.spend.run_fields())
             raise
-        self.store.record("review", rid, result.verdict, spend.cost_usd, spend.tokens)
+        self.store.record("review", rid, result.verdict, spend.cost_usd, spend.tokens,
+                          log=run_log, **spend.run_fields())
         cycle = int(meta.get("review_cycle", 0))
 
         if result.verdict == "reject":
@@ -717,6 +813,7 @@ class Pipeline:
 
         st = vcs.pr_status(wt, number, env=env)
         if st["merged"]:
+            self.store.record("pr_merged", rid, self._merge_detail(row, wt, number, env))
             self._set(rid, AIState.DONE)
             # Gated: on a two-repo ticket the first merge must not close the
             # ticket out from under the second, still-open PR.
@@ -742,6 +839,11 @@ class Pipeline:
                                       since_iso=meta.get("feedback_seen_at"),
                                       env=env)
         approvals = vcs.approving_reactions(wt, number, allowlist, env=env)
+        if not meta.get("first_review_at") and (
+                feedback or approvals
+                or st.get("review_decision") in ("APPROVED", "CHANGES_REQUESTED")):
+            self._note_first_review(rid, meta, wt, number, allowlist, env,
+                                    seen_human=bool(feedback or approvals))
         needs_fix = st["ci"] == "failing" or bool(feedback)
 
         if approvals and not feedback and st["ci"] != "failing":
@@ -755,6 +857,8 @@ class Pipeline:
         if not needs_fix:
             if st["draft"] and st["ci"] in ("passing", "none"):
                 vcs.mark_ready(wt, number, env=env)
+                # When the PR started waiting on a person rather than on CI.
+                self.store.record("pr_ready", rid)
                 self._set_status_when(rid, AIState.PR_OPEN, "review_status", "code review")
                 self._comment(rid, f"ready-{number}",
                               f"Checks are green. PR is ready for review: {st['url']}")
@@ -772,10 +876,16 @@ class Pipeline:
         logs = vcs.failing_check_logs(wt, number, env=env) if st["ci"] == "failing" else ""
         prompt = _fix_prompt(row["task_key"], st, feedback, logs,
                              self._brain_block(repo["key"]))
-        res = self.agent.work(prompt, wt,
-                              log_path=self.log_root / agent_log_name(row["task_key"], repo["key"], f"fix-{attempts}"))
-        self.store.record("fix", rid, res.error or "ok", res.cost_usd,
-                          res.usage.total)
+        # What prompted this pass, on the ledger line: a fix for a red check
+        # is the agent cleaning up after itself; a fix for a human comment is
+        # a person having to step in, which is what autonomy counts.
+        cause = "+".join(c for c, hit in (("ci", st["ci"] == "failing"),
+                                          ("feedback", bool(feedback))) if hit)
+        before = self._measure("head", vcs.head_sha, wt, env=env)
+        run_log, log_path = self._run_log(rid, row["task_key"], repo["key"], "fix")
+        res = self.agent.work(prompt, wt, log_path=log_path)
+        self.store.record("fix", rid, f"{cause}: {res.error or 'ok'}", res.cost_usd,
+                          res.usage.total, log=run_log, **Spend.of(res).run_fields())
         # Second-precision and Z-suffixed to match GitHub's `createdAt`: these
         # are compared as strings, and an isoformat() fraction sorts *before*
         # a bare `Z`, which would let a same-second comment through forever.
@@ -783,6 +893,7 @@ class Pipeline:
             "%Y-%m-%dT%H:%M:%SZ")
         if res.ok and vcs.commit_all(wt, f"{row['task_key']}: address review/CI feedback", env=env):
             vcs.push(wt, row["branch"], env=env)
+            self._note_own_commits(meta, wt, before, env)
             self._comment(rid, f"fix-{number}-{attempts}",
                           f"Pushed fixes (attempt {attempts}).\n\n{res.text[:1200]}")
             self.store.upsert(rid, attempts=attempts, meta=meta)
@@ -955,6 +1066,70 @@ class Pipeline:
             return ""
         row = self.store.get(rid) or {}
         return f"`{row.get('repo_key') or '?'}` — " if row.get("repo_key") else ""
+
+    # --- measurement ---------------------------------------------------
+    def _note_own_commits(self, meta: dict[str, Any], wt: Path,
+                          before: str | None, env: dict[str, str]) -> None:
+        """Remember the SHAs this runner put on the branch, in `meta`.
+
+        At merge, any commit on the PR that is not in this list was pushed by
+        someone else -- the "human commits" half of autonomy. Comparing SHAs
+        rather than author logins is deliberate: the runner usually pushes
+        with the developer's own GitHub identity, so a login cannot tell the
+        two apart. Without a `before` SHA the list is left alone, and the
+        merge is then reported as unknown rather than guessed.
+        """
+        added = self._measure("own-commits", vcs.commits_since, wt, before,
+                              env=env) if before else None
+        if added is None:
+            meta["own_commits_incomplete"] = True
+            return
+        meta["own_commits"] = list(dict.fromkeys(
+            list(meta.get("own_commits") or []) + added))
+
+    def _merge_detail(self, row: dict[str, Any], wt: Path, number: int,
+                      env: dict[str, str]) -> str:
+        """`human_commits=N` for the merge's ledger line, or `=?` if unknowable.
+
+        Unknown is a real answer: a row whose own pushes predate SHA tracking,
+        or whose PR commits cannot be read, must not be scored autonomous (or
+        not) on a guess. `db.flow()` leaves those out of the autonomy rate.
+        """
+        meta = json.loads(row.get("meta") or "{}")
+        own = set(meta.get("own_commits") or [])
+        on_pr = self._measure("pr-commits", vcs.pr_commits, wt, number, env=env)
+        if not own or meta.get("own_commits_incomplete") or on_pr is None:
+            return "human_commits=?"
+        return f"human_commits={sum(1 for sha in on_pr if sha not in own)}"
+
+    def _note_first_review(self, rid: str, meta: dict[str, Any], wt: Path,
+                           number: int, allowlist: list[str],
+                           env: dict[str, str], *, seen_human: bool) -> None:
+        """Ledger line for the first time a human looked at the PR.
+
+        Stamped with GitHub's own time for that review, comment or reaction,
+        not the poll's: a tick runs every 15 minutes or so, and "PR to first
+        human review" is the stage this dashboard most needs to get right.
+        Recorded once per row; `meta["first_review_at"]` is the latch.
+
+        `review_decision` alone does not prove a human: a review app can
+        approve too. When GitHub's history cannot confirm a person and the
+        poll's own human-filtered reads did not either, nothing is latched
+        and the next tick asks again.
+        """
+        found = self._measure("first-review", vcs.first_human_activity,
+                              wt, number, allowlist, env=env)
+        if found is None and not seen_human:
+            return
+        at, login = found if found else ("", "")
+        try:
+            ts = int(dt.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            ts = int(time.time())
+        self.store.record("pr_review", rid, login or "human", ts=ts)
+        meta["first_review_at"] = at or dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        self.store.upsert(rid, meta=meta)
 
     def _record_transition(self, rid: str, new_state: AIState, *,
                            old: str | None = None) -> None:
