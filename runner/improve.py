@@ -114,10 +114,21 @@ def settings(raw: Any) -> dict[str, Any]:
     out = dict(DEFAULTS)
     if isinstance(raw, dict):
         out.update({k: v for k, v in raw.items() if k in DEFAULTS and v is not None})
-    out["enabled"] = bool(out["enabled"])
+    # A `${VAR}`-expanded or quoted "false" is a string, and bool("false") is
+    # True: that would switch on a station that spends quota.
+    flag = out["enabled"]
+    out["enabled"] = (flag.strip().lower() in ("1", "true", "yes", "on")
+                      if isinstance(flag, str) else bool(flag))
+    # This runs in Pipeline.__init__, outside the per-source guard, so a typo
+    # must cost a default, not every source's tick.
     for k in DEFAULTS:
         if k != "enabled":
-            out[k] = max(0, int(out[k]))
+            try:
+                out[k] = max(0, int(out[k]))
+            except (TypeError, ValueError):
+                log.warning("runner.improve.%s=%r is not a whole number; using %d",
+                            k, out[k], DEFAULTS[k])
+                out[k] = DEFAULTS[k]
     return out
 
 

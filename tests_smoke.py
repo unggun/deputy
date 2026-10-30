@@ -3536,6 +3536,11 @@ _i_checks.append(("improve is off unless configured, and settings coerce",
                   and IM.settings({"enabled": 1, "min_evidence": "3", "bogus": 9,
                                    "max_age_days": None})
                   == {**IM.DEFAULTS, "enabled": True, "min_evidence": 3}))
+_i_checks.append(("a quoted false stays off, and a bad number falls back, never raises",
+                  IM.settings({"enabled": "false"})["enabled"] is False
+                  and IM.settings({"enabled": " Yes "})["enabled"] is True
+                  and IM.settings({"min_evidence": "five", "max_age_days": [1]})
+                  == {**IM.DEFAULTS}))
 
 
 def _review_log(path, findings, summary="needs work", verdict="request_changes"):

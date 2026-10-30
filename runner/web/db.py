@@ -643,14 +643,21 @@ class Reader:
         count = {s: sum(1 for r in rows if r["status"] == s) for s in self._IMPROVE_SHOWN}
         n = count["accepted"] + count["rejected"]
         ci = _wilson(count["accepted"], n)
+        # Spend is dated by when the run ran, from the ledger, exactly as the
+        # Spend chart dates it. The rows above are dated by decision, and keep
+        # an old pending proposal whatever the range, so summing their cost
+        # would charge a months-old run to this week.
+        spent = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) c, COALESCE(SUM(tokens), 0) t"
+            " FROM events WHERE kind = 'improve' AND ts >= ?",
+            (self._since(days),)).fetchone()
         return {
             "items": items, "accepted": count["accepted"],
             "rejected": count["rejected"], "pending": count["pending"],
             "none": count["none"], "errors": count["error"], "n": n,
             "rate": (count["accepted"] / n) if n else None,
             "low": ci[0] if ci else None, "high": ci[1] if ci else None,
-            "cost_usd": round(sum(float(r["cost_usd"] or 0) for r in rows), 6),
-            "tokens": sum(int(r["tokens"] or 0) for r in rows),
+            "cost_usd": round(float(spent["c"]), 6), "tokens": int(spent["t"]),
         }
 
     def review_cycles(self, days: int = 30) -> list[dict[str, Any]]:

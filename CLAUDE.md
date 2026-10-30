@@ -790,7 +790,13 @@ accident:
   `runner.log_dir` named by `agent_log_name(source, repo, "improve-N")`. It
   counts against both daily limits, `_budget_available` is checked before
   each run, and it is not in `_RUN_KINDS`. It shares the grey overhead band
-  with `score` on the Spend chart.
+  with `score` on the Spend chart, and the Improvements tab's cost reads the
+  same ledger lines by run time, never the proposal rows (which are dated by
+  decision and keep an old pending one whatever the range).
+- **`improve.settings()` never raises.** It runs in `Pipeline.__init__`,
+  outside the per-source guard. A bad number falls back to its default with a
+  warning, and `enabled` parses a string, because a `${VAR}`-expanded
+  `"false"` would otherwise be truthy and switch on a station that spends.
 - **Last in the tick**, after scoring so this tick's verdicts count, inside
   `windows.improve` (default: the triage window), at most `max_per_run` runs
   per source. Repos are taken in config order; that cannot starve a later repo,

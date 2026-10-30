@@ -885,9 +885,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a rejection reason is redacted on the way out",
           all("ghp_BBBB" not in (i["reason"] or "") for i in out["items"])
           and any("leaked" in (i["reason"] or "") for i in out["items"]))
-    check("improve spend is summed over the runs shown",
-          abs(out["cost_usd"] - 6 * 0.25) < 1e-9 and out["tokens"] == 6000)
+    check("improve spend is the ledger's in the range, not the rows' whatever their age",
+          out["cost_usd"] == 0 and out["tokens"] == 0)
     st.record("improve", None, "acme:api #1: pending", 0.25, 1000, ts=now)
+    st.record("improve", None, "acme:api #0: pending", 0.5, 2000, ts=now - 86400 * 60)
+    spent = Reader(path, limits={}).improvements(30)
+    check("an improve run is charged to the day it ran, as on the Spend chart",
+          spent["cost_usd"] == 0.25 and spent["tokens"] == 1000)
     kinds = set()
     for d in Reader(path, limits={}).spend_by_day(7):
         kinds |= set(d["kinds"])
