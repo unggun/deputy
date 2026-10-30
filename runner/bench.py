@@ -152,13 +152,22 @@ def answer_key(history: list[dict[str, Any]], snap: dict[str, Any], *,
         final[t] = new
     if not final:
         return None, None, "still in flight"
+    # Every repo this run routed to has to have moved. `_route()` creates all
+    # the rows before it moves any, so a provider error part-way leaves a
+    # routed row at `new` with no event at all -- and the repos that did
+    # move would read as the whole of the work. A row whose repo can no
+    # longer be read (a legacy row since deleted) may be the missing one,
+    # which is why it is counted rather than ignored.
+    of = [repo_of(t) for t in final]
+    unmoved = {str(k) for k in result.get("repo_keys") or []} - {r for r in of if r}
+    if len(unmoved) > of.count(None):
+        return None, None, "still in flight"
     terminal = ("done", "blocked", "human-only")
     if any(st not in terminal for st in final.values()):
         return None, None, "still in flight"
     if all(st == "done" for st in final.values()):
-        repos = [repo_of(t) for t in final]
-        return ["execute"], (sorted({r for r in repos if r})
-                             if all(repos) else None), "merged"
+        return ["execute"], (sorted({r for r in of if r})
+                             if all(of) else None), "merged"
     if any(st == "done" for st in final.values()):
         return ["execute"], None, "merged in part"
     return None, None, "ended blocked"

@@ -847,7 +847,11 @@ each easy to undo by accident:
   wants anything else (`reset`); a human_only nobody reset for
   `SETTLED_AFTER` stands (`stood`). Both human_only grades need the
   placeholder's `->human-only` move in between: a verdict comment that failed
-  to post leaves the row `new`, and the tick's own retry is not a reset. Every other snapshot is left out and
+  to post leaves the row `new`, and the tick's own retry is not a reset. Both
+  execute grades need a move from every repo in the snapshot's `repo_keys`:
+  `_route()` creates every row before it moves any, so a provider error
+  part-way leaves one at `new` with no event, and the repos that did move
+  would read as the whole ticket. Every other snapshot is left out and
   counted by reason. A grade on a guess would be worse than no grade.
 - **A snapshot is matched to its ledger line by run number and time.** The
   `n`th triage event on the placeholder, within `SNAPSHOT_SLACK` of the

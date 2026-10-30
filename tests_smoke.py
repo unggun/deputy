@@ -4164,6 +4164,9 @@ with tempfile.TemporaryDirectory() as _tmp:
                                "B7__mycorp__triage-1": "merged",
                                "B8__mycorp__triage-1": "merged in part"}))
     _by = {c.name: c for c in _cases}
+    # Not _cases[:1]: two snapshots written in the same second sort by name, so
+    # which one is newest depends on where the clock ticked over.
+    _one = [_by["B8__mycorp__triage-1"]]
     _b_checks.append(("what each outcome accepts",
                       _by["B1__mycorp__triage-1"].expected == ["execute"]
                       and _by["B2__mycorp__triage-1"].expected == ["clarify"]
@@ -4241,8 +4244,8 @@ with tempfile.TemporaryDirectory() as _tmp:
     _trials = [_bench.decode(t) for t in _st.bench_trials(_run)]
     _sum = {r["variant"].split(" · ")[0]: r for r in _bench.summarize(_trials)}
     _b_checks.append(("every variant on a ticket before the next ticket",
-                      [x["key"] for x in _ag.calls][:2] == ["B8", "B8"]
-                      and [x["model"] for x in _ag.calls][:2] == [None, "fast"]
+                      all(a["key"] == b["key"] for a, b in zip(_ag.calls[::2], _ag.calls[1::2]))
+                      and [x["model"] for x in _ag.calls] == [None, "fast"] * 7
                       and len(_seen) == 14))
     _b_checks.append(("the baseline is graded against history, routing included",
                       (_sum["sonnet"]["correct"], _sum["sonnet"]["n"]) == (6, 7)
@@ -4277,7 +4280,7 @@ with tempfile.TemporaryDirectory() as _tmp:
     # the prompt a variant replaces, and today's repo notes
     _pv = _bench.variants([], [str(_vfile)], default_model="sonnet")[1:]
     _ag2 = _Variants(_answers)
-    _bench.run(_ag2, _st, _cases[:1], _pv, policy=_policy, repos_now=_repos_now, repeat=1,
+    _bench.run(_ag2, _st, _one, _pv, policy=_policy, repos_now=_repos_now, repeat=1,
                max_usd=5.0, limits_check=lambda: None, secrets=[])
     _b_checks.append(("a prompt variant replaces the built-in prompt, not the ticket",
                       _ag2.calls[0]["prompt"].startswith("CLASSIFY WITH CARE.")
@@ -4287,23 +4290,23 @@ with tempfile.TemporaryDirectory() as _tmp:
     _cur[("mycorp", "pulse-backend")] = dict(_cur[("mycorp", "pulse-backend")],
                                              notes="THE NEW NOTES")
     _ag3 = _Variants(_answers)
-    _bench.run(_ag3, _st, _cases[:1],
+    _bench.run(_ag3, _st, _one,
                _bench.variants([], [], default_model="sonnet", current_repos=True),
                policy=_policy, repos_now=_cur, repeat=1, max_usd=5.0,
                limits_check=lambda: None, secrets=[])
     _ag4 = _Variants(_answers)
-    _bench.run(_ag4, _st, _cases[:1], _vs[:1], policy=_policy, repos_now=_cur, repeat=1,
+    _bench.run(_ag4, _st, _one, _vs[:1], policy=_policy, repos_now=_cur, repeat=1,
                max_usd=5.0, limits_check=lambda: None, secrets=[])
     _b_checks.append(("--current-repos offers today's notes; without it, the snapshot's",
                       "THE NEW NOTES" in _ag3.calls[0]["prompt"]
                       and "THE NEW NOTES" not in _ag4.calls[0]["prompt"]))
-    _old_notes = next(r["notes"] for r in _cases[0].snap["repos"]
+    _old_notes = next(r["notes"] for r in _one[0].snap["repos"]
                       if r["key"] == "pulse-backend")
     _gone = dict(_repos_now)
     _gone[("mycorp", "pulse-backend")] = {
         k: v for k, v in _gone[("mycorp", "pulse-backend")].items() if k != "notes"}
     _ag9 = _Variants(_answers)
-    _bench.run(_ag9, _st, _cases[:1],
+    _bench.run(_ag9, _st, _one,
                _bench.variants([], [], default_model="sonnet", current_repos=True),
                policy=_policy, repos_now=_gone, repeat=1, max_usd=5.0,
                limits_check=lambda: None, secrets=[])
@@ -4338,7 +4341,7 @@ with tempfile.TemporaryDirectory() as _tmp:
 
     # a failed trial is counted beside the rate, never in it, and its spend kept
     _ag8 = _TriageScript({"B8": ["no json here"]}, cost=0.03)
-    _bad = _bench.run(_ag8, _st, _cases[:1], _vs[:1], policy=_policy, repos_now=_repos_now,
+    _bad = _bench.run(_ag8, _st, _one, _vs[:1], policy=_policy, repos_now=_repos_now,
                       repeat=1, max_usd=5.0, limits_check=lambda: None,
                       secrets=["sekrit-123"])[0]
     _bt = [_bench.decode(t) for t in _st.bench_trials(_bad)]
@@ -4353,7 +4356,7 @@ with tempfile.TemporaryDirectory() as _tmp:
             return AgentResult(ok=True, cost_usd=0.01, text=json.dumps(
                 dict(_HUMAN, reasoning="token sekrit-123 is in the ticket")))
 
-    _leak = _bench.run(_Leaky({}), _st, _cases[:1], _vs[:1], policy=_policy,
+    _leak = _bench.run(_Leaky({}), _st, _one, _vs[:1], policy=_policy,
                        repos_now=_repos_now, repeat=1, max_usd=5.0,
                        limits_check=lambda: None, secrets=["sekrit-123"])[0]
     _b_checks.append(("a trial's reasoning is redacted before it is stored",
@@ -4450,6 +4453,39 @@ with tempfile.TemporaryDirectory() as _tmp:
                       and [c.why for c in _c] == ["stood"]
                       and _c[0].name == "B20__mycorp__triage-2"
                       and _o == {"verdict not applied": 1}))
+
+
+# a two-repo route that failed part-way is not graded as a merge of one
+class _FlakyState(FakeProvider):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.fail = 1
+
+    def set_ai_state(self, tid, state):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("provider 502")
+        return super().set_ai_state(tid, state)
+
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg, _src = _two_repo_cfg(_tmp)
+    _cfg.data["runner"]["windows"]["execute"] = ["23:00-23:01"]
+    _st = Store(f"{_tmp}/s.db")
+    _prov = _FlakyState([mk("B21", "Export button", "endpoint plus a download button")])
+    Pipeline(_cfg, _src, _prov,
+             _TriageScript({"B21": [_ex("pulse-backend", "pulse-frontend")]}),
+             _st).tick(dt.datetime(2026, 8, 10, 7, 0))
+    _moved = [r["task_id"] for r in _st.conn.execute(
+        "SELECT task_id FROM events WHERE kind = 'state'")]
+    _st.record("state", _moved[0], "pr-open->done")
+    _st.upsert(_moved[0], state="done")
+    _c, _o = _bench.load(Path(_tmp) / "l", _st, now=int(time.time()) + 8 * 86400,
+                         policy=_cfg.get("policy", {}))
+    _b_checks.append(("a routed repo that never moved keeps the ticket in flight",
+                      len(_moved) == 1 and _moved[0] == rid("B21", "pulse-backend")
+                      and _st.get(rid("B21", "pulse-frontend"))["state"] == "new"
+                      and _c == [] and _o == {"still in flight": 1}))
 
 # triage keeps the spend of a reply it cannot use
 with tempfile.TemporaryDirectory() as _tmp:
