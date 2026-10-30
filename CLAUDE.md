@@ -14,7 +14,7 @@ PR through CI/review until merge.
 ```
 runner/
   __init__.py  cli.py  config.py  graph.py  models.py  pipeline.py  state.py  triage.py  vcs.py
-  analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py
+  analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py  improve.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
   providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
   web/       __init__.py  api.py  db.py  logs.py  static/ (committed build output)
@@ -50,6 +50,8 @@ deputy daemon --interval 900      # loop, for hosts where cron is awkward
 deputy status                     # in-flight rows across all sources
 deputy graph                      # print the live transition table as Mermaid
 deputy score NAME [--run ID] [--record]   # judge real runs with one scorer; records nothing by default
+deputy improve list|show ID|accept ID|reject ID [--reason ..]   # proposed brain notes
+deputy improve run --repo KEY             # one improve run now, skipping the "is it due" check
 python3 tests_smoke.py                    # offline state-machine tests (fake provider + fake agent)
 ```
 
@@ -172,13 +174,13 @@ whatever branch and worktree the dropped row already owned.
   `PR_OPEN`. The repo lock exists to stop two agents branching off the same base; a
   ticket already in review or already PR'd is no longer racing anyone for that base.
 
-### Five model seams
+### Six model seams
 
 `CodingAgent` has two methods, `reason` and `work`, but `work()` takes `model` and
 `allowed_tools` overrides — so the analyst and reviewer stations reuse it with their
 own model and tool set instead of adding new methods — and `reason()` takes `model`
 and `system_prompt`, which is how the scoring judge reuses triage's seam. That gives
-five effectively independent seams:
+six effectively independent seams:
 
 - `reason(prompt, *, max_turns=1)` — triage. Runs `claude -p` with `--tools ""` and one
   turn, so **triage never reads the repo**; it judges `scope` *and routes the
@@ -206,6 +208,12 @@ five effectively independent seams:
   triage's (`triage_model`, `TRIAGE_SYSTEM_PROMPT`) when not passed. A named system
   prompt is applied with `isolate_triage: false` too: the default agent prompt is the
   wrong one for a judge whatever the isolation setting.
+- `work(prompt, cwd, model=agent.improve_model, allowed_tools=agent.planner_tools)`
+  — the improve station. The analyst's tools, in a detached checkout of the base
+  branch (`vcs.ensure_review_worktree`), so it can check a claim against the code but
+  change nothing. `improve_model` falls back to `agent.model`. Like the analyst it is
+  `work()`, not `reason()`, and deliberately not isolated: the repo's own `CLAUDE.md`
+  is what it needs to see to avoid proposing what is already written down.
 
 `triage_model` falls back to `model` when unset. `allowed_tools` includes `Agent`, which
 is what permits `work()` to dispatch subagents — the tool is named `Agent`, not `Task`.
@@ -361,10 +369,11 @@ state-write site.
 ### Brain
 
 `brain.py` holds durable per-repo notes at `runner.brain_dir`, one markdown file per
-`{source}__{repo}`. It is appended to **only on an approving review**, before the PR is
-even opened — a rejected plan, a rejected/changes-requested review, or a crashed run
-writes nothing, so the brain only accumulates notes from changes an independent review
-actually approved. It refuses to grow past `limits.brain_max_bytes`: at the
+`{source}__{repo}`. It is appended to in exactly two places: on an **approving review**,
+before the PR is even opened — a rejected plan, a rejected/changes-requested review, or
+a crashed run writes nothing — and by `improve.accept()`, when a human accepts a
+proposed note. Nothing else writes it, so the brain only accumulates notes an
+independent review or a person approved. It refuses to grow past `limits.brain_max_bytes`: at the
 cap it logs and skips the append rather than evicting older notes, because a brain that
 quietly forgets is worse than one that tells you to prune it. It is plain markdown in a
 known directory — editing or deleting it by hand is a supported operation, not
@@ -695,8 +704,8 @@ Invariants, each easy to undo by accident:
   re-rolled every tick.
 - **Scoring spend is on the ledger, not the row.** `score_run` records kind
   `score` with `task_id` NULL: it counts against both daily limits (and every
-  judge call is behind `_budget_available`), shows as its own grey band on the
-  Spend chart, and stays out of a PR's cost and out of `runs_recorded()`. It is
+  judge call is behind `_budget_available`), shows in the grey overhead band on
+  the Spend chart (shared with `improve` runs), and stays out of a PR's cost and out of `runs_recorded()`. It is
   not in `_RUN_KINDS`, so judges do not appear on the Runs tab.
 - **One path for the tick and the CLI.** `scorers.score_run()` is what both
   `Pipeline._score_runs()` and `deputy score` call, so a verdict tried at the
@@ -708,8 +717,8 @@ Invariants, each easy to undo by accident:
 - **`scorers.load()` never raises for a file.** It runs in `Pipeline.__init__`,
   which `cli._pipelines` calls outside the per-source guard, so its per-file
   catch is deliberately broad: a rubric typo must cost a scorer, not the tick.
-- **Scoring is last in the tick** and inside `windows.score` (default: the
-  triage window). It moves no ticket, so it only ever gets the budget the work
+- **Scoring comes after the work in the tick** and inside `windows.score`
+  (default: the triage window); only the improve station follows it. It moves no ticket, so it only ever gets the budget the work
   left. Scorers take turns, starting with whichever has waited longest
   (`Store.last_scored()`), so one with a backlog cannot take every
   `max_scores_per_run` slot, this tick or the next. Failed runs (`models.run_outcome`, shared with the
@@ -725,6 +734,71 @@ Invariants, each easy to undo by accident:
   import, so a developer's own `~/.deputy/scorers` cannot start judging with
   the test fakes. Keep `scorers_dir` commented out in `config.example.yaml` for
   the same reason.
+
+### Improvements
+
+`runner/improve.py` turns one repo's failures into at most one proposed brain
+note. The brain otherwise learns only from approvals; this is the station that
+learns from the failed scorer verdicts and the reviews that asked for changes.
+Off by default (`runner.improve.enabled`). Invariants, each easy to undo by
+accident:
+
+- **Propose, never apply.** A run writes an `improvements` row with status
+  `pending`. Only `improve.accept()` (`deputy improve accept`) writes the
+  brain, through `brain.append()` and its cap. At the cap nothing is written
+  and the proposal stays pending: the brain refuses rather than evicts, here
+  too. The dashboard shows the CLI commands; it does not grow a button.
+- **Every proposal cites what it was shown.** `parse_proposal()` keeps only
+  refs (`score:<scores.id>`, `review:<events.id>`) that were rendered into the
+  prompt; a proposal citing none of them is recorded as `none`, not pending. A
+  note the brain already has, or one already pending or rejected (compared as
+  `brain.append` compares, case and whitespace folded), is `none` too.
+- **Evidence is spent once.** `Store.improve_evidence()` leaves out every ref
+  in the `evidence` column of a `running`, `pending`, `none`, `accepted` or
+  `rejected` row (`Store.IMPROVE_CONSUMED`). That is what makes a quiet repo
+  cost nothing and stops a rejected idea being re-derived from the same
+  failures. `error` and `abandoned` spend nothing: a failed run is retried, but
+  `improve.due()` holds the repo off for `RETRY_AFTER_ERROR` (a day) so a
+  broken setup costs one run a day, not one a tick.
+- **Rejections are remembered.** Every pending and rejected note, with the
+  human's reason, goes into every later prompt for that repo.
+- **One run per repo at a time.** `claim_improvement()` inserts a `running`
+  row under a partial unique index on `(source, repo_key) WHERE status =
+  'running'`. A claim older than `improve.claim_ttl()` (four agent timeouts,
+  since a run may retry once) belongs to a killed tick; it is marked
+  `abandoned`, which hands its evidence back, and `finish_improvement()` only
+  updates a row still `running`, so a run that comes back late changes nothing.
+  Evidence is re-read after the claim, so what a run is shown is exactly what
+  no other live run on that repo can be shown.
+- **Whole items or none.** Evidence is rendered oldest first and added while
+  the prompt fits `agent.max_prompt_bytes`; an item that does not fit is left
+  for a later run, never clipped mid-item. A score item carries the judge's
+  reasoning and, when short enough, the run's condensed transcript; a review
+  item carries the reviewer's blocking findings read back from the run's final
+  reply (`scorers.final_text()`). A review whose log no longer parses is spent
+  without an agent call, so it cannot wedge the repo.
+- **Spend is on the ledger, not a row.** Kind `improve`, `task_id` NULL,
+  detail `"{source}:{repo} #{id}: {status}"`, log under `improve/` in
+  `runner.log_dir` named by `agent_log_name(source, repo, "improve-N")`. It
+  counts against both daily limits, `_budget_available` is checked before
+  each run, and it is not in `_RUN_KINDS`. It shares the grey overhead band
+  with `score` on the Spend chart.
+- **Last in the tick**, after scoring so this tick's verdicts count, inside
+  `windows.improve` (default: the triage window), at most `max_per_run` runs
+  per source. Repos are taken in config order; that cannot starve a later repo,
+  because a run spends the earlier repo's evidence and it is not due again
+  until new failures arrive.
+- **Redacted before it is stored.** `problem`, `solution`, `note` and
+  `reasoning` go through `redact()` with the runner's known secrets, and
+  `Reader.improvements()` scrubs them again on the way out, like every other
+  dashboard row.
+- **One path for the tick and the CLI.** `deputy improve run` builds the same
+  `improve.Context` and calls `run_for_repo()`; it skips `due()` on purpose
+  (it is how an operator sees what the station makes of their history before
+  turning it on) and never `limits_exceeded()`.
+- **Brain notes only, for now.** `target` is always `brain`. Opening a PR
+  against the target repo's own `CLAUDE.md` was considered and deferred; the
+  column exists so it can be added without a migration.
 
 `runner/web/static/` is committed build output, not source. `web/vite.config.ts`
 points `build.outDir` at it directly rather than the default `web/dist`,

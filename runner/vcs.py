@@ -362,9 +362,11 @@ def pr_size(wt: Path, number: int,
     out = run(["gh", "pr", "view", str(number), "--json",
                "additions,deletions,changedFiles"], cwd=wt, env=env).stdout
     data = json.loads(out)
-    return {"additions": int(data.get("additions") or 0),
-            "deletions": int(data.get("deletions") or 0),
-            "files": int(data.get("changedFiles") or 0)}
+    # No `or 0`: a field GitHub did not send is a size nobody knows, and a
+    # KeyError here is what makes `_measure` record it as absent, not as zero.
+    return {"additions": int(data["additions"]),
+            "deletions": int(data["deletions"]),
+            "files": int(data["changedFiles"])}
 
 
 def first_human_activity(wt: Path, number: int, allowlist: list[str],

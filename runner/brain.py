@@ -64,6 +64,13 @@ def as_prompt_block(path: Path) -> str:
     )
 
 
+def has_note(path: Path, note: str) -> bool:
+    """Is `note` already in the brain, by the same comparison `append` uses?"""
+    return _norm(" ".join(str(note).split())) in {
+        _norm(_DATE_PREFIX.sub("", line))
+        for line in read(path).splitlines() if line.strip()}
+
+
 def append(path: Path, notes: list[str], *,
            max_bytes: int = DEFAULT_MAX_BYTES,
            today: dt.date | None = None) -> list[str]:

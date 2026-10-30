@@ -169,7 +169,7 @@ export function Flow({ days, onOpen }: { days: number; onOpen: (id: string) => v
             counts them. Cost is the row's own plan, implement, review and fix
             runs; triage covers the whole ticket and judging is overhead, so
             neither is charged to one PR. "unknown" is a PR merged before size
-            was recorded.
+            was recorded, or one whose size GitHub could not report.
           </p>
         </CardContent>
       </Card>

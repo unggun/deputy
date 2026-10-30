@@ -3039,6 +3039,32 @@ _s_checks.append(("an empty pass_score is refused, not a TypeError",
 _s_checks.append(("a pass_score nothing can reach is refused",
                   _rejects(_GOOD.replace("labels:", "pass_score: 2\nlabels:"),
                            "nothing could pass")))
+_s_checks.append(("a file saved with a byte-order mark still parses",
+                  SC.parse("\ufeff" + _GOOD).name == "ran-tests"))
+_s_checks.append(("an empty frontmatter says so, not that it is unclosed",
+                  _rejects("---\n---\nDid it run the tests?", "empty")))
+
+
+class _GhOut:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+_real_vrun = _V.run
+try:
+    _V.run = lambda *a, **k: _GhOut('{"additions": 40, "deletions": 12, "changedFiles": 3}')
+    _size_ok = _V.pr_size(Path("."), 8)
+    _V.run = lambda *a, **k: _GhOut('{"additions": 40, "changedFiles": 3}')
+    try:
+        _V.pr_size(Path("."), 8)
+        _size_partial = "no error"
+    except KeyError:
+        _size_partial = "KeyError"
+finally:
+    _V.run = _real_vrun
+_s_checks.append(("a PR size GitHub only half reports is an error, never a zero",
+                  _size_ok == {"additions": 40, "deletions": 12, "files": 3}
+                  and _size_partial == "KeyError"))
 
 with tempfile.TemporaryDirectory() as _tmp:
     Path(_tmp, "a.md").write_text(_GOOD)
@@ -3493,6 +3519,439 @@ with tempfile.TemporaryDirectory() as _tmp:
         _cli.ClaudeCodeAgent = _real_agent
 
 for label, ok in _s_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- improve: brain notes proposed from repeated failures --------------------
+print("\nimprove: proposals from failed verdicts and blocking reviews")
+import argparse as _argparse
+from runner import analyst, brain as BR
+from runner import improve as IM
+from runner import vcs as _vcs
+
+_i_checks = []
+_d = IM.settings(None)
+_i_checks.append(("improve is off unless configured, and settings coerce",
+                  _d["enabled"] is False and _d == IM.DEFAULTS
+                  and IM.settings({"enabled": 1, "min_evidence": "3", "bogus": 9,
+                                   "max_age_days": None})
+                  == {**IM.DEFAULTS, "enabled": True, "min_evidence": 3}))
+
+
+def _review_log(path, findings, summary="needs work", verdict="request_changes"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reply = json.dumps({"verdict": verdict, "blocking_findings": findings,
+                        "summary": summary})
+    path.write_text("\n".join([
+        json.dumps({"type": "run_started", "argv": ["claude", "-p"]}),
+        _stream({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Reviewing the diff."}]}}),
+        _stream({"type": "result", "subtype": "success", "num_turns": 4,
+                 "result": f"```json\n{reply}\n```"}),
+    ]) + "\n")
+
+
+def _seed_review(store, tmp, key, findings, *, repo="pulse-backend",
+                 verdict="request_changes", log="review", source="mycorp"):
+    row = f"{source}:{key}#{repo}"
+    store.upsert(row, source=source, provider_task_id=key, task_key=key,
+                 title=f"{key} title", repo_key=repo, state=AIState.DONE.value)
+    _review_log(Path(tmp, "l", _aln(key, repo, log)), findings, verdict=verdict)
+    store.record("review", row, verdict, 0.3, 500, log=log)
+    return store.conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+
+
+def _seed_fail(store, tmp, key, *, repo="pulse-backend", passed=False,
+               reasoning="never ran pnpm test", source="mycorp"):
+    row = f"{source}:{key}#{repo}"
+    store.upsert(row, source=source, provider_task_id=key, task_key=key,
+                 title=f"{key} title", repo_key=repo, state=AIState.DONE.value)
+    _write_log(Path(tmp, "l", _aln(key, repo, "implement")))
+    store.record("implement", row, "ok", 0.5, 1000, log="implement")
+    ev = store.conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+    store.claim_score("ran-tests", ev, task_id=row, station="implement", log="implement")
+    store.finish_score("ran-tests", ev, label="ran_and_passed" if passed else "did_not_run",
+                       score=1.0 if passed else 0.0, passed=passed, pass_score=1.0,
+                       reasoning=reasoning)
+    return store.conn.execute("SELECT id FROM scores WHERE event_id = ?",
+                              (ev,)).fetchone()[0]
+
+
+class _Improver:
+    """A planner-shaped agent: answers work() with `replies` in turn."""
+    def __init__(self, *replies, ok=True, max_prompt_bytes=None):
+        self.replies = list(replies) or [{"proposal": None, "reasoning": "nothing shared"}]
+        self.ok, self.calls = ok, []
+        if max_prompt_bytes:
+            self.max_prompt_bytes = max_prompt_bytes
+
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        self.calls.append({"prompt": prompt, "cwd": cwd, "log_path": log_path,
+                           "model": model, "tools": allowed_tools})
+        reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
+        if not self.ok:
+            return AgentResult(ok=False, text="", cost_usd=0.04, error="rate limited")
+        text = reply if isinstance(reply, str) else json.dumps(reply)
+        return AgentResult(ok=True, text=text, cost_usd=0.25,
+                           usage=TokenUsage(input_tokens=3000, output_tokens=200),
+                           raw={"modelUsage": {"claude-opus-5": {"costUSD": 0.25}}},
+                           requested_model=model)
+
+    def reason(self, *a, **k):
+        raise AssertionError("the improve station never calls reason()")
+
+
+def _ctx_for(store, tmp, agent, **conf):
+    return IM.Context(agent=agent, store=store, source_key="mycorp",
+                      log_root=Path(tmp, "l"), work_root=Path(tmp, "w"),
+                      brain_root=Path(tmp, "b"),
+                      settings=IM.settings({"enabled": True, **conf}),
+                      model="opus", tools=["Read", "Grep"],
+                      secrets=["s3cret-token-value"],
+                      rubrics={"ran-tests": "Did the agent run the tests?"})
+
+
+_BACKEND = {"key": "pulse-backend", "language": "TypeScript", "test": "pnpm test",
+            "base_branch": "main"}
+_NOW = dt.datetime.now()
+_real_review_wt = _vcs.ensure_review_worktree
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _st = Store(f"{_tmp}/s.db")
+    _s1 = _seed_fail(_st, _tmp, "T200")
+    _seed_fail(_st, _tmp, "T201", passed=True)                       # a pass
+    _seed_fail(_st, _tmp, "T202", repo="pulse-frontend")             # other repo
+    _seed_fail(_st, _tmp, "T203", source="acme")                     # other source
+    _r1 = _seed_review(_st, _tmp, "T204", ["src/api.ts: no test for the 404 path"])
+    _seed_review(_st, _tmp, "T205", [], verdict="approve")           # approved
+    _st.record("review", "mycorp:T206#pulse-backend", "reject", 0.1, 10)   # no log
+    _ev = {e["ref"]: e for e in _st.improve_evidence("mycorp", "pulse-backend", 0)}
+    _i_checks.append(("evidence is failed verdicts and blocking reviews, per repo and source",
+                      sorted(_ev) == [f"review:{_r1}", f"score:{_s1}"]
+                      and _ev[f"score:{_s1}"]["scorer"] == "ran-tests"
+                      and _ev[f"score:{_s1}"]["reasoning"] == "never ran pnpm test"
+                      and _ev[f"review:{_r1}"]["verdict"] == "request_changes"))
+    _st.conn.execute("UPDATE events SET ts = ts - 5 WHERE kind = 'review'")
+    _st.conn.commit()
+    _i_checks.append(("evidence comes oldest first",
+                      [e["ref"] for e in _st.improve_evidence("mycorp", "pulse-backend", 0)]
+                      == [f"review:{_r1}", f"score:{_s1}"]))
+    _i_checks.append(("evidence older than the lookback is not evidence",
+                      _st.improve_evidence("mycorp", "pulse-backend",
+                                           int(time.time()) + 60) == []))
+
+    _five = IM.settings({"enabled": True})
+    _two = IM.settings({"enabled": True, "min_evidence": 2})
+    _due_count = (IM.due(_st, "mycorp", "pulse-backend", _NOW, _five),
+                  IM.due(_st, "mycorp", "pulse-backend", _NOW, _two))
+    _st.conn.execute("UPDATE scores SET ts = ts - 8 * 86400 WHERE id = ?", (_s1,))
+    _st.conn.commit()
+    _due_age = IM.due(_st, "mycorp", "pulse-backend", _NOW, _five)
+    _i_checks.append(("a repo is due at min_evidence failures, or one max_age_days old",
+                      _due_count == (False, True) and _due_age is True
+                      and not IM.due(_st, "mycorp", "pulse-docs", _NOW, _two)))
+
+    # Claims: one running run per repo; a dead tick's claim is handed back.
+    _c1 = _st.claim_improvement("mycorp", "pulse-backend", ttl=600)
+    _c2 = _st.claim_improvement("mycorp", "pulse-backend", ttl=600)
+    _c3 = _st.claim_improvement("mycorp", "pulse-frontend", ttl=600)
+    _st.conn.execute("UPDATE improvements SET evidence = ? WHERE id = ?",
+                     (json.dumps([f"score:{_s1}"]), _c1))
+    _st.conn.commit()
+    _held = [e["ref"] for e in _st.improve_evidence("mycorp", "pulse-backend", 0)]
+    _st.conn.execute("UPDATE improvements SET ts = 0 WHERE id = ?", (_c1,))
+    _st.conn.commit()
+    _c4 = _st.claim_improvement("mycorp", "pulse-backend", ttl=600)
+    _i_checks.append(("one improve run holds a repo; a stale claim is abandoned and retaken",
+                      _c1 and _c2 is None and _c3 and _c4 and _c4 != _c1
+                      and _st.improvement(_c1)["status"] == "abandoned"
+                      and _held == [f"review:{_r1}"]))
+    _st.finish_improvement(_c1, "pending", note="late")
+    _i_checks.append(("a run that returns after its claim was abandoned changes nothing",
+                      _st.improvement(_c1)["status"] == "abandoned"
+                      and _st.improvement(_c1)["note"] is None
+                      and len(_st.improve_evidence("mycorp", "pulse-backend", 0)) == 2))
+    _st.conn.execute("DELETE FROM improvements")
+    _st.conn.commit()
+
+    # One run, start to finish.
+    _wt_calls = []
+    _vcs.ensure_review_worktree = lambda repo, base, root, env=None: (
+        _wt_calls.append((repo["key"], base)) or Path(_tmp))
+    try:
+        _ag = _Improver({"proposal": {
+            "problem": "The implementer never runs the tests.",
+            "solution": "Name the command.",
+            "note": "Run `pnpm test` before you finish; token ghp_" + "a" * 36 + " is not needed.",
+            "evidence": [f"score:{_s1}", "score:999", f"review:{_r1}"]},
+            "reasoning": "checked package.json for s3cret-token-value"})
+        _row = IM.run_for_repo(_ctx_for(_st, _tmp, _ag), _BACKEND, {"GH_TOKEN": "x"}, _NOW)
+        _p = _ag.calls[0]["prompt"] if _ag.calls else ""
+        _i_checks.append(("the run is the analyst's seam, in a checkout of the base branch",
+                          len(_ag.calls) == 1 and _ag.calls[0]["tools"] == ["Read", "Grep"]
+                          and _ag.calls[0]["model"] == "opus"
+                          and _ag.calls[0]["cwd"] == Path(_tmp)
+                          and _wt_calls == [("pulse-backend", "main")]))
+        _i_checks.append(("the prompt shows the judge's reasoning, the review's findings, the rubric",
+                          "never ran pnpm test" in _p and "TOOL CALL Bash" in _p
+                          and "src/api.ts: no test for the 404 path" in _p
+                          and "asked for changes on T204" in _p
+                          and "Did the agent run the tests?" in _p
+                          and "Test command: pnpm test" in _p))
+        _i_checks.append(("a proposal is pending, cites only what it was shown, and is redacted",
+                          _row["status"] == "pending"
+                          and json.loads(_row["cited"]) == [f"score:{_s1}", f"review:{_r1}"]
+                          and json.loads(_row["evidence"]) == [f"score:{_s1}", f"review:{_r1}"]
+                          and "ghp_" not in _row["note"] and "s3cret" not in _row["reasoning"]
+                          and _row["note"].startswith("Run `pnpm test`")))
+        _il = _st.conn.execute("SELECT * FROM events WHERE kind = 'improve'").fetchone()
+        _i_checks.append(("improve spend is on the ledger, not on any row",
+                          _il is not None and _il["task_id"] is None
+                          and _il["detail"] == f"mycorp:pulse-backend #{_row['id']}: pending"
+                          and _il["log"] == _row["log"]
+                          and _il["log"].startswith("improve/")
+                          and _ag.calls[0]["log_path"] == Path(_tmp, "l", _row["log"])
+                          and _il["model"] == "claude-opus-5" and _il["tokens"] == 3200
+                          and _st.get("mycorp:T200#pulse-backend")["cost_usd"] == 0.5))
+        _i_checks.append(("evidence is spent once: a quiet repo is not due again",
+                          _st.improve_evidence("mycorp", "pulse-backend", 0) == []
+                          and not IM.due(_st, "mycorp", "pulse-backend", _NOW, _two)
+                          and IM.run_for_repo(_ctx_for(_st, _tmp, _ag), _BACKEND, {}, _NOW)
+                          is None and len(_ag.calls) == 1))
+
+        # Accepting writes the brain through its cap; a second accept is refused.
+        _bfile = BR.brain_path(Path(_tmp, "b"), "mycorp", "pulse-backend")
+        _ok_cap, _msg_cap = IM.accept(_st, _row["id"], Path(_tmp, "b"), max_bytes=10)
+        _cap_status = _st.improvement(_row["id"])["status"]
+        _ok1, _ = IM.accept(_st, _row["id"], Path(_tmp, "b"))
+        _ok2, _msg2 = IM.accept(_st, _row["id"], Path(_tmp, "b"))
+        _i_checks.append(("at the brain's cap nothing is written and the proposal waits",
+                          not _ok_cap and "cap" in _msg_cap and _cap_status == "pending"))
+        _i_checks.append(("accept writes the note to the brain, once",
+                          _ok1 and not _ok2 and "accepted, not pending" in _msg2
+                          and BR.has_note(_bfile, _row["note"])
+                          and BR.read(_bfile).count("pnpm test") == 1
+                          and bool(_st.improvement(_row["id"])["decided_at"])))
+
+        # A rejection, and its reason, reach the next run's prompt.
+        _s2 = _seed_fail(_st, _tmp, "T210", reasoning="skipped lint")
+        _s3 = _seed_fail(_st, _tmp, "T211", reasoning="skipped lint again")
+        _ag2 = _Improver({"proposal": {"problem": "p", "solution": "s",
+                                       "note": "Always run eslint.",
+                                       "evidence": [f"score:{_s2}"]}, "reasoning": "r"})
+        _row2 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag2), _BACKEND, {}, _NOW)
+        _okr, _ = IM.reject(_st, _row2["id"], "eslint is not installed here")
+        _s4 = _seed_fail(_st, _tmp, "T212", reasoning="lint, a third time")
+        _ag3 = _Improver({"proposal": {"problem": "p", "solution": "s",
+                                       "note": "always   run ESLINT.",
+                                       "evidence": [f"score:{_s4}"]}, "reasoning": "r"})
+        _row3 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag3), _BACKEND, {}, _NOW)
+        _p3 = _ag3.calls[0]["prompt"]
+        _i_checks.append(("a rejected note and its reason are shown to every later run",
+                          _okr and _st.improvement(_row2["id"])["status"] == "rejected"
+                          and "A HUMAN REJECTED" in _p3 and "Always run eslint." in _p3
+                          and "eslint is not installed here" in _p3
+                          and f"score:{_s3}" not in _p3))
+        _i_checks.append(("a note already rejected is no proposal, however it is spaced",
+                          _row3["status"] == "none" and "already pending or rejected"
+                          in _row3["reasoning"]))
+        _s5 = _seed_fail(_st, _tmp, "T213")
+        _ag4 = _Improver({"proposal": {"problem": "p", "solution": "s",
+                                       "note": _row["note"], "evidence": [f"score:{_s5}"]},
+                          "reasoning": "r"})
+        _row4 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag4), _BACKEND, {}, _NOW)
+        _i_checks.append(("a note the brain already has is no proposal",
+                          _row4["status"] == "none" and "brain already" in _row4["reasoning"]))
+        _s6 = _seed_fail(_st, _tmp, "T214")
+        _ag5 = _Improver({"proposal": {"problem": "p", "solution": "s", "note": "n",
+                                       "evidence": ["score:1", "review:12345"]},
+                          "reasoning": "r"})
+        _row5 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag5), _BACKEND, {}, _NOW)
+        _i_checks.append(("a proposal citing nothing it was shown is no proposal",
+                          _row5["status"] == "none" and "cited none" in _row5["reasoning"]
+                          and _row5["note"] is None
+                          and json.loads(_row5["evidence"]) == [f"score:{_s6}"]))
+
+        # Failures spend money but no evidence, and back the repo off for a day.
+        _s7 = _seed_fail(_st, _tmp, "T215")
+        _ag6 = _Improver(ok=False)
+        _row6 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag6), _BACKEND, {}, _NOW)
+        _i_checks.append(("a failed run is an error, keeps its spend, and spends no evidence",
+                          _row6["status"] == "error" and "rate limited" in _row6["reasoning"]
+                          and _row6["cost_usd"] == 0.04
+                          and [e["ref"] for e in _st.improve_evidence(
+                              "mycorp", "pulse-backend", 0)] == [f"score:{_s7}"]
+                          and not IM.due(_st, "mycorp", "pulse-backend", _NOW,
+                                         IM.settings({"min_evidence": 1}))
+                          and IM.due(_st, "mycorp", "pulse-backend",
+                                     _NOW + dt.timedelta(days=1, minutes=1),
+                                     IM.settings({"min_evidence": 1}))))
+        _ag7 = _Improver("I would add a note about tests.")
+        _row7 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag7), _BACKEND, {}, _NOW)
+        _i_checks.append(("prose instead of JSON is retried once, then an error",
+                          len(_ag7.calls) == 2 and "previous reply was not a single JSON"
+                          in _ag7.calls[1]["prompt"] and _row7["status"] == "error"
+                          and _row7["cost_usd"] == 0.5))
+
+        # Nothing renderable: no agent run, nothing on the ledger.
+        _st.conn.execute("DELETE FROM improvements WHERE status = 'error'")
+        _st.conn.commit()
+        _r9 = _seed_review(_st, _tmp, "T216", ["x"])
+        Path(_tmp, "l", _aln("T216", "pulse-backend", "review")).write_text("garbage\n")
+        _st.conn.execute("DELETE FROM scores WHERE id = ?", (_s7,))
+        _st.conn.commit()
+        _n_ledger = _st.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = 'improve'").fetchone()[0]
+        _ag8 = _Improver()
+        _row8 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag8), _BACKEND, {}, _NOW)
+        _i_checks.append(("a review whose log no longer says what it found costs nothing",
+                          _ag8.calls == [] and _row8["status"] == "none"
+                          and json.loads(_row8["evidence"]) == [f"review:{_r9}"]
+                          and _st.conn.execute("SELECT COUNT(*) FROM events WHERE kind = "
+                                               "'improve'").fetchone()[0] == _n_ledger))
+
+        # Whole items or none under the prompt ceiling.
+        for _k in ("T220", "T221", "T222"):
+            _seed_review(_st, _tmp, _k, [f"{_k}: " + "x" * 500])
+        _base = len(IM.build_prompt(_BACKEND, BR.read(_bfile), [], _st.improvements(
+            source="mycorp", repo_key="pulse-backend", statuses=("pending", "rejected")),
+            {}).encode())
+        _ag9 = _Improver(max_prompt_bytes=_base + 1400 + len(IM._RETRY_SUFFIX.encode()))
+        _row9 = IM.run_for_repo(_ctx_for(_st, _tmp, _ag9), _BACKEND, {}, _NOW)
+        _i_checks.append(("evidence that does not fit is left whole for a later run",
+                          len(_ag9.calls) == 1 and "T220: " in _ag9.calls[0]["prompt"]
+                          and "T222: " not in _ag9.calls[0]["prompt"]
+                          and len(json.loads(_row9["evidence"])) == 2
+                          and len(_st.improve_evidence("mycorp", "pulse-backend", 0)) == 1))
+    finally:
+        _vcs.ensure_review_worktree = _real_review_wt
+
+# The tick's improve phase: off by default, windowed, capped, budget-gated.
+def _improve_pipe(tmp, agent, conf=None, limits=None):
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b",
+                              scorers_dir=f"{tmp}/no-scorers")
+    if conf is not None:
+        cfg.data["runner"]["improve"] = conf
+    cfg.data["runner"]["limits"].update(limits or {})
+    store = Store(f"{tmp}/s.db")
+    return Pipeline(cfg, cfg.sources(only=["mycorp"])[0], FakeProvider([]), agent,
+                    store), store
+
+
+_vcs.ensure_review_worktree = lambda *a, **k: Path(tempfile.gettempdir())
+try:
+    with tempfile.TemporaryDirectory() as _tmp:
+        _ag = _Improver()
+        _pipe, _st = _improve_pipe(_tmp, _ag)
+        for _k in ("T230", "T231", "T232", "T233", "T234"):
+            _seed_review(_st, _tmp, _k, [f"{_k} finding"])
+        _pipe.tick(_in_window)
+        _i_checks.append(("the tick runs no improve station unless it is enabled",
+                          _pipe.improve["enabled"] is False and _ag.calls == []))
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        _ag = _Improver()
+        _pipe, _st = _improve_pipe(_tmp, _ag, {"enabled": True, "min_evidence": 2})
+        for _k, _repo_key in (("T240", "pulse-backend"), ("T241", "pulse-backend"),
+                              ("T242", "pulse-frontend"), ("T243", "pulse-frontend")):
+            _seed_review(_st, _tmp, _k, [f"{_k} finding"], repo=_repo_key)
+        _pipe.tick(_out_window)
+        _shut = len(_ag.calls)
+        _pipe.tick(_in_window)
+        _first = [r["repo_key"] for r in _st.improvements()]
+        _pipe.tick(_in_window)
+        _pipe.tick(_in_window)
+        _i_checks.append(("improve runs in its window, one repo per tick, each repo once",
+                          _shut == 0 and _first == ["pulse-backend"]
+                          and sorted(r["repo_key"] for r in _st.improvements())
+                          == ["pulse-backend", "pulse-frontend"] and len(_ag.calls) == 2
+                          and all(c["tools"] == list(_pipe.acfg.get("planner_tools")
+                                                     or analyst.PLANNER_TOOLS)
+                                  for c in _ag.calls)))
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        _ag = _Improver()
+        _pipe, _st = _improve_pipe(_tmp, _ag, {"enabled": True, "min_evidence": 1},
+                                   limits={"daily_budget_usd": 0.5})
+        _seed_review(_st, _tmp, "T250", ["a finding"])
+        _seed_review(_st, _tmp, "T251", ["another"])       # $0.60 spent today
+        _pipe.tick(_in_window)
+        _i_checks.append(("an improve run never starts once the daily budget is spent",
+                          _ag.calls == [] and _st.improvements() == []))
+finally:
+    _vcs.ensure_review_worktree = _real_review_wt
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _lp = Path(_tmp, "r.log")
+    _review_log(_lp, ["f1"])
+    _i_checks.append(("final_text reads back the run's last reply, unclipped",
+                      '"blocking_findings": ["f1"]' in (SC.final_text(_lp) or "")
+                      and SC.final_text(Path(_tmp, "gone.log")) is None))
+    _bp = Path(_tmp, "brain.md")
+    BR.append(_bp, ["Use  pnpm, not npm."], today=dt.date(2026, 1, 2))
+    _i_checks.append(("has_note compares notes the way append dedupes them",
+                      BR.has_note(_bp, "use pnpm,   NOT npm.")
+                      and not BR.has_note(_bp, "Use yarn.")
+                      and not BR.has_note(Path(_tmp, "none.md"), "x")))
+
+# `deputy improve`: list, show, accept, reject, run.
+with tempfile.TemporaryDirectory() as _tmp:
+    _ag = _Improver({"proposal": {"problem": "Tests are skipped.", "solution": "Say so.",
+                                  "note": "Run pnpm test before finishing.",
+                                  "evidence": []}, "reasoning": "r"})
+    _pipe, _st = _improve_pipe(_tmp, _ag)
+    _ra = _seed_review(_st, _tmp, "T260", ["tests were never run"])
+
+    def _imp(*argv):
+        ns = _argparse.Namespace(action=argv[0], sources=None, all=False, limit=50,
+                                 id=None, reason=None, repo=None)
+        for k, v in zip(argv[1::2], argv[2::2]):
+            setattr(ns, k, v)
+        out, err = io.StringIO(), io.StringIO()
+        with _ctx.redirect_stdout(out), _ctx.redirect_stderr(err):
+            rc = _cli._improve(_pipe.cfg, ns)
+        return rc, out.getvalue(), err.getvalue()
+
+    _ag.replies[0]["proposal"]["evidence"] = [f"review:{_ra}"]
+    _real_agent = _cli.ClaudeCodeAgent
+    _cli.ClaudeCodeAgent = lambda cfg: _ag
+    _vcs.ensure_review_worktree = lambda *a, **k: Path(_tmp)
+    try:
+        _rc_run, _out_run, _ = _imp("run", "repo", "pulse-backend")
+        _rc_again, _out_again, _ = _imp("run", "repo", "pulse-backend")
+        _rc_none, _, _err_none = _imp("run", "repo", "no-such-repo")
+    finally:
+        _cli.ClaudeCodeAgent = _real_agent
+        _vcs.ensure_review_worktree = _real_review_wt
+    _pid = (_st.improvements() or [{"id": 0}])[0]["id"]
+    _i_checks.append(("deputy improve run skips the due check, not the limits",
+                      _rc_run == 0 and "pending" in _out_run and len(_ag.calls) == 1
+                      and f"deputy improve show {_pid}" in _out_run
+                      and _rc_again == 0 and "nothing new" in _out_again
+                      and _rc_none == 1 and "no repo no-such-repo" in _err_none))
+    _rc_l, _out_l, _ = _imp("list")
+    _rc_s, _out_s, _ = _imp("show", "id", _pid)
+    _i_checks.append(("list and show say what is waiting and what it rests on",
+                      _rc_l == 0 and f"#{_pid}" in _out_l and "1/1 cited" in _out_l
+                      and _rc_s == 0 and "Run pnpm test before finishing." in _out_s
+                      and f"review:{_ra}  reviewer: request_changes on T260" in _out_s))
+    _rc_r, _, _ = _imp("reject", "id", _pid, "reason", "we use vitest")
+    _rc_a, _, _err_a = _imp("accept", "id", _pid)
+    _rc_m, _, _err_m = _imp("show", "id", 9999)
+    _i_checks.append(("reject records the reason; a decided proposal cannot be accepted",
+                      _rc_r == 0 and _st.improvement(_pid)["reason"] == "we use vitest"
+                      and _rc_a == 1 and "rejected, not pending" in _err_a
+                      and _rc_m == 1 and "no proposal 9999" in _err_m
+                      and "no proposals waiting" in _imp("list")[1]))
+    _pipe.cfg.data["runner"]["limits"]["daily_budget_usd"] = 0.01
+    _rc_b, _, _err_b = _imp("run", "repo", "pulse-backend")
+    _i_checks.append(("deputy improve run stops at the daily budget",
+                      _rc_b == 1 and "daily budget exhausted" in _err_b
+                      and len(_ag.calls) == 1))
+
+for label, ok in _i_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 

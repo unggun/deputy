@@ -76,6 +76,33 @@ CREATE TABLE IF NOT EXISTS scores (
     UNIQUE (scorer, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_scores_ts ON scores(ts);
+-- One row per improve run on one repo, and the proposal it made, if any.
+-- `evidence` is every ref the run was shown ("score:<scores.id>",
+-- "review:<events.id>"); `cited` is the subset its proposal names.
+CREATE TABLE IF NOT EXISTS improvements (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,       -- claimed at, then finished at
+    source     TEXT NOT NULL,
+    repo_key   TEXT NOT NULL,
+    -- running | pending | none | error | abandoned | accepted | rejected
+    status     TEXT NOT NULL,
+    target     TEXT NOT NULL DEFAULT 'brain',
+    problem    TEXT,
+    solution   TEXT,
+    note       TEXT,                   -- the exact text accepting would write
+    reasoning  TEXT,                   -- the run's account, or why it failed
+    evidence   TEXT NOT NULL DEFAULT '[]',
+    cited      TEXT NOT NULL DEFAULT '[]',
+    reason     TEXT,                   -- the human's, on a rejection
+    decided_at INTEGER,
+    cost_usd   REAL NOT NULL DEFAULT 0,
+    tokens     INTEGER NOT NULL DEFAULT 0,
+    model      TEXT,
+    log        TEXT
+);
+-- At most one improve run holds a repo at a time; see claim_improvement.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_improvements_running
+    ON improvements(source, repo_key) WHERE status = 'running';
 CREATE TABLE IF NOT EXISTS posted_comments (
     idempotency_key TEXT PRIMARY KEY,
     task_id TEXT,
@@ -367,6 +394,148 @@ class Store:
         rows = self.conn.execute(
             f"SELECT * FROM events WHERE kind IN ({ph}) AND log IS NOT NULL"
             " ORDER BY ts DESC, id DESC LIMIT ?", (*kinds, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- improvements --------------------------------------------------
+    # Statuses whose evidence is spent: no later run is shown it again. An
+    # `error` run produced nothing a human could act on, and an `abandoned`
+    # claim belonged to a killed tick, so their evidence stays available.
+    IMPROVE_CONSUMED = ("running", "pending", "none", "accepted", "rejected")
+
+    def repo_of(self, task_id: str) -> str | None:
+        """The repo a run belongs to, even after its row is gone.
+
+        A routed id carries it after `#`, which survives a human reset that
+        deleted the row. A legacy two-segment row only has it in the column.
+        """
+        if "#" in task_id:
+            return task_id.split("#", 1)[1]
+        return (self.get(task_id) or {}).get("repo_key")
+
+    def _improve_seen(self, source: str, repo_key: str) -> set[str]:
+        ph = ",".join("?" * len(self.IMPROVE_CONSUMED))
+        seen: set[str] = set()
+        for r in self.conn.execute(
+                "SELECT evidence FROM improvements WHERE source = ? AND repo_key = ?"
+                f" AND status IN ({ph})", (source, repo_key, *self.IMPROVE_CONSUMED)):
+            try:
+                seen.update(str(x) for x in json.loads(r["evidence"] or "[]"))
+            except (TypeError, ValueError):
+                continue
+        return seen
+
+    def improve_evidence(self, source: str, repo_key: str,
+                         since: int) -> list[dict[str, Any]]:
+        """Failures on one repo since `since` that no improve run has seen yet.
+
+        Two kinds, oldest first: a scorer verdict that failed
+        (`score:<scores.id>`, dated when it was judged) and a review that
+        asked for changes or rejected the approach (`review:<events.id>`).
+        Only runs that left a log: the log is the record of what the run did.
+        """
+        prefix = f"{source}:"
+        found: list[dict[str, Any]] = []
+        for r in self.conn.execute(
+                "SELECT * FROM scores WHERE passed = 0 AND ts >= ?"
+                " AND log IS NOT NULL AND substr(task_id, 1, ?) = ?",
+                (int(since), len(prefix), prefix)):
+            found.append({"ref": f"score:{r['id']}", "kind": "score",
+                          "ts": int(r["ts"]), "task_id": r["task_id"],
+                          "event_id": r["event_id"], "station": r["station"],
+                          "log": r["log"], "scorer": r["scorer"],
+                          "label": r["label"], "reasoning": r["reasoning"]})
+        for r in self.conn.execute(
+                "SELECT * FROM events WHERE kind = 'review'"
+                " AND detail IN ('request_changes', 'reject')"
+                " AND log IS NOT NULL AND ts >= ? AND substr(task_id, 1, ?) = ?",
+                (int(since), len(prefix), prefix)):
+            found.append({"ref": f"review:{r['id']}", "kind": "review",
+                          "ts": int(r["ts"]), "task_id": r["task_id"],
+                          "event_id": r["id"], "station": "review",
+                          "log": r["log"], "verdict": r["detail"]})
+        seen = self._improve_seen(source, repo_key)
+        out = [e for e in found if e["ref"] not in seen
+               and self.repo_of(e["task_id"]) == repo_key]
+        # Ids break a tie numerically: "review:10" sorts after "review:9".
+        out.sort(key=lambda e: (e["ts"], e["kind"], int(e["ref"].partition(":")[2])))
+        return out
+
+    def claim_improvement(self, source: str, repo_key: str, *, ttl: int) -> int | None:
+        """Take one repo for an improve run. None if another run holds it.
+
+        The partial unique index allows one `running` row per repo, so two
+        overlapping ticks cannot both pay for the same proposal. A claim older
+        than `ttl` belongs to a tick that was killed mid-run; it is marked
+        `abandoned`, which hands its evidence back, and retaken.
+        """
+        now = _now()
+        self.conn.execute(
+            "UPDATE improvements SET status = 'abandoned',"
+            " reasoning = 'the run holding this claim never finished'"
+            " WHERE source = ? AND repo_key = ? AND status = 'running' AND ts < ?",
+            (source, repo_key, now - int(ttl)))
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO improvements (ts, source, repo_key, status)"
+                " VALUES (?, ?, ?, 'running')", (now, source, repo_key))
+        except sqlite3.IntegrityError:
+            self.conn.commit()
+            return None
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    _IMPROVE_FIELDS = ("target", "problem", "solution", "note", "reasoning",
+                       "evidence", "cited", "cost_usd", "tokens", "model", "log")
+
+    def finish_improvement(self, improvement_id: int, status: str,
+                           **fields: Any) -> None:
+        """Close a claim. A claim already abandoned stays abandoned: its run
+        came back after another tick had given its evidence away."""
+        sets = {k: _coerce(v) for k, v in fields.items() if k in self._IMPROVE_FIELDS}
+        sets.update(status=status, ts=_now())
+        self.conn.execute(
+            f"UPDATE improvements SET {', '.join(f'{k} = ?' for k in sets)}"
+            " WHERE id = ? AND status = 'running'",
+            (*sets.values(), int(improvement_id)))
+        self.conn.commit()
+
+    def decide_improvement(self, improvement_id: int, status: str,
+                           reason: str | None = None) -> bool:
+        """Accept or reject a pending proposal. False if it is not pending."""
+        cur = self.conn.execute(
+            "UPDATE improvements SET status = ?, reason = ?, decided_at = ?"
+            " WHERE id = ? AND status = 'pending'",
+            (status, reason, _now(), int(improvement_id)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def score(self, score_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM scores WHERE id = ?",
+                                (int(score_id),)).fetchone()
+        return dict(row) if row else None
+
+    def improvement(self, improvement_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM improvements WHERE id = ?",
+                                (int(improvement_id),)).fetchone()
+        return dict(row) if row else None
+
+    def improvements(self, *, source: str | None = None,
+                     repo_key: str | None = None,
+                     statuses: tuple[str, ...] | None = None,
+                     limit: int = 200) -> list[dict[str, Any]]:
+        """Improve runs, newest first."""
+        sql, args = "SELECT * FROM improvements WHERE 1 = 1", []
+        if source is not None:
+            sql += " AND source = ?"
+            args.append(source)
+        if repo_key is not None:
+            sql += " AND repo_key = ?"
+            args.append(repo_key)
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args.extend(statuses)
+        rows = self.conn.execute(sql + " ORDER BY ts DESC, id DESC LIMIT ?",
+                                 (*args, int(limit)))
         return [dict(r) for r in rows]
 
     # --- comment idempotency -------------------------------------------
