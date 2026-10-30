@@ -695,19 +695,29 @@ with tempfile.TemporaryDirectory() as tmp:
     b = _merged(22, "human_commits=0 additions=12 deletions=7 files=1", [1.0])
     c = _merged(23, "human_commits=1 additions=400 deletions=150 files=9", [2.0])
     d = _merged(24, "human_commits=0", [0.1])
+    # A legacy row: two-segment id, so its triage shares the row's id.
+    legacy = "acme:25"
+    st.upsert(legacy, source="acme", provider_task_id="25", task_key="DEV-25",
+              title="legacy", state="done", repo_key="api")
+    _ev(st, t0, legacy, "triage", "execute (s)", cost_usd=2.0, tokens=2000)
+    _ev(st, t0 + 1, legacy, "implement", "ok", cost_usd=3.0, tokens=3000)
+    _ev(st, t0 + 50, legacy, "pr_merged", "human_commits=0 additions=1 deletions=1 files=1")
+    _ev(st, t0 + 51, legacy, "state", "pr-open->done")
     fl = Reader(path, limits={}).flow(7)
     by = {r["task_id"]: r for r in fl["rows"]}
+    check("a legacy row's own triage is not charged to its PR",
+          by[legacy]["cost_usd"] == 3.0 and by[legacy]["tokens"] == 3000)
     check("a merged PR's lines are additions plus deletions",
           by[a]["lines"] == 40 and by[c]["lines"] == 550 and by[d]["lines"] is None)
     check("cost per PR is the row's own runs, not the ticket's triage",
           by[a]["cost_usd"] == 0.75 and by[a]["tokens"] == 750)
     check("sizes land in fixed buckets, unknown kept apart",
           [(x["size"], x["n"]) for x in fl["summary"]["cost_by_size"]]
-          == [("<50", 2), ("500+", 1), ("unknown", 1)])
+          == [("<50", 3), ("500+", 1), ("unknown", 1)])
     small = fl["summary"]["cost_by_size"][0]
     check("a bucket reports the median cost, not the mean",
-          small["median_cost_usd"] == (0.75 + 1.0) / 2
-          and small["total_cost_usd"] == 1.75)
+          small["median_cost_usd"] == 1.0
+          and small["total_cost_usd"] == 4.75)
 
 # --- scores -------------------------------------------------------------------
 print("\nscores")

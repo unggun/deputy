@@ -653,9 +653,10 @@ wherever they are shown, and never present them to the second.
 **Cost per PR by size** (`_cost_by_size`) buckets merged rows by lines changed
 (additions + deletions from the `pr_merged` line) at fixed edges (`<50`,
 `50-199`, `200-499`, `500+`, `unknown`) and reports medians. A row's cost is its
-*own* events only: triage lives on the placeholder and covered every repo on
-the ticket, so adding it to each routed row would count it once per repo, and
-judging spend has no task id at all.
+*own* events minus triage: triage covered every repo on the ticket, so adding
+it to each routed row would count it once per repo. It is excluded by kind, not
+only by id, because a legacy two-segment row is its own placeholder and its
+triage carries the row's id. Judging spend has no task id at all.
 
 ### Scorers
 

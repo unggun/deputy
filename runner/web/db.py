@@ -450,10 +450,11 @@ class Reader:
         human_commits = int(m.group(1)) if m and m.group(1).isdigit() else None
         size = _PR_SIZE.search(str(merged[-1]["detail"])) if merged else None
         lines = int(size.group(1)) + int(size.group(2)) if size else None
-        # The row's own runs only. Triage is the placeholder's and covered
-        # every repo on the ticket, so charging it to one PR would count it
-        # once per repo.
-        own = [e for e in evs if e["task_id"] == tid]
+        # The row's own runs only. Triage covered every repo on the ticket,
+        # so charging it to one PR would count it once per repo. Excluded by
+        # kind as well as by id: a legacy row (two-segment id, no `#repo`) *is*
+        # its own placeholder, so its triage carries the row's id.
+        own = [e for e in evs if e["task_id"] == tid and e["kind"] != "triage"]
         fix_feedback = sum(1 for c in causes if c and "feedback" in c)
         known = human_commits is not None and all(c is not None for c in causes)
         transitions = [str(e["detail"]) for e in states]
