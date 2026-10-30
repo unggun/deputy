@@ -845,7 +845,9 @@ each easy to undo by accident:
   placeholder went `needs-input->new` before another run wants clarify
   (`answered`); a human_only followed by another run was reset by a human and
   wants anything else (`reset`); a human_only nobody reset for
-  `SETTLED_AFTER` stands (`stood`). Every other snapshot is left out and
+  `SETTLED_AFTER` stands (`stood`). Both human_only grades need the
+  placeholder's `->human-only` move in between: a verdict comment that failed
+  to post leaves the row `new`, and the tick's own retry is not a reset. Every other snapshot is left out and
   counted by reason. A grade on a guess would be worse than no grade.
 - **A snapshot is matched to its ledger line by run number and time.** The
   `n`th triage event on the placeholder, within `SNAPSHOT_SLACK` of the
@@ -857,6 +859,9 @@ each easy to undo by accident:
   in production. A ticket today's denylist stops is left out: no variant
   decides it. A prompt variant replaces `triage.SYSTEM` only; the ticket, the
   repos and the comments are rendered by `_build_prompt` as always.
+  `--current-repos` takes `language` and `notes` from today's config whole,
+  absent where config has none, so a deleted hint does not ride along from
+  the snapshot; a repo gone from config keeps what triage saw.
 - **The baseline is always first.** `variants()` starts with the configured
   triage model and the built-in prompt, then every model × prompt asked for,
   without repeats. A prompt's label carries a hash of its text, so an edited

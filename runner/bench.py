@@ -13,6 +13,8 @@ it -- and the answer key is what happened next, read from the ledger:
             anything but human_only.
 - stood     triage said human_only and nobody reset it in `SETTLED_AFTER`.
 
+A human_only only counts as either once the row actually reached human-only.
+
 Everything else is left out and counted: a question nobody answered, a run
 still in flight, an execute that ended blocked or was triaged again after a
 rejected plan. History does not say what the right call was there, and a
@@ -127,6 +129,11 @@ def answer_key(history: list[dict[str, Any]], snap: dict[str, Any], *,
         return (["clarify"], None, "answered") if nxt and answered \
             else (None, None, "nobody answered")
     if decision == "human_only":
+        # The verdict has to have landed. A verdict comment that failed to
+        # post leaves the row at `new`, and the next tick triages it again
+        # with no human involved -- which is not a reset.
+        if not any(t == placeholder and new == "human-only" for t, _, new in moves):
+            return None, None, "verdict not applied"
         # human-only is terminal, so the only road to another triage run is
         # a human setting AI State back to new.
         if nxt:
@@ -291,9 +298,15 @@ def replay(agent: CodingAgent, case: Case, variant: Variant,
     """One trial: the variant's verdict on one past ticket, graded."""
     repos = [dict(r) for r in case.snap.get("repos") or []]
     if variant.current_repos:
-        repos = [{**r, **{k: v for k, v in (repos_now.get((case.source, str(r.get("key"))))
-                                             or {}).items()
-                          if k in ("language", "notes")}} for r in repos]
+        def today(r: dict[str, Any]) -> dict[str, Any]:
+            now = repos_now.get((case.source, str(r.get("key"))))
+            if now is None:         # gone from config: the snapshot is all there is
+                return r
+            # Both fields from today's config, absent where it has none: a
+            # hint someone deleted must not ride along from the snapshot.
+            return {"key": r.get("key"),
+                    **{k: now[k] for k in ("language", "notes") if k in now}}
+        repos = [today(r) for r in repos]
     fields: dict[str, Any] = {
         "variant": variant.label, "case_name": case.name, "task_id": case.row_id,
         "task_key": case.task_key, "why": case.why, "expected": case.expected,

@@ -4297,6 +4297,19 @@ with tempfile.TemporaryDirectory() as _tmp:
     _b_checks.append(("--current-repos offers today's notes; without it, the snapshot's",
                       "THE NEW NOTES" in _ag3.calls[0]["prompt"]
                       and "THE NEW NOTES" not in _ag4.calls[0]["prompt"]))
+    _old_notes = next(r["notes"] for r in _cases[0].snap["repos"]
+                      if r["key"] == "pulse-backend")
+    _gone = dict(_repos_now)
+    _gone[("mycorp", "pulse-backend")] = {
+        k: v for k, v in _gone[("mycorp", "pulse-backend")].items() if k != "notes"}
+    _ag9 = _Variants(_answers)
+    _bench.run(_ag9, _st, _cases[:1],
+               _bench.variants([], [], default_model="sonnet", current_repos=True),
+               policy=_policy, repos_now=_gone, repeat=1, max_usd=5.0,
+               limits_check=lambda: None, secrets=[])
+    _b_checks.append(("...and a note deleted from config is gone from the replay too",
+                      bool(_old_notes) and _old_notes not in _ag9.calls[0]["prompt"]
+                      and "- key: pulse-backend" in _ag9.calls[0]["prompt"]))
 
     # caps and limits are checked before each case, never inside one
     _ag5 = _Variants(_answers, cost=0.015)
@@ -4406,6 +4419,37 @@ with tempfile.TemporaryDirectory() as _tmp:
     finally:
         _cli.ClaudeCodeAgent = _real_agent
         _cli.time.time = _real_time
+
+# a human_only whose comment failed to post is retried by the tick, not reset
+class _FlakyComments(FakeProvider):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.fail = 1
+
+    def add_comment(self, tid, md):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("provider 502")
+        return super().add_comment(tid, md)
+
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _cfg = Config.load("config.example.yaml")
+    _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                               log_dir=f"{_tmp}/l", brain_dir=f"{_tmp}/b")
+    _st = Store(f"{_tmp}/s.db")
+    _prov = _FlakyComments([mk("B20", "Renew the vendor contract", "talk to sales")])
+    _pipe = Pipeline(_cfg, _cfg.sources(only=["mycorp"])[0], _prov,
+                     _TriageScript({"B20": [_HUMAN]}), _st)
+    _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+    _c, _o = _bench.load(Path(_tmp) / "l", _st, now=int(time.time()) + 8 * 86400,
+                         policy=_cfg.get("policy", {}))
+    _b_checks.append(("a human_only that never landed is retried, not graded as a reset",
+                      _prov.states.get("B20") == AIState.HUMAN_ONLY
+                      and [c.why for c in _c] == ["stood"]
+                      and _c[0].name == "B20__mycorp__triage-2"
+                      and _o == {"verdict not applied": 1}))
 
 # triage keeps the spend of a reply it cannot use
 with tempfile.TemporaryDirectory() as _tmp:
