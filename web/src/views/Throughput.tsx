@@ -26,15 +26,15 @@ function histogram(seconds: number[]): { band: string; n: number }[] {
   });
 }
 
-export function Throughput() {
-  const { data, isError, error } = useThroughput(30);
+export function Throughput({ days = 30 }: { days?: number }) {
+  const { data, isError, error } = useThroughput(days);
   const m = useColorMode();
   // React Query leaves `data` undefined once its retries are exhausted, so
   // without this branch a dead API spins on "loading…" forever.
   if (isError) return <FetchError what="throughput" error={error} />;
   if (!data) return <div className="p-6 text-muted-foreground">loading…</div>;
   const axis = { stroke: MUTED, fontSize: 11, tickLine: false, axisLine: false };
-  const days = data.days.map((d) => ({ ...d, day: d.day.slice(5) }));
+  const perDay = data.days.map((d) => ({ ...d, day: d.day.slice(5) }));
   const hist = histogram(data.cycle_times.map((c) => c.seconds));
 
   const cycles: Record<number, number> = {};
@@ -54,9 +54,9 @@ export function Throughput() {
           palette -- with names in the legend, never color alone. */}
       <ChartFrame title="Outcomes per day"
         columns={["day", "pr-open", "done", "blocked"]}
-        rows={days.map((d) => [d.day, d.pr_open, d.done, d.blocked])}>
+        rows={perDay.map((d) => [d.day, d.pr_open, d.done, d.blocked])}>
         <ResponsiveContainer width="100%" height={240}>
-          <BarChart data={days}>
+          <BarChart data={perDay}>
             <CartesianGrid stroke={GRID[m]} vertical={false} />
             <XAxis dataKey="day" {...axis} />
             <YAxis {...axis} width={40} allowDecimals={false} />

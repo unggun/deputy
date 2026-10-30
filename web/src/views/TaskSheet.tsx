@@ -4,7 +4,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { StateBadge } from "@/components/StateBadge";
 import { FetchError } from "@/components/FetchError";
-import { useTask, useTaskLog, type LogLine } from "@/lib/api";
+import { Swimlanes } from "@/components/Swimlanes";
+import { TERMINAL, useTask, useTaskLog, type LogLine } from "@/lib/api";
+import { duration } from "@/lib/format";
 
 function LogTail({ id, station }: { id: string; station: string }) {
   // Poll forward from the offset the last read returned rather than
@@ -71,14 +73,31 @@ function LogTail({ id, station }: { id: string; station: string }) {
   );
 }
 
-export function TaskSheet({ id, onClose }: { id: string | null; onClose: () => void }) {
-  const { data: row, isError, error } = useTask(id);
-  const [station, setStation] = useState<string | null>(null);
-  useEffect(() => { setStation(row?.stations?.[0] ?? null); }, [row?.task_id]);
+/** `station` opens the sheet on that run's log (the Runs tab passes it); it
+ *  is ignored when the row has no such log, rather than opening a log tab on
+ *  a different run than the one clicked. */
+export function TaskSheet({ id, station: wanted, onClose }: {
+  id: string | null; station?: string | null; onClose: () => void;
+}) {
+  const { data: row, isError, error, dataUpdatedAt } = useTask(id);
+  const onLog = !!wanted && (row?.stations ?? []).includes(wanted);
+  // The station a person clicked, remembered only for the sheet it was
+  // clicked in. Derived rather than reset in an effect: the sheet stays
+  // mounted across row switches, and a pick made on one row must not carry
+  // over to the next.
+  const opened = `${id}:${wanted ?? ""}`;
+  const [pick, setPick] = useState<{ opened: string; station: string } | null>(null);
+  const station = (pick?.opened === opened ? pick.station : null)
+    ?? (onLog ? wanted! : row?.stations?.[0] ?? null);
+  const setStation = (s: string) => setPick({ opened, station: s });
 
   return (
     <Sheet open={!!id} onOpenChange={(o) => !o && onClose()}>
-      <SheetContent className="w-full sm:max-w-3xl">
+      {/* The width has to name the same `data-[side=right]` variant the
+          sheet's own `sm:max-w-sm` default carries: a bare `sm:max-w-3xl` is
+          less specific, loses, and leaves the sheet 24rem wide -- too narrow
+          for the timeline lanes. `cn` merges the two, so only this one ships. */}
+      <SheetContent className="w-full gap-0 overflow-y-auto data-[side=right]:sm:max-w-3xl">
         {/* A sheet that opens onto nothing is the same ambiguity the rest of
             the dashboard refuses: say the row could not be fetched. */}
         {isError && <FetchError what="this row" error={error} />}
@@ -90,69 +109,79 @@ export function TaskSheet({ id, onClose }: { id: string | null; onClose: () => v
                 <span className="text-muted-foreground">{row.repo_key}</span>
               </SheetTitle>
             </SheetHeader>
-            <div className="mt-2 text-sm">{row.title}</div>
-            <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
-              {row.branch && <span className="font-mono">{row.branch}</span>}
-              {row.pr_url && <a className="underline" href={row.pr_url}
-                                target="_blank" rel="noreferrer">PR #{row.pr_number}</a>}
-              <span>{row.attempts} attempts</span>
-              <span>{row.tokens.toLocaleString()} tok · ${row.cost_usd.toFixed(2)}</span>
-            </div>
+            <div className="px-4 pb-6">
+              <div className="text-sm">{row.title}</div>
+              <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
+                {row.branch && <span className="font-mono">{row.branch}</span>}
+                {row.pr_url && <a className="underline" href={row.pr_url}
+                                  target="_blank" rel="noreferrer">PR #{row.pr_number}</a>}
+                <span>{row.attempts} attempts</span>
+                <span>{row.tokens.toLocaleString()} tok · ${row.cost_usd.toFixed(2)}</span>
+              </div>
 
-            {/* Keyed on `id`: the Sheet's `open` prop never passes through
-                `false` when the row switches (Board/Overview hand `onOpen` a
-                new id directly), so Dialog.Content never unmounts and this
-                uncontrolled Tabs would otherwise keep whatever value was
-                selected on the PREVIOUS row. If that value has no matching
-                trigger/content on the new row (e.g. "error" when the new row
-                has no last_error), nothing renders as active -- a blank pane
-                instead of falling back to Timeline. Keying on `id` forces a
-                remount on every row switch, same as `LogTail` already does. */}
-            <Tabs key={id ?? undefined} defaultValue="timeline" className="mt-4">
-              <TabsList>
-                <TabsTrigger value="timeline">Timeline</TabsTrigger>
-                <TabsTrigger value="logs">Logs</TabsTrigger>
-                {row.last_error && <TabsTrigger value="error">Error</TabsTrigger>}
-              </TabsList>
+              {/* Keyed on `id`: the Sheet's `open` prop never passes through
+                  `false` when the row switches (Board/Overview hand `onOpen` a
+                  new id directly), so Dialog.Content never unmounts and this
+                  uncontrolled Tabs would otherwise keep whatever value was
+                  selected on the PREVIOUS row. If that value has no matching
+                  trigger/content on the new row (e.g. "error" when the new row
+                  has no last_error), nothing renders as active -- a blank pane
+                  instead of falling back to Timeline. Keying on `id` forces a
+                  remount on every row switch, same as `LogTail` already does. */}
+              <Tabs key={opened} defaultValue={onLog ? "logs" : "timeline"}
+                    className="mt-4">
+                <TabsList>
+                  <TabsTrigger value="timeline">Timeline</TabsTrigger>
+                  <TabsTrigger value="logs">Logs</TabsTrigger>
+                  {row.last_error && <TabsTrigger value="error">Error</TabsTrigger>}
+                </TabsList>
 
-              <TabsContent value="timeline">
-                <div className="divide-y text-sm">
-                  {(row.events ?? []).map((e, i) => (
-                    <div key={i} className="flex gap-3 py-1.5">
-                      <span className="w-32 shrink-0 text-xs text-muted-foreground tabular-nums">
-                        {new Date(e.ts * 1000).toLocaleString()}</span>
-                      <span className="w-20 shrink-0 font-mono text-xs">{e.kind}</span>
-                      <span className="min-w-0 flex-1 truncate">{e.detail}</span>
-                      {e.tokens > 0 && (
-                        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-                          {e.tokens.toLocaleString()} tok</span>)}
-                    </div>
-                  ))}
-                </div>
-              </TabsContent>
-
-              <TabsContent value="logs">
-                <div className="mb-2 flex gap-1">
-                  {(row.stations ?? []).map((s) => (
-                    <button key={s} onClick={() => setStation(s)}
-                            className={`rounded px-2 py-1 font-mono text-xs ${
-                              s === station ? "bg-muted" : "text-muted-foreground"}`}>
-                      {s}</button>
-                  ))}
-                </div>
-                {id && station && <LogTail key={`${id}:${station}`} id={id} station={station} />}
-                {(row.stations ?? []).length === 0 && (
-                  <div className="p-4 text-sm text-muted-foreground">
-                    No agent has run for this row yet.</div>)}
-              </TabsContent>
-
-              {row.last_error && (
-                <TabsContent value="error">
-                  <pre className="whitespace-pre-wrap rounded border p-3 font-mono text-xs">
-                    {row.last_error}</pre>
+                <TabsContent value="timeline">
+                  <Swimlanes events={row.events ?? []}
+                             live={!TERMINAL.includes(row.state)} now={dataUpdatedAt / 1000} />
+                  <div className="divide-y text-sm">
+                    {(row.events ?? []).map((e, i) => (
+                      <div key={i} className="flex gap-3 py-1.5">
+                        <span className="w-32 shrink-0 text-xs text-muted-foreground tabular-nums">
+                          {new Date(e.ts * 1000).toLocaleString()}</span>
+                        <span className="w-20 shrink-0 font-mono text-xs">{e.log ?? e.kind}</span>
+                        <span className="min-w-0 flex-1 truncate" title={e.detail ?? undefined}>
+                          {e.detail}</span>
+                        {!!e.duration_ms && (
+                          <span className="shrink-0 text-xs text-muted-foreground tabular-nums"
+                                title={e.model ?? undefined}>
+                            {duration(e.duration_ms / 1000)}{e.turns ? ` · ${e.turns} turns` : ""}</span>)}
+                        {e.tokens > 0 && (
+                          <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                            {e.tokens.toLocaleString()} tok</span>)}
+                      </div>
+                    ))}
+                  </div>
                 </TabsContent>
-              )}
-            </Tabs>
+
+                <TabsContent value="logs">
+                  <div className="mb-2 flex gap-1">
+                    {(row.stations ?? []).map((s) => (
+                      <button key={s} onClick={() => setStation(s)}
+                              className={`rounded px-2 py-1 font-mono text-xs ${
+                                s === station ? "bg-muted" : "text-muted-foreground"}`}>
+                        {s}</button>
+                    ))}
+                  </div>
+                  {id && station && <LogTail key={`${id}:${station}`} id={id} station={station} />}
+                  {(row.stations ?? []).length === 0 && (
+                    <div className="p-4 text-sm text-muted-foreground">
+                      No agent has run for this row yet.</div>)}
+                </TabsContent>
+
+                {row.last_error && (
+                  <TabsContent value="error">
+                    <pre className="whitespace-pre-wrap rounded border p-3 font-mono text-xs">
+                      {row.last_error}</pre>
+                  </TabsContent>
+                )}
+              </Tabs>
+            </div>
           </>
         )}
       </SheetContent>

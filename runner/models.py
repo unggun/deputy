@@ -166,19 +166,73 @@ class AgentResult:
     raw: dict[str, Any] = field(default_factory=dict)
     usage: TokenUsage = field(default_factory=TokenUsage)
     timed_out: bool = False
+    # What `--model` asked for, or None when the CLI default was used.
+    requested_model: str | None = None
+
+    @property
+    def models(self) -> list[str]:
+        """Models that answered, per the result payload. See `answered_models`."""
+        return answered_models(self.raw)
+
+
+def answered_models(payload: dict[str, Any] | None) -> list[str]:
+    """Every model `modelUsage` says answered, the most expensive first.
+
+    A `work()` run legitimately reports several -- subagents bill separately --
+    so this is a list, and its first entry is the one that did most of the
+    work. Each key is followed by its `canonicalModel` when that differs, so
+    an alias request (`sonnet`) can be matched against either spelling.
+
+    An absent or malformed `modelUsage` is an empty list, never an error:
+    telemetry must not be what fails a run.
+    """
+    reported = (payload or {}).get("modelUsage")
+    if not isinstance(reported, dict):
+        return []
+
+    def spent(item: tuple[Any, Any]) -> float:
+        entry = item[1]
+        try:
+            return -float(entry.get("costUSD") or 0) if isinstance(entry, dict) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    out: list[str] = []
+    for key, entry in sorted(reported.items(), key=spent):
+        canonical = entry.get("canonicalModel") if isinstance(entry, dict) else None
+        for name in (key, canonical):
+            if name and str(name) not in out:
+                out.append(str(name))
+    return out
+
+
+def model_present(wanted: str, ran: list[str]) -> bool:
+    """Did the requested model answer?
+
+    `--model` accepts an alias ("sonnet") as readily as a canonical id
+    ("claude-sonnet-5"), so an alias counts as present when it names part of
+    an id that ran. Presence, not exclusivity: subagents may add others.
+    """
+    return any(wanted == r or wanted in r for r in ran)
 
 
 @dataclass
 class Spend:
-    """What one station cost, in both currencies.
+    """What one station cost, in both currencies, and what its runs were.
 
     Stations used to return a bare `float` cost. Threading a second number
     through every return and every `StationError` as a separate positional
     argument invites the two drifting apart at one call site; one object
-    cannot.
+    cannot. The run telemetry (wall time, turns, models) rides along for the
+    same reason: a station that retries once has two runs, and the ledger
+    line has to describe both.
     """
     cost_usd: float = 0.0
     usage: TokenUsage = field(default_factory=TokenUsage)
+    duration_ms: int = 0
+    num_turns: int = 0
+    models: list[str] = field(default_factory=list)
+    requested_model: str | None = None
 
     @property
     def tokens(self) -> int:
@@ -186,11 +240,23 @@ class Spend:
 
     def __add__(self, other: "Spend") -> "Spend":
         return Spend(cost_usd=self.cost_usd + other.cost_usd,
-                     usage=self.usage + other.usage)
+                     usage=self.usage + other.usage,
+                     duration_ms=self.duration_ms + other.duration_ms,
+                     num_turns=self.num_turns + other.num_turns,
+                     models=list(dict.fromkeys(self.models + other.models)),
+                     requested_model=self.requested_model or other.requested_model)
 
     @classmethod
     def of(cls, res: AgentResult) -> "Spend":
-        return cls(cost_usd=res.cost_usd, usage=res.usage)
+        return cls(cost_usd=res.cost_usd, usage=res.usage,
+                   duration_ms=res.duration_ms, num_turns=res.num_turns,
+                   models=res.models, requested_model=res.requested_model)
+
+    def run_fields(self) -> dict[str, Any]:
+        """The telemetry columns of an `events` row, as `Store.record` takes them."""
+        return {"duration_ms": self.duration_ms, "turns": self.num_turns,
+                "model": ",".join(self.models) or None,
+                "model_requested": self.requested_model}
 
 
 @dataclass
@@ -235,3 +301,18 @@ def agent_log_name(task_key: str, repo_key: str, station: str) -> str:
     safe_key = task_key.replace("/", "_")
     safe_repo = repo_key.replace("/", "_")
     return f"{safe_key}__{safe_repo}__{station}.log"
+
+
+def run_station(station: str, n: int) -> str:
+    """The log station name of the `n`th run (1-based) of a station on a row.
+
+    `_EventLog` opens with "w", so a second implement or review pass on the
+    same row used to overwrite the first pass's transcript -- the evidence a
+    later reviewer, scorer or human most wants. The first run keeps the bare
+    name, so rows from before numbering existed still find their log; later
+    runs are `implement-2`, `implement-3`. `fix` is always numbered, matching
+    the `fix-N` names it has had all along.
+    """
+    if station == "fix" or n > 1:
+        return f"{station}-{max(n, 1)}"
+    return station

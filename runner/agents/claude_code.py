@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..models import AgentResult, TokenUsage
+from ..models import AgentResult, TokenUsage, answered_models, model_present
 from ..redact import redact
 from .base import CodingAgent
 
@@ -354,12 +354,15 @@ class ClaudeCodeAgent(CodingAgent):
         # argument without a bound. Checked here rather than in `reason()` and
         # `work()` so a seam added later cannot skip it, and before anything is
         # opened or spawned, so an over-long prompt costs nothing.
+        # Stamped on every result, refusals included, so the ledger can say
+        # what was asked for even when nothing answered.
+        requested = cmd[cmd.index("--model") + 1] if "--model" in cmd else None
         prompt_bytes = len(cmd[2].encode("utf-8")) if len(cmd) > 2 else 0
         if prompt_bytes > self.max_prompt_bytes:
             log.error("refusing to run: prompt is %d bytes (ceiling %d)",
                       prompt_bytes, self.max_prompt_bytes)
             return AgentResult(
-                ok=False, text="",
+                ok=False, text="", requested_model=requested,
                 error=(f"prompt is {prompt_bytes} bytes, over the "
                        f"{self.max_prompt_bytes} byte ceiling -- it travels in "
                        f"argv and would fail at exec. Trim the ticket text or "
@@ -373,8 +376,10 @@ class ClaudeCodeAgent(CodingAgent):
             except OSError as exc:
                 log.warning("could not open agent log %s: %s", log_path, exc)
         try:
-            return self._execute(cmd, cwd, timeout, stream=stream,
-                                 run_id=run_id, events=events)
+            result = self._execute(cmd, cwd, timeout, stream=stream,
+                                   run_id=run_id, events=events)
+            result.requested_model = requested
+            return result
         finally:
             events.close()
 
@@ -493,18 +498,13 @@ class ClaudeCodeAgent(CodingAgent):
         if "--model" not in cmd:
             return
         wanted = cmd[cmd.index("--model") + 1]
-        reported = payload.get("modelUsage")
-        if not isinstance(reported, dict) or not reported:
+        ran = answered_models(payload)
+        if not ran:
             return
-        ran: set[str] = set()
-        for key, entry in reported.items():
-            ran.add(str(key))
-            if isinstance(entry, dict) and entry.get("canonicalModel"):
-                ran.add(str(entry["canonicalModel"]))
-        # `--model` accepts an alias ("sonnet") as readily as a canonical id
-        # ("claude-sonnet-5"), so an alias counts as present when it names
-        # part of an id that ran.
-        if any(wanted == r or wanted in r for r in ran):
+        # Alias-tolerant: see `model_present`. The dashboard's Runs tab flags
+        # the same mismatch from the ledger with the same function, so the
+        # warning here and the flag there cannot disagree.
+        if model_present(wanted, ran):
             return
         log.warning("requested model %s but %s answered", wanted,
                     ", ".join(sorted(ran)))

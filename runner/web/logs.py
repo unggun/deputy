@@ -15,9 +15,11 @@ from typing import Any, Sequence
 from ..models import agent_log_name
 from ..redact import redact
 
-# A station is a fixed vocabulary plus numbered fix passes. Anchored, because
-# this value reaches a filesystem path and the alternative is path traversal.
-_STATION = re.compile(r"^(plan|implement|review|fix-\d+)$")
+# A station is a fixed vocabulary, optionally numbered (`implement-2` is the
+# second implement pass on a row; see `models.run_station`), plus numbered fix
+# passes. Anchored, because this value reaches a filesystem path and the
+# alternative is path traversal.
+_STATION = re.compile(r"^(?:(?:plan|implement|review)(?:-\d+)?|fix-\d+)$")
 
 DEFAULT_MAX_BYTES = 262144  # one poll's worth; the UI pages with next_offset
 
@@ -57,7 +59,21 @@ def stations(log_root: Path, task_key: str, repo_key: str) -> list[str]:
         name = path.name[len(legacy_prefix):-len(".log")]
         if _STATION.match(name) and name not in out:
             out.append(name)
-    return out
+    return sorted(out, key=_run_order)
+
+
+_PIPELINE_ORDER = ("plan", "implement", "review", "fix")
+
+
+def _run_order(name: str) -> tuple[int, int]:
+    """Pipeline order, then run number: `implement-10` after `implement-2`.
+
+    A plain sort is lexicographic, which puts `implement-10` before
+    `implement-2` and `fix-1` before `plan`.
+    """
+    base, _, num = name.partition("-")
+    rank = _PIPELINE_ORDER.index(base) if base in _PIPELINE_ORDER else len(_PIPELINE_ORDER)
+    return rank, int(num) if num.isdigit() else 1
 
 
 def tail(log_root: Path, task_key: str, repo_key: str, station: str,

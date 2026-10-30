@@ -220,6 +220,23 @@ def push(wt: Path, branch: str, env: dict[str, str] | None = None) -> None:
     run(["git", "push", "-u", "origin", branch], cwd=wt, env=env)
 
 
+def head_sha(wt: Path, env: dict[str, str] | None = None) -> str:
+    return run(["git", "rev-parse", "HEAD"], cwd=wt, env=env).stdout.strip()
+
+
+def merge_base(wt: Path, base: str, env: dict[str, str] | None = None) -> str:
+    """The commit this branch forked from `origin/<base>` at."""
+    return run(["git", "merge-base", "HEAD", f"origin/{base}"],
+               cwd=wt, env=env).stdout.strip()
+
+
+def commits_since(wt: Path, since: str,
+                  env: dict[str, str] | None = None) -> list[str]:
+    """SHAs reachable from HEAD but not from `since`, i.e. what was just added."""
+    return run(["git", "rev-list", f"{since}..HEAD"],
+               cwd=wt, env=env).stdout.split()
+
+
 def diff_stat(wt: Path, base: str) -> str:
     return run(["git", "diff", "--stat", f"origin/{base}...HEAD"], cwd=wt).stdout.strip()
 
@@ -328,6 +345,62 @@ def approving_reactions(wt: Path, number: int, allowlist: list[str],
             continue
         out.append(login)
     return out
+
+
+def pr_commits(wt: Path, number: int,
+               env: dict[str, str] | None = None) -> list[str]:
+    """Every commit SHA on the PR, as GitHub sees it at this moment."""
+    out = run(["gh", "pr", "view", str(number), "--json", "commits"],
+              cwd=wt, env=env).stdout
+    return [str(c.get("oid")) for c in (json.loads(out).get("commits") or [])
+            if isinstance(c, dict) and c.get("oid")]
+
+
+def first_human_activity(wt: Path, number: int, allowlist: list[str],
+                         env: dict[str, str] | None = None) -> tuple[str, str] | None:
+    """(ISO time, login) of the earliest human review, comment or reaction.
+
+    Wider than `human_feedback()` on purpose: an "Approve" review with an
+    empty body and a thumbs-up on the PR are both a human having looked, and
+    neither carries text for the fix agent. Same human test, though -- never
+    a `[bot]`, and only allowlisted logins when there is an allowlist.
+
+    Returns None when nothing human has happened yet, or when GitHub cannot
+    be read: this feeds a metric, and a metric must not fail a poll.
+    """
+    allow = [a.lower() for a in allowlist]
+
+    def human(login: str) -> bool:
+        return bool(login) and not login.endswith("[bot]") and (
+            not allow or login in allow)
+
+    seen: list[tuple[str, str]] = []
+    res = run(["gh", "pr", "view", str(number), "--json", "comments,reviews"],
+              cwd=wt, check=False, env=env)
+    if res.returncode == 0:
+        try:
+            data = json.loads(res.stdout or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        for bucket in ("reviews", "comments"):
+            for item in data.get(bucket) or []:
+                login = ((item.get("author") or {}).get("login") or "").lower()
+                at = item.get("submittedAt") or item.get("createdAt") or ""
+                if at and human(login):
+                    seen.append((at, login))
+    res = run(["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{number}/reactions"],
+              cwd=wt, check=False, env=env)
+    if res.returncode == 0:
+        try:
+            reactions = json.loads(res.stdout or "[]")
+        except json.JSONDecodeError:
+            reactions = []
+        for item in reactions if isinstance(reactions, list) else []:
+            login = ((item.get("user") or {}).get("login") or "").lower()
+            at = item.get("created_at") or ""
+            if at and human(login) and item.get("content") in APPROVAL_REACTIONS:
+                seen.append((at, login))
+    return min(seen) if seen else None
 
 
 def mark_ready(wt: Path, number: int, env: dict[str, str] | None = None) -> None:

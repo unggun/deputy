@@ -1,4 +1,4 @@
-import { useOverview, useTasks, type Overview as OverviewData } from "@/lib/api";
+import { useOverview, useTasks, type Overview as OverviewData, type TaskRow } from "@/lib/api";
 import { StatTile } from "@/components/StatTile";
 import { StateBadge } from "@/components/StateBadge";
 import { FetchError } from "@/components/FetchError";
@@ -56,6 +56,59 @@ function advanceOpen(o: OverviewData, now: Date): boolean {
   const days = (o.days ?? []).map((d) => d.toLowerCase().slice(0, 3));
   if (days.length > 0 && !days.includes(DAYS[now.getDay()])) return false;
   return inWindow(o.windows?.advance ?? ["00:00-23:59"], now);
+}
+
+/** What a person has to do, in the order it unblocks the most: an answer or
+ *  an approval restarts a ticket on the next tick, a blocked row needs a
+ *  decision, and a failing run needs someone to read its log. Every stuck row
+ *  lands in exactly one group, so the counts sum to the Stuck tile. */
+const GROUPS = [
+  { key: "answer", title: "Questions to answer", states: ["needs-input"],
+    hint: "reply on the ticket; the next tick re-reads it" },
+  { key: "approve", title: "Plans to approve", states: ["plan-review"],
+    hint: "reply approved, or correct the plan" },
+  { key: "blocked", title: "Blocked or off-limits", states: ["blocked", "human-only"],
+    hint: "read the comment on the ticket; set AI State to new to retry" },
+  { key: "look", title: "Runs that need a look", states: null,
+    hint: "open the row for its error and log" },
+] as const;
+
+function group(rows: TaskRow[]): [(typeof GROUPS)[number], TaskRow[]][] {
+  const out = GROUPS.map((g) => [g, [] as TaskRow[]] as [(typeof GROUPS)[number], TaskRow[]]);
+  for (const r of rows) {
+    const i = GROUPS.findIndex((g) => g.states?.some((s) => s === r.state));
+    out[i === -1 ? GROUPS.length - 1 : i][1].push(r);
+  }
+  return out.filter(([, rs]) => rs.length > 0);
+}
+
+// A div, not a <button>: the PR link inside it is interactive, and a link
+// nested in a button is invalid markup that screen readers announce badly.
+function StuckRow({ r, onOpen }: { r: TaskRow; onOpen: (id: string) => void }) {
+  return (
+    <div role="button" tabIndex={0} onClick={() => onOpen(r.task_id)}
+         onKeyDown={(e) => {
+           if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(r.task_id); }
+         }}
+         className="flex w-full cursor-pointer items-start gap-3 py-2 text-left hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <StateBadge state={r.state} />
+      <div className="min-w-0 flex-1">
+        <div className="font-mono text-sm">{r.task_key}
+          <span className="ml-2 text-muted-foreground">{r.repo_key}</span>
+          {r.pr_url && (
+            <a href={r.pr_url} target="_blank" rel="noreferrer"
+               onClick={(e) => e.stopPropagation()}
+               onKeyDown={(e) => e.stopPropagation()}
+               className="ml-2 text-xs underline">PR #{r.pr_number}</a>)}
+        </div>
+        <div className="truncate text-sm">{r.title}</div>
+        <div className="text-xs text-muted-foreground">{r.reason}</div>
+        {r.last_error && (
+          <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+            {r.last_error}</div>)}
+      </div>
+    </div>
+  );
 }
 
 export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
@@ -122,21 +175,18 @@ export function Overview({ onOpen }: { onOpen: (id: string) => void }) {
               Nothing is stuck. Every in-flight row is progressing on its own.
             </div>
           ) : (
-            <div className="divide-y">
-              {stuck.map((r) => (
-                <button key={r.task_id} onClick={() => onOpen(r.task_id)}
-                        className="flex w-full items-start gap-3 py-2 text-left hover:bg-muted/50">
-                  <StateBadge state={r.state} />
-                  <div className="min-w-0 flex-1">
-                    <div className="font-mono text-sm">{r.task_key}
-                      <span className="ml-2 text-muted-foreground">{r.repo_key}</span></div>
-                    <div className="truncate text-sm">{r.title}</div>
-                    <div className="text-xs text-muted-foreground">{r.reason}</div>
-                    {r.last_error && (
-                      <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
-                        {r.last_error}</div>)}
+            <div className="space-y-4">
+              {group(stuck).map(([g, rows]) => (
+                <section key={g.key}>
+                  <div className="flex items-baseline gap-2">
+                    <h3 className="text-sm font-medium">{g.title}</h3>
+                    <span className="text-xs tabular-nums text-muted-foreground">{rows.length}</span>
+                    <span className="text-xs text-muted-foreground">· {g.hint}</span>
                   </div>
-                </button>
+                  <div className="divide-y">
+                    {rows.map((r) => <StuckRow key={r.task_id} r={r} onOpen={onOpen} />)}
+                  </div>
+                </section>
               ))}
             </div>
           )}

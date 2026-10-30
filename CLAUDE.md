@@ -547,16 +547,96 @@ diagram-layout engine was tried and dropped: `mermaid` pulled in `elk`,
 `cytoscape` and `katex` plus chunks for a dozen diagram types this dashboard
 never renders, taking the committed bundle to 5.9 MB across roughly 100 files
 for an 11-state diagram, and brought `mermaid`'s own `chevrotain`/`lodash-es`
-`npm audit` advisories along with it. The bundle is back to 888 KB across 9
-files with 0 vulnerabilities. Do not reintroduce a diagram library for this —
+`npm audit` advisories along with it. The bundle is back to about 900 KB
+across 9 files with 0 vulnerabilities. Do not reintroduce a diagram library for this —
 an 11-state table earns its keep as a table.
 
 Agent log filenames come from `models.agent_log_name(task_key, repo_key,
 station)`. The repo key is load-bearing: `_EventLog` opens with `"w"`, so a
 cross-repo ticket without it had two rows truncating each other's evidence.
-`web/logs.py` looks for the current name first and falls back to the
-pre-per-repo `{task_key}-{station}.log` name, so a row that was mid-flight
-when per-repo names shipped still has a readable log instead of an empty tab.
+For the same reason the station is numbered per run: `Pipeline._run_log()` is
+the one place a log path is built, and it names the run with
+`models.run_station(station, n)` from `store.runs_recorded()` — the first
+`implement` keeps the bare name (so older rows still find their log), a second
+pass is `implement-2`, and `fix` is always `fix-N`. A second implement or review
+pass used to overwrite the first pass's transcript, which is the evidence a
+scorer or a human most wants. The name also goes on the run's ledger line
+(`events.log`), which is how the Runs tab opens the right log. `tests_smoke.py`
+asserts `agent_log_name` is called exactly twice in `pipeline.py` (`_run_log`
+and the triage snapshot) and `_run_log` four times, so a new station cannot
+quietly build its own path. `web/logs.py` looks for the current name first and
+falls back to the pre-per-repo `{task_key}-{station}.log` name, so a row that
+was mid-flight when per-repo names shipped still has a readable log instead of
+an empty tab; `stations()` sorts in pipeline order, then run number, because a
+plain sort puts `implement-10` before `implement-2`.
+
+### Measurement
+
+The ledger records enough to answer "where did the time and the human
+attention go", not only "what did it cost". Every rule here exists because
+the obvious version measured the wrong thing.
+
+- **Every agent run writes its telemetry.** `events` carries `duration_ms`,
+  `turns`, `model` (what `modelUsage` says answered, most expensive first,
+  comma-joined), `model_requested` (what `--model` asked for) and `log`. They
+  ride on `Spend` through the stations exactly as cost and tokens do —
+  `Spend.run_fields()` is what `store.record(...)` takes — so a station that
+  retries reports both runs. `models.answered_models()` and `model_present()`
+  are shared by `_check_model()` and the dashboard's mismatch flag, so the
+  warning in the log and the ⚠ on the Runs tab cannot disagree.
+- **Markers are not spend.** Besides `state`, the poll writes `pr_ready` (the
+  draft was marked ready), `pr_review` (first human review or approving
+  reaction, at GitHub's own timestamp, login in `detail`) and `pr_merged`
+  (`human_commits=N`, or `=?` when it cannot say). `db.py::_MARKERS` lists them
+  and `_SPEND_ONLY` keeps every spend sum off them; a new marker kind goes in
+  that tuple or it grows a zero-height station in the spend chart.
+- **Measurement never fails a tick.** Every git/gh call that only feeds the
+  dashboard goes through `Pipeline._measure()`, which returns `None` on any
+  exception. A missing SHA costs a metric, never a step.
+- **Own commits are tracked by SHA, not by author.** The runner usually pushes
+  as the developer's own GitHub identity, so "commits not by the bot" is
+  meaningless. `_execute` and the fix pass record HEAD before the agent runs
+  and append `rev-list before..HEAD` to `meta.own_commits` after the push; at
+  merge, `_merge_detail()` counts PR commits not in that list. If any capture
+  failed, `meta.own_commits_incomplete` makes the answer `?` instead of a guess.
+  Coverage has to start at the fork: the first note is complete only when the
+  pre-run HEAD *is* the fork point, so a PR implemented before tracking existed
+  does not have its original runner commits counted as a human's on its first
+  fix pass.
+  `meta.base_sha` is the merge-base the first run forked from, kept for a
+  later benchmark that needs to replay a ticket against the code it saw.
+- **The first human review latches once**, into `meta.first_review_at`, and
+  only for a human: `vcs.first_human_activity()` never counts a `[bot]` login
+  and honours the reviewer allowlist. A bot's `APPROVED` review decision or
+  thumbs-up reaction with no human activity found does not latch — it would
+  otherwise record the bot's approval as the start of human review.
+  `approving_reactions()` keeps bots on purpose (a Codex 👍 means "nothing to
+  flag"), so the poll filters `[bot]` logins itself before treating a reaction
+  as evidence of a person. The merged path asks GitHub once too, before the
+  row goes terminal: a PR reviewed and merged between two ticks is never seen
+  open with a review on it.
+- **Fix passes carry their cause**: `detail` is `ci: …`, `feedback: …` or
+  `ci+feedback: …`. A fix line with no cause prefix predates this and makes the
+  row's autonomy unknown rather than assumed.
+- **Triage snapshots.** Triage writes no agent log, and the ticket keeps
+  changing after triage reads it, so `_snapshot_triage()` writes what it saw
+  (ticket, comments, candidate repos) and what it decided, redacted, to
+  `{log_dir}/triage/{key}__{source}__triage-N.json` on both the success and the
+  failure path. Inputs, not the rendered prompt, so a prompt variant can be
+  re-rendered from them. It never raises.
+
+`db.py::flow()` is the definition of the Flow tab, per row merged in the
+window: `to_pr`, `pr_to_review` (from `pr_ready`, else `pr-open`, to the first
+human review), `review_to_merge`, and `waiting` = time in `needs-input` and
+`plan-review` plus the PR's wait for its first human review. History is the
+row's own events plus its placeholder's (`_placeholder()`), because triage and
+pre-routing clarifications live on the placeholder id; `Reader.task()` includes
+them for the same reason. **Autonomous** = merged with no fix pass caused by
+feedback and no commit that is not the runner's; `None` when either cannot be
+known, and the rate is over the rows that can say. Clarifications and plan
+approvals are gates by design: counted as touches, never held against
+autonomy. State durations are only as fine as the tick interval — say so
+wherever they are shown, and never present them to the second.
 
 `runner/web/static/` is committed build output, not source. `web/vite.config.ts`
 points `build.outDir` at it directly rather than the default `web/dist`,

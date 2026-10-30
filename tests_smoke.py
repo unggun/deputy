@@ -2556,8 +2556,12 @@ _c_checks.append(("two repos of one ticket get different log names",
 
 import inspect as _inspect
 _src = _inspect.getsource(Pipeline)
-_c_checks.append(("all four log paths go through agent_log_name",
-                  _src.count("agent_log_name(") == 4))
+# Station logs are built in one place now (`_run_log`, which numbers them),
+# plus the triage snapshot, which has no agent log of its own.
+_c_checks.append(("log paths are built in _run_log and the triage snapshot only",
+                  _src.count("agent_log_name(") == 2))
+_c_checks.append(("all four agent stations take their log from _run_log",
+                  _src.count("self._run_log(") == 4))
 _c_checks.append(("pipeline builds log paths through agent_log_name",
                   "agent_log_name(" in _src
                   and "-implement.log" not in _src
@@ -2735,6 +2739,239 @@ _r.append(("a rejected rich-text shape falls back to plain text once",
            len(_calls) == 2 and "comment_text" in _calls[1]))
 
 for label, ok in _r:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- run telemetry, numbered logs, and the human signals -------------------
+print("\nmeasurement: run telemetry, numbered logs, human signals")
+from runner import vcs as _mv
+
+
+class _TelemetryAgent(FakeAgent):
+    """FakeAgent whose runs report wall time, turns and the model that answered."""
+    def work(self, prompt, cwd, *, log_path=None, model=None, allowed_tools=None):
+        res = super().work(prompt, cwd, log_path=log_path, model=model,
+                           allowed_tools=allowed_tools)
+        res.duration_ms, res.num_turns = 90_000, 7
+        res.raw = {"modelUsage": {"claude-sonnet-5": {"costUSD": 0.4},
+                                  "claude-haiku-5": {"costUSD": 0.1}}}
+        res.requested_model = model or "sonnet"
+        return res
+
+
+_m_checks = []
+_m_real = {n: getattr(_mv, n) for n in (
+    "ensure_worktree", "ensure_review_worktree", "commit_all", "push",
+    "create_pr", "diff_stat", "remove_worktree", "head_sha", "merge_base",
+    "commits_since", "pr_status", "human_feedback", "approving_reactions",
+    "first_human_activity", "failing_check_logs", "pr_commits", "mark_ready")}
+try:
+    with tempfile.TemporaryDirectory() as _tmp:
+        _cfg = Config.load("config.example.yaml")
+        _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                                   log_dir=f"{_tmp}/l", brain_dir=f"{_tmp}/b",
+                                   mode="execute")
+        _src = _cfg.sources(only=["mycorp"])[0]
+        _task = mk("T70", "Fix footer typo", "'Copyrigth' -> 'Copyright'")
+        _prov = FakeProvider([_task])
+        _store = Store(f"{_tmp}/s.db")
+        _agent = _TelemetryAgent(
+            {"decision": "execute", "confidence": 0.95, "scope": "xs",
+             "plan": ["fix typo"], "acceptance_criteria": ["footer reads Copyright"]},
+            work_replies=["implemented it", json.dumps(_changes_v),
+                          "implemented it again", json.dumps(_approve_v),
+                          "addressed the review"])
+        _pipe = Pipeline(_cfg, _src, _prov, _agent, _store)
+        _heads = iter(["base0", "impl1", "impl2", "fix1"])
+        _mv.ensure_worktree = lambda *a, **k: Path(_tmp)
+        _mv.ensure_review_worktree = lambda *a, **k: Path(_tmp)
+        _mv.commit_all = lambda *a, **k: True
+        _mv.push = lambda *a, **k: None
+        _mv.diff_stat = lambda *a, **k: "1 file changed"
+        _mv.create_pr = lambda *a, **k: (7, "http://pr/7")
+        _mv.remove_worktree = lambda *a, **k: None
+        # A fresh branch's HEAD is its fork point; tracking that starts there
+        # is complete.
+        _mv.merge_base = lambda *a, **k: "base0"
+        # Each implement pass adds one commit on top of whatever HEAD was.
+        _mv.head_sha = lambda *a, **k: next(_heads)
+        _mv.commits_since = lambda wt, since, env=None: [f"after-{since}"]
+        _when = dt.datetime(2026, 8, 10, 7, 0)
+        for _ in range(8):
+            _pipe.tick(_when)
+        _r = _store.get(rid("T70"))
+        _meta = json.loads(_r["meta"])
+        _runs = [dict(x) for x in _store.conn.execute(
+            "SELECT kind, log, duration_ms, turns, model, model_requested"
+            " FROM events WHERE task_id = ? AND kind IN ('implement', 'review')"
+            " ORDER BY id", (rid("T70"),))]
+        _m_checks.append(("the PR opened after one revision cycle",
+                          _r["state"] == AIState.PR_OPEN.value))
+        _m_checks.append(("a second implement/review pass gets its own log",
+                          [x["log"] for x in _runs]
+                          == ["implement", "review", "implement-2", "review-2"]))
+        _m_checks.append(("every run records duration and turns",
+                          all(x["duration_ms"] == 90_000 and x["turns"] == 7
+                              for x in _runs)))
+        _m_checks.append(("the model that did most of the work is listed first",
+                          all((x["model"] or "").startswith("claude-sonnet-5,")
+                              for x in _runs)))
+        _m_checks.append(("the requested model is recorded beside it",
+                          all(x["model_requested"] for x in _runs)))
+        _m_checks.append(("the fork point is kept for replays",
+                          _meta.get("base_sha") == "base0"))
+        _m_checks.append(("each push's own commits are remembered",
+                          _meta.get("own_commits") == ["after-base0", "after-impl1"]))
+        _snaps = list((Path(_tmp) / "l" / "triage").glob("*.json"))
+        _snap = json.loads(_snaps[0].read_text()) if _snaps else {}
+        _m_checks.append(("triage leaves a snapshot of what it saw and decided",
+                          len(_snaps) == 1
+                          and _snap.get("task", {}).get("key") == "T70"
+                          and _snap.get("result", {}).get("decision") == "execute"
+                          and bool(_snap.get("repos"))))
+
+        # --- the PR poll: first human review, fix cause, merge ------------
+        _st = {"state": "OPEN", "merged": False, "draft": False,
+               "review_decision": "CHANGES_REQUESTED", "ci": "passing",
+               "failed_checks": [], "url": "http://pr/7"}
+        _mv.pr_status = lambda *a, **k: dict(_st)
+        _feedback = ["@dana: please rename the variable"]
+        _mv.human_feedback = lambda *a, **k: list(_feedback)
+        _mv.approving_reactions = lambda *a, **k: []
+        _mv.first_human_activity = lambda *a, **k: ("2026-08-10T05:00:00Z", "dana")
+        _mv.failing_check_logs = lambda *a, **k: ""
+        _pipe.tick(_when)
+        _feedback.clear()
+        _pipe.tick(_when)
+        _ev = [dict(x) for x in _store.conn.execute(
+            "SELECT kind, detail, ts, log FROM events WHERE task_id = ?"
+            " AND kind IN ('pr_review', 'fix') ORDER BY id", (rid("T70"),))]
+        _rev = [x for x in _ev if x["kind"] == "pr_review"]
+        _fix = [x for x in _ev if x["kind"] == "fix"]
+        _m_checks.append(("the first human review is recorded once",
+                          len(_rev) == 1 and _rev[0]["detail"] == "dana"))
+        _m_checks.append(("...at GitHub's time, not the poll's",
+                          bool(_rev) and _rev[0]["ts"] == int(dt.datetime(
+                              2026, 8, 10, 5, 0, tzinfo=dt.timezone.utc).timestamp())))
+        _m_checks.append(("a fix pass says a human comment caused it",
+                          len(_fix) == 1 and _fix[0]["detail"] == "feedback: ok"
+                          and _fix[0]["log"] == "fix-1"))
+        _meta = json.loads(_store.get(rid("T70"))["meta"])
+        _m_checks.append(("the fix pass's commit joins the runner's own",
+                          "after-impl2" in _meta.get("own_commits", [])))
+
+        _st.update(merged=True, state="MERGED")
+        _mv.pr_commits = lambda *a, **k: ["after-base0", "after-impl1",
+                                          "after-impl2", "someone-else"]
+        _pipe.tick(_when)
+        _merged = _store.conn.execute(
+            "SELECT detail FROM events WHERE task_id = ? AND kind = 'pr_merged'",
+            (rid("T70"),)).fetchone()
+        _m_checks.append(("a merge counts the commits the runner did not make",
+                          _merged is not None
+                          and _merged["detail"] == "human_commits=1"
+                          and _store.get(rid("T70"))["state"] == AIState.DONE.value))
+
+    # A bot's approval alone is not a human review: nothing is latched --
+    # neither a review app's APPROVED decision nor its thumbs-up reaction.
+    with tempfile.TemporaryDirectory() as _tmp:
+        _cfg = Config.load("config.example.yaml")
+        _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                                   log_dir=f"{_tmp}/l", mode="execute")
+        _src = _cfg.sources(only=["mycorp"])[0]
+        _task = mk("T71", "x", "y")
+        _store = Store(f"{_tmp}/s.db")
+        _pipe = Pipeline(_cfg, _src, FakeProvider([_task]), FakeAgent({}), _store)
+        _store.upsert(rid("T71"), source="mycorp", provider_task_id="T71",
+                      task_key="T71", repo_key="pulse-backend", branch="ai/t71",
+                      state=AIState.PR_OPEN.value, pr_number=8, meta={})
+        _mv.pr_status = lambda *a, **k: {
+            "state": "OPEN", "merged": False, "draft": False,
+            "review_decision": "APPROVED", "ci": "passing",
+            "failed_checks": [], "url": "http://pr/8"}
+        _mv.human_feedback = lambda *a, **k: []
+        _mv.approving_reactions = lambda *a, **k: ["chatgpt-codex-connector[bot]"]
+        _mv.first_human_activity = lambda *a, **k: None
+        _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        _n = _store.conn.execute(
+            "SELECT COUNT(*) c FROM events WHERE kind = 'pr_review'").fetchone()["c"]
+        _m_checks.append(("an approval no human can be found for latches nothing",
+                          _n == 0 and not json.loads(
+                              _store.get(rid("T71"))["meta"]).get("first_review_at")))
+
+        # Unreadable PR commits: the merge is unknown, never guessed.
+        _mv.pr_status = lambda *a, **k: {
+            "state": "MERGED", "merged": True, "draft": False,
+            "review_decision": "APPROVED", "ci": "passing",
+            "failed_checks": [], "url": "http://pr/8"}
+        def _boom(*a, **k):
+            raise _mv.CommandError("gh pr view 8 -> 1")
+        _mv.pr_commits = _boom
+        _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        _d = _store.conn.execute(
+            "SELECT detail FROM events WHERE kind = 'pr_merged'").fetchone()
+        _m_checks.append(("a merge whose commits cannot be read is unknown",
+                          _d is not None and _d["detail"] == "human_commits=?"
+                          and _store.get(rid("T71"))["state"] == AIState.DONE.value))
+
+    # A PR opened before SHA tracking: its first tracked push is a fix, so
+    # the original implementation's commits were never recorded as the
+    # runner's. The merge must stay unknown, not count them as a human's.
+    # It is also reviewed and merged between two ticks, so the first human
+    # review is only findable on the merged path.
+    with tempfile.TemporaryDirectory() as _tmp:
+        _cfg = Config.load("config.example.yaml")
+        _cfg.data["runner"].update(db_path=f"{_tmp}/s.db", work_dir=f"{_tmp}/w",
+                                   log_dir=f"{_tmp}/l", mode="execute")
+        _src = _cfg.sources(only=["mycorp"])[0]
+        _task = mk("T72", "x", "y")
+        _store = Store(f"{_tmp}/s.db")
+        _pipe = Pipeline(_cfg, _src, FakeProvider([_task]), FakeAgent({}), _store)
+        _store.upsert(rid("T72"), source="mycorp", provider_task_id="T72",
+                      task_key="T72", repo_key="pulse-backend", branch="ai/t72",
+                      state=AIState.PR_OPEN.value, pr_number=9, meta={})
+        _st = {"state": "OPEN", "merged": False, "draft": False,
+               "review_decision": None, "ci": "failing",
+               "failed_checks": ["lint"], "url": "http://pr/9"}
+        _mv.pr_status = lambda *a, **k: dict(_st)
+        _mv.human_feedback = lambda *a, **k: []
+        _mv.approving_reactions = lambda *a, **k: []
+        _mv.first_human_activity = lambda *a, **k: None
+        _mv.head_sha = lambda *a, **k: "old-impl"
+        _mv.commits_since = lambda wt, since, env=None: [f"after-{since}"]
+        _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        _meta = json.loads(_store.get(rid("T72"))["meta"])
+        _m_checks.append(("tracking that starts after the fork is incomplete",
+                          _meta.get("own_commits") == ["after-old-impl"]
+                          and _meta.get("own_commits_incomplete") is True))
+
+        _st.update(merged=True, state="MERGED", ci="passing")
+        _mv.pr_commits = lambda *a, **k: ["old-impl", "after-old-impl"]
+        _mv.first_human_activity = lambda *a, **k: ("2026-08-10T06:30:00Z", "erin")
+        _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
+        _d = _store.conn.execute(
+            "SELECT detail FROM events WHERE kind = 'pr_merged'").fetchone()
+        _m_checks.append(("a pre-tracking PR's merge is unknown, not human",
+                          _d is not None and _d["detail"] == "human_commits=?"))
+        _rv = _store.conn.execute(
+            "SELECT detail, ts FROM events WHERE kind = 'pr_review'").fetchone()
+        _m_checks.append(("a review and merge between ticks still records the review",
+                          _rv is not None and _rv["detail"] == "erin"
+                          and _rv["ts"] == int(dt.datetime(
+                              2026, 8, 10, 6, 30, tzinfo=dt.timezone.utc).timestamp())))
+finally:
+    for _n_, _f_ in _m_real.items():
+        setattr(_mv, _n_, _f_)
+
+# Spend is additive over a station's retries, telemetry included.
+_a = Spend(cost_usd=1, duration_ms=10, num_turns=2, models=["m1"], requested_model="r")
+_b = Spend(cost_usd=2, duration_ms=5, num_turns=1, models=["m2", "m1"])
+_ab = _a + _b
+_m_checks.append(("Spend adds wall time and turns, and unions models",
+                  (_ab.duration_ms, _ab.num_turns, _ab.models, _ab.requested_model)
+                  == (15, 3, ["m1", "m2"], "r")))
+
+for label, ok in _m_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 

@@ -37,13 +37,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at           INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts       INTEGER NOT NULL,
-    task_id  TEXT,
-    kind     TEXT NOT NULL,
-    detail   TEXT,
-    cost_usd REAL NOT NULL DEFAULT 0,
-    tokens   INTEGER NOT NULL DEFAULT 0
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              INTEGER NOT NULL,
+    task_id         TEXT,
+    kind            TEXT NOT NULL,
+    detail          TEXT,
+    cost_usd        REAL NOT NULL DEFAULT 0,
+    tokens          INTEGER NOT NULL DEFAULT 0,
+    -- Agent runs only. `ts` is when the run was recorded, i.e. when it ended;
+    -- it started `duration_ms` earlier.
+    duration_ms     INTEGER NOT NULL DEFAULT 0,
+    turns           INTEGER NOT NULL DEFAULT 0,
+    model           TEXT,              -- what answered, most expensive first
+    model_requested TEXT,              -- what `--model` asked for
+    log             TEXT               -- station log name, e.g. implement-2
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source, state);
@@ -85,6 +92,11 @@ class Store:
         for table, column, decl in (
             ("events", "tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("tasks", "tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("events", "duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("events", "turns", "INTEGER NOT NULL DEFAULT 0"),
+            ("events", "model", "TEXT"),
+            ("events", "model_requested", "TEXT"),
+            ("events", "log", "TEXT"),
         ):
             names = {r["name"] for r in
                      self.conn.execute(f"PRAGMA table_info({table})")}
@@ -189,11 +201,22 @@ class Store:
     # --- accounting ---------------------------------------------------
     def record(self, kind: str, task_id: str | None = None,
                detail: str = "", cost_usd: float = 0.0,
-               tokens: int = 0) -> None:
+               tokens: int = 0, *, duration_ms: int = 0, turns: int = 0,
+               model: str | None = None, model_requested: str | None = None,
+               log: str | None = None, ts: int | None = None) -> None:
+        """One ledger line.
+
+        `ts` defaults to now. Pass it only for a fact whose time is known
+        better elsewhere -- the first human review of a PR happened when
+        GitHub says it did, not when the next tick noticed.
+        """
         self.conn.execute(
-            "INSERT INTO events (ts, task_id, kind, detail, cost_usd, tokens)"
-            " VALUES (?,?,?,?,?,?)",
-            (_now(), task_id, kind, detail[:4000], cost_usd, int(tokens)),
+            "INSERT INTO events (ts, task_id, kind, detail, cost_usd, tokens,"
+            " duration_ms, turns, model, model_requested, log)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (_now() if ts is None else int(ts), task_id, kind, detail[:4000],
+             cost_usd, int(tokens), int(duration_ms or 0), int(turns or 0),
+             model, model_requested, log),
         )
         if task_id and (cost_usd or tokens):
             self.conn.execute(
@@ -202,6 +225,18 @@ class Store:
                 (cost_usd, int(tokens), task_id),
             )
         self.conn.commit()
+
+    def runs_recorded(self, task_id: str, kind: str) -> int:
+        """How many `kind` runs this row has on the ledger.
+
+        Numbers the next run's log (`models.run_station`). Counted from the
+        ledger rather than a counter in `meta` so a run that crashed before
+        it was recorded reuses its name instead of leaving a gap.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) c FROM events WHERE task_id = ? AND kind = ?",
+            (task_id, kind)).fetchone()
+        return int(row["c"])
 
     def spend_since(self, epoch: int) -> float:
         row = self.conn.execute(

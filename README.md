@@ -319,6 +319,30 @@ what it cost, and whether the work landed. It opens the SQLite store with
 `mode=ro`, so it cannot write to the database, the tickets or the repos —
 acting on the runner stays in the task manager and the CLI.
 
+| Tab | What it answers |
+|---|---|
+| Overview | What needs you, grouped: questions to answer, plans to approve, blocked rows, runs that need a look |
+| Board | Every in-flight row by state |
+| Flow | For merged PRs: median time to PR, PR to first human review, review to merge; the share of cycle time spent waiting on people; human touches; how many merged with no human fix or commit |
+| Runs | Every agent run: station, outcome, wall time, turns, the model that answered (⚠ when it differs from the one requested), tokens, cost; click one to open its log |
+| Spend, Throughput | Tokens and dollars per station per day; outcomes and cycle times |
+| Graph | The live state machine as a table |
+
+The date range (7, 14, 30 or 90 days) applies to Flow, Runs, Spend and
+Throughput. A row's detail sheet shows its history as lanes on one time axis —
+the state it was in, the PR milestones, one bar per agent run — above the same
+history as a list.
+
+Flow and Runs read telemetry the runner started recording in this version, so
+rows that finished earlier show `—` for run times and an unknown autonomy
+rather than a guess. Stage times come from ticks, so they are only as precise
+as the cron interval.
+
+Triage also keeps what it saw and what it decided, redacted, under
+`{runner.log_dir}/triage/` — one JSON file per triage run. Nothing reads them
+yet; they are the inputs a later triage benchmark replays. Prune them by hand
+like any other log.
+
 `serve` refuses to start against a missing or unusable database rather than
 serving a dashboard full of zeros — those are indistinguishable from a runner
 that ran and found nothing to do, which is exactly the ambiguity the
