@@ -88,6 +88,10 @@ class Scorer:
     model: str | None = None
     path: Path | None = None
 
+    def covers(self, row: dict[str, Any]) -> bool:
+        """Is this row's repo one the scorer applies to? (`repos` empty: all.)"""
+        return not self.repos or row.get("repo_key") in self.repos
+
     def judges(self, station: str) -> bool:
         """Does this scorer apply to a run logged under `station`?
 
@@ -171,7 +175,10 @@ def parse(text: str, path: Path | None = None) -> Scorer:
 
     # Unset means only the best label passes. A three-level rubric whose
     # middle label quietly counted as a pass would overstate every rate.
-    pass_score = float(meta.get("pass_score", max(labels.values())))
+    try:
+        pass_score = float(meta.get("pass_score", max(labels.values())))
+    except (TypeError, ValueError):
+        raise ValueError("pass_score must be a number in 0..1") from None
     if not any(v >= pass_score for v in labels.values()):
         raise ValueError(f"pass_score {pass_score} is above every label's "
                          f"score, so nothing could pass")
@@ -198,18 +205,25 @@ def load(directory: Path | str | None) -> tuple[list[Scorer], list[str]]:
 
     A bad file is skipped, not fatal: one typo'd rubric must not stop the
     others, or the tick. `doctor` reports the errors, so they are not silent.
+
+    The catch is deliberately broad. This runs in `Pipeline.__init__`, which
+    `cli._pipelines` calls outside the per-source guard, so anything a rubric
+    file can make `parse` raise would otherwise stop every source's tick --
+    a dashboard metric taking down the work it measures.
     """
     if not directory:
         return [], []
     root = Path(str(directory)).expanduser()
-    if not root.is_dir():
-        return [], []
+    try:
+        paths = sorted(root.glob("*.md")) if root.is_dir() else []
+    except OSError as exc:
+        return [], [f"{root}: {exc}"]
     found: list[Scorer] = []
     errors: list[str] = []
-    for path in sorted(root.glob("*.md")):
+    for path in paths:
         try:
             sc = parse(path.read_text(encoding="utf-8"), path)
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"{path.name}: {exc}")
             continue
         if any(s.name == sc.name for s in found):

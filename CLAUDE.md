@@ -693,11 +693,18 @@ Invariants, each easy to undo by accident:
 - **One path for the tick and the CLI.** `scorers.score_run()` is what both
   `Pipeline._score_runs()` and `deputy score` call, so a verdict tried at the
   terminal is the verdict the tick would record. `--record` claims exactly as
-  the tick does; without it only the spend is written.
+  the tick does; without it only the spend is written. The CLI holds itself to
+  the tick's other rules too: the scorer's `repos`, no recorded verdict on a
+  failed run, and `pipeline.limits_exceeded()` — the same function behind
+  `Pipeline._limits_exceeded` — before every judge call.
+- **`scorers.load()` never raises for a file.** It runs in `Pipeline.__init__`,
+  which `cli._pipelines` calls outside the per-source guard, so its per-file
+  catch is deliberately broad: a rubric typo must cost a scorer, not the tick.
 - **Scoring is last in the tick** and inside `windows.score` (default: the
   triage window). It moves no ticket, so it only ever gets the budget the work
-  left. Scorers take turns per tick so one with a backlog cannot take every
-  `max_scores_per_run` slot. Failed runs (`models.run_outcome`, shared with the
+  left. Scorers take turns, starting with whichever has waited longest
+  (`Store.last_scored()`), so one with a backlog cannot take every
+  `max_scores_per_run` slot, this tick or the next. Failed runs (`models.run_outcome`, shared with the
   Runs tab) and runs with no log are never judged.
 - **The log path is built in `scorers.log_path()`**, not in `pipeline.py`,
   which keeps the smoke test's count of `agent_log_name(` call sites there at two.

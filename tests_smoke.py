@@ -3034,6 +3034,8 @@ _s_checks.append(("a score outside 0..1 is refused",
                   _rejects(_GOOD.replace("partly: 0.5", "partly: 5"), "outside")))
 _s_checks.append(("a file with no frontmatter is refused",
                   _rejects("just a rubric", "frontmatter")))
+_s_checks.append(("an empty pass_score is refused, not a TypeError",
+                  _rejects(_GOOD.replace("labels:", "pass_score:\nlabels:"), "pass_score")))
 _s_checks.append(("a pass_score nothing can reach is refused",
                   _rejects(_GOOD.replace("labels:", "pass_score: 2\nlabels:"),
                            "nothing could pass")))
@@ -3042,12 +3044,25 @@ with tempfile.TemporaryDirectory() as _tmp:
     Path(_tmp, "a.md").write_text(_GOOD)
     Path(_tmp, "b.md").write_text(_GOOD)                  # same name again
     Path(_tmp, "c.md").write_text("no frontmatter")
+    Path(_tmp, "d.md").write_text(_GOOD.replace("name: ran-tests", "name: d")
+                                       .replace("labels:", "pass_score:\nlabels:"))
     Path(_tmp, "notes.txt").write_text("ignored")
     _found, _errs = SC.load(_tmp)
+    # Whatever a rubric file makes the parser raise, load() reports it: it
+    # runs in Pipeline.__init__, outside the per-source guard.
+    _real_parse = SC.parse
+    SC.parse = lambda *a, **k: (_ for _ in ()).throw(KeyError("surprise"))
+    try:
+        _f2, _e2 = SC.load(_tmp)
+    finally:
+        SC.parse = _real_parse
 _s_checks.append(("load keeps the good file and names each bad one",
-                  [x.name for x in _found] == ["ran-tests"] and len(_errs) == 2
+                  [x.name for x in _found] == ["ran-tests"] and len(_errs) == 3
                   and any("b.md" in e and "already" in e for e in _errs)
-                  and any(e.startswith("c.md") for e in _errs)))
+                  and any(e.startswith("c.md") for e in _errs)
+                  and any(e.startswith("d.md") for e in _errs)))
+_s_checks.append(("no rubric file can make load() raise",
+                  _f2 == [] and len(_e2) == 4))
 _s_checks.append(("no scorer directory means scoring is off, quietly",
                   SC.load("/nonexistent/deputy/scorers") == ([], [])
                   and SC.load(None) == ([], [])))
@@ -3355,6 +3370,24 @@ with tempfile.TemporaryDirectory() as _tmp:
                       [r["task_id"] for r in _st.conn.execute("SELECT task_id FROM scores")]
                       == ["mycorp:T89#pulse-frontend"]))
 
+# A cap smaller than the number of scorers rotates across ticks.
+with tempfile.TemporaryDirectory() as _tmp:
+    _SCORER_FILES["second.md"] = _GOOD.replace("name: ran-tests", "name: second")
+    try:
+        _j = _Judge()
+        _pipe, _st = _scoring_pipe(_tmp, _j, limits={"max_scores_per_run": 1})
+    finally:
+        del _SCORER_FILES["second.md"]
+    for _k in ("T91", "T92", "T93"):
+        _seed_run(_st, _tmp, _k)
+    _order = []
+    for _ in range(2):
+        _pipe.tick(_in_window)
+        _order.append(_st.conn.execute(
+            "SELECT scorer FROM scores ORDER BY id DESC LIMIT 1").fetchone()[0])
+    _s_checks.append(("with a cap of one, the next tick goes to the scorer that waited",
+                      sorted(_order) == ["ran-tests", "second"]))
+
 # `deputy score`: the same verdict, recorded only when asked.
 import runner.cli as _cli
 with tempfile.TemporaryDirectory() as _tmp:
@@ -3396,6 +3429,35 @@ with tempfile.TemporaryDirectory() as _tmp:
             _rc3 = _cli._score(_pipe.cfg, "review-only", [_evid], 3, False)
         _s_checks.append(("a run of the wrong station is refused, not judged",
                           _rc3 == 1 and "implement run" in _err.getvalue()
+                          and len(_j.calls) == 3))
+
+        _fe = _draft.parent / "frontend-only.md"
+        _fe.write_text(_GOOD.replace("name: ran-tests", "name: frontend-only")
+                            .replace("labels:", "repos: [pulse-frontend]\nlabels:"))
+        _err, _out = io.StringIO(), io.StringIO()
+        with _ctx.redirect_stderr(_err), _ctx.redirect_stdout(_out):
+            _rc4 = _cli._score(_pipe.cfg, str(_fe), [_evid], 3, True)
+            _rc5 = _cli._score(_pipe.cfg, str(_fe), [], 3, False)
+        _s_checks.append(("a run outside the scorer's repos is refused or skipped",
+                          _rc4 == 1 and "covers pulse-frontend" in _err.getvalue()
+                          and _rc5 == 0 and "no finished" in _out.getvalue()
+                          and len(_j.calls) == 3))
+
+        _bad_row = _seed_run(_st, _tmp, "T94", detail="agent timed out after 60s")
+        _bad = _st.conn.execute("SELECT id FROM events WHERE task_id = ?",
+                                (_bad_row,)).fetchone()[0]
+        _err = io.StringIO()
+        with _ctx.redirect_stderr(_err):
+            _rc6 = _cli._score(_pipe.cfg, "ran-tests", [_bad], 3, True)
+        _s_checks.append(("--record refuses a failed run the tick would never judge",
+                          _rc6 == 1 and "failed" in _err.getvalue() and len(_j.calls) == 3))
+
+        _pipe.cfg.data["runner"]["limits"]["daily_budget_usd"] = 0.01
+        _err = io.StringIO()
+        with _ctx.redirect_stderr(_err), _ctx.redirect_stdout(io.StringIO()):
+            _rc7 = _cli._score(_pipe.cfg, "ran-tests", [_evid], 3, False)
+        _s_checks.append(("deputy score stops at the daily budget like the tick",
+                          _rc7 == 1 and "daily budget exhausted" in _err.getvalue()
                           and len(_j.calls) == 3))
     finally:
         _cli.ClaudeCodeAgent = _real_agent

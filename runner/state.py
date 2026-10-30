@@ -334,6 +334,11 @@ class Store:
              _now() - self.SCORE_CLAIM_TTL)).fetchall()
         return [dict(r) for r in rows]
 
+    def last_scored(self) -> dict[str, int]:
+        """When each scorer last claimed a run: who has waited longest."""
+        return {r["scorer"]: int(r["ts"]) for r in self.conn.execute(
+            "SELECT scorer, MAX(ts) ts FROM scores GROUP BY scorer")}
+
     def event(self, event_id: int) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM events WHERE id = ?", (int(event_id),)).fetchone()

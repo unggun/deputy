@@ -37,6 +37,26 @@ def _midnight_epoch(now: dt.datetime) -> int:
     return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
+def limits_exceeded(store: Store, limits: dict[str, Any],
+                    now: dt.datetime) -> str | None:
+    """The daily-limit gate itself; see `Pipeline._limits_exceeded`.
+
+    Module-level so `deputy score`, which spends without a pipeline, is held
+    to the same two limits by the same code.
+    """
+    midnight = _midnight_epoch(now)
+    budget = float(limits.get("daily_budget_usd", 20))
+    spent = store.spend_since(midnight)
+    if spent >= budget:
+        return f"daily budget exhausted ({spent:.2f} / {budget:.2f} USD)"
+    cap = int(limits.get("daily_tokens", 0) or 0)
+    if cap:
+        used = store.tokens_since(midnight)
+        if used >= cap:
+            return f"daily token cap exhausted ({used:,} / {cap:,} tokens)"
+    return None
+
+
 class Pipeline:
     def __init__(self, cfg: Config, source: Source, provider: TaskProvider,
                  agent: CodingAgent, store: Store, dry_run: bool = False) -> None:
@@ -990,19 +1010,24 @@ class Pipeline:
         """Judge up to `limits.max_scores_per_run` finished runs.
 
         Scorers take turns, newest runs first, so one scorer with a backlog
-        cannot take every slot. Each judge call is budget-checked like every
-        other agent run, and each run is claimed before it is judged, so a
-        crash or an overlapping tick never pays twice for one verdict.
+        cannot take every slot -- and the turn order starts with whichever
+        scorer has waited longest, read from the store, so a cap smaller than
+        the number of scorers rotates across ticks instead of giving the
+        first file every slot every time. Each judge call is budget-checked
+        like every other agent run, and each run is claimed before it is
+        judged, so a crash or an overlapping tick never pays twice for one
+        verdict.
         """
         cap = int(self.limits.get("max_scores_per_run", 5) or 0)
         if cap <= 0:
             return
         since = int(now.timestamp()) - 86400 * int(
             self.limits.get("score_lookback_days", 14) or 14)
+        last = self.store.last_scored()
         queues = [[(sc, ev) for ev in self.store.unscored_runs(
                        sc.name, self.source.key, sc.stations, since)
                    if scorers.sampled(sc, ev["id"]) and scorers.judgeable(ev)]
-                  for sc in self.scorers]
+                  for sc in sorted(self.scorers, key=lambda sc: last.get(sc.name, 0))]
         judged = 0
         while judged < cap and any(queues):
             for queue in queues:
@@ -1010,8 +1035,7 @@ class Pipeline:
                     continue
                 sc, ev = queue.pop(0)
                 row = self.store.get(ev["task_id"] or "")
-                if not row or not row.get("repo_key") or (
-                        sc.repos and row["repo_key"] not in sc.repos):
+                if not row or not row.get("repo_key") or not sc.covers(row):
                     continue
                 if not self._budget_available(now):
                     return
@@ -1037,17 +1061,7 @@ class Pipeline:
         same units as the quota, so it is the limit that bites on the setup
         most people actually have. Whichever trips first stops the tick.
         """
-        midnight = _midnight_epoch(now)
-        budget = float(self.limits.get("daily_budget_usd", 20))
-        spent = self.store.spend_since(midnight)
-        if spent >= budget:
-            return f"daily budget exhausted ({spent:.2f} / {budget:.2f} USD)"
-        cap = int(self.limits.get("daily_tokens", 0) or 0)
-        if cap:
-            used = self.store.tokens_since(midnight)
-            if used >= cap:
-                return f"daily token cap exhausted ({used:,} / {cap:,} tokens)"
-        return None
+        return limits_exceeded(self.store, self.limits, now)
 
     def _budget_available(self, now: dt.datetime) -> bool:
         """Re-checked immediately before every agent run (analyst, implementer,

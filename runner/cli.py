@@ -13,7 +13,7 @@ from . import brain, graph, providers, scorers, vcs
 from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .models import AgentResult, AIState
-from .pipeline import Pipeline
+from .pipeline import Pipeline, limits_exceeded
 from .state import Store
 
 BOT_MARKER_DEFAULT = "<!-- ai-runner -->"
@@ -243,20 +243,36 @@ def _score(cfg: Config, name: str, run_ids: list[int], last: int,
         return 1
 
     store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
+
+    def row_of(ev: dict) -> dict:
+        return store.get(ev["task_id"] or "") or {}
+
     if run_ids:
-        runs = [store.event(i) for i in run_ids]
-        missing = [i for i, ev in zip(run_ids, runs) if ev is None]
+        found_runs = [store.event(i) for i in run_ids]
+        missing = [i for i, ev in zip(run_ids, found_runs) if ev is None]
         if missing:
             print(f"no run with id {', '.join(map(str, missing))}", file=sys.stderr)
             return 1
-        wrong = [ev for ev in runs if ev and not sc.judges(ev["kind"])]
-        if wrong:
-            print(f"{sc.name} judges {'/'.join(sc.stations)} runs; run "
-                  f"{wrong[0]['id']} is a {wrong[0]['kind']} run", file=sys.stderr)
+        runs = [ev for ev in found_runs if ev]
+        # The scorer's own scope applies here exactly as in the tick: a
+        # verdict on a run the scorer does not cover would land in its pass
+        # rate with `--record`, and tells a rubric author nothing without it.
+        refusals = [
+            f"{sc.name} judges {'/'.join(sc.stations)} runs; run {ev['id']} "
+            f"is a {ev['kind']} run" for ev in runs if not sc.judges(ev["kind"])
+        ] + [
+            f"{sc.name} covers {', '.join(sc.repos)}; run {ev['id']} is in "
+            f"{row_of(ev).get('repo_key')}" for ev in runs if not sc.covers(row_of(ev))
+        ] + [
+            f"run {ev['id']} failed, and the tick never records a verdict on a "
+            f"failed run" for ev in runs if record and not scorers.judgeable(ev)
+        ]
+        if refusals:
+            print(refusals[0], file=sys.stderr)
             return 1
     else:
-        runs = [ev for ev in store.recent_runs(sc.stations, 200)
-                if scorers.judgeable(ev)][:last]
+        runs = [ev for ev in store.recent_runs(sc.stations, 500)
+                if scorers.judgeable(ev) and sc.covers(row_of(ev))][:last]
         if not runs:
             print(f"no finished {'/'.join(sc.stations)} runs with a log yet")
             return 0
@@ -270,8 +286,15 @@ def _score(cfg: Config, name: str, run_ids: list[int], last: int,
         except Exception:  # noqa: BLE001
             continue
     log_root = Path(str(cfg.get("runner.log_dir", "~/.deputy/logs"))).expanduser()
-    for ev in filter(None, runs):
-        row = store.get(ev["task_id"] or "") or {}
+    limits = cfg.get("runner.limits", {}) or {}
+    for ev in runs:
+        # Operator-run, but it spends the same quota: held to the same daily
+        # limits as the tick, checked before every judge call.
+        spent = limits_exceeded(store, limits, dt.datetime.now())
+        if spent:
+            print(f"{spent}; not judging further runs today", file=sys.stderr)
+            return 1
+        row = row_of(ev)
         verdict = scorers.score_run(
             agent, store, sc, ev, log_root=log_root,
             repo=repos.get((row.get("source"), row.get("repo_key"))),
