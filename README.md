@@ -481,9 +481,11 @@ A replay gets what the implementer got the first time: the tick's own
 implement prompt and tools, the ticket as triage last saw it before the work
 began, the agreed plan and acceptance criteria, and the repo's brain as it
 stood that day. Notes dated on or after it are left out, since the approving
-review of that very ticket may have written one. It runs in a scratch clone of
-the repo with no remote, under `{runner.work_dir}/bench/`, so nothing can be
-pushed, and nothing is commented on or reviewed. The clone is deleted
+review of that very ticket may have written one. It runs in a scratch
+repository under `{runner.work_dir}/bench/` that holds the base commit's
+history and nothing else: no remote, so nothing can be pushed, and no branch,
+tag or later commit, so the change that merged is not there to find. Nothing
+is commented on or reviewed. The clone is deleted
 afterwards; its diff and agent log stay under `{runner.log_dir}/bench/`.
 
 Each run is graded twice:

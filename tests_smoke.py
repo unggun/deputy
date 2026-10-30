@@ -4544,7 +4544,12 @@ class _Implementer:
         self.work_calls.append({
             "prompt": prompt, "model": model, "tools": allowed_tools,
             "remotes": vcs.run(["git", "remote"], cwd=cwd).stdout.strip(),
-            "head": vcs.run(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()})
+            "head": vcs.run(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip(),
+            "refs": vcs.run(["git", "for-each-ref"], cwd=cwd).stdout.strip(),
+            "commits": {line.split()[1] for line in vcs.run(
+                ["git", "cat-file", "--batch-all-objects",
+                 "--batch-check=%(objecttype) %(objectname)"], cwd=cwd).stdout.splitlines()
+                if line.startswith("commit ")}})
         Path(log_path).write_text('{"type": "result"}\n', encoding="utf-8")
         if model == "sloppy":
             (cwd / "other.txt").write_text("token sekrit-123\n", encoding="utf-8")
@@ -4574,6 +4579,8 @@ def _impl_world(tmp, test="test -f feature.txt"):
     (repo / "feature.txt").write_text("export\n", encoding="utf-8")
     g("add", "-A")
     g("commit", "-q", "-m", "the change that merged")
+    g("branch", "merged")              # the answer, a branch and a tag away
+    g("tag", "v1")
     ref = vcs.run(["git", "diff", base, "HEAD"], cwd=repo).stdout
     g("reset", "-q", "--hard", base)
 
@@ -4617,7 +4624,7 @@ try:
         vcs.pr_diff = lambda main, number, env=None: _ref
         _cases, _out = _bi.load(_st, Path(_tmp) / "l", _rn)
         _i_checks.append(("a merged ticket is a case; one without a base commit is left out",
-                          [c.name for c in _cases] == ["B30__pulse-backend"]
+                          [c.name for c in _cases] == ["B30__mycorp__pulse-backend"]
                           and _out == {"no base commit": 1}
                           and _cases[0].base_sha == _base
                           and _cases[0].task.title == "Add CSV export"
@@ -4633,6 +4640,8 @@ try:
         _i_checks.append(("every trial starts at the base commit in a clone with no remote",
                           len(_w) == 3 and all(c["head"] == _base and c["remotes"] == ""
                                                for c in _w)))
+        _i_checks.append(("...and nothing from after it: no branch, no tag, no later commit",
+                          all(c["refs"] == "" and c["commits"] == {_base} for c in _w)))
         _i_checks.append(("...with the tick's own implement prompt, plan and criteria",
                           all("=== AGREED PLAN ===" in c["prompt"] and "1. do it" in c["prompt"]
                               and "- it works" in c["prompt"]
@@ -4665,7 +4674,8 @@ try:
                           _sloppy_diff.exists() and "other.txt" in _sloppy_diff.read_text()
                           and "sekrit-123" not in _sloppy_diff.read_text()
                           and "sekrit-123" not in _ag.reason_calls[1]["prompt"]
-                          and (Path(_tmp) / "l" / _tr["sonnet"]["log"]).exists()))
+                          and (Path(_tmp) / "l" / _tr["sonnet"]["log"]).exists()
+                          and _tr["sonnet"]["log"].startswith(f"bench/{_run_id}/mycorp/")))
         _iled = [dict(r) for r in _st.conn.execute(
             "SELECT * FROM events WHERE kind = 'bench' ORDER BY id")]
         _i_checks.append(("each agent run and judge call is on the ledger as bench, with no task",
@@ -4676,7 +4686,7 @@ try:
         _branches = vcs.run(["git", "branch", "--format=%(refname:short)"], cwd=_repo).stdout.split()
         _i_checks.append(("the scratch clones are gone and the main clone is as it was",
                           not (Path(_tmp) / "w" / "bench" / str(_run_id)).exists()
-                          and _branches == ["main"] and _stop is None
+                          and _branches == ["main", "merged"] and _stop is None
                           and vcs.run(["git", "rev-parse", "HEAD"], cwd=_repo).stdout.strip() == _base
                           and len(vcs.run(["git", "worktree", "list"], cwd=_repo).stdout.splitlines()) == 1
                           and not vcs.run(["git", "status", "--porcelain"], cwd=_repo).stdout.strip()))
@@ -4727,6 +4737,33 @@ try:
         _i_checks.append(("diffs too big for one prompt are never cut: insufficient, nothing called",
                           _big["decision"] == "insufficient_evidence" and _big["correct"] is None
                           and _ag5.reason_calls == [] and "nothing was cut" in _big["reasoning"]))
+
+        # a failed test grades the trial wrong even when the judge cannot answer
+        _ag6 = _Implementer(label="bogus")
+        _f_id, _ = _irun(_ag6, _st, _cases, [_bi.Variant(model="sloppy", label="sloppy")], _tmp)
+        _ft = [_bench.decode(t) for t in _st.bench_trials(_f_id)]
+        _fsum = _bi.summarize(_ft, ["sloppy"])[0]
+        _i_checks.append(("a failed test grades the trial wrong when the judge cannot answer",
+                          _ft[0]["decision"] is None and "unknown label" in _ft[0]["error"]
+                          and _ft[0]["tests"] == 0 and _ft[0]["correct"] == 0
+                          and (_fsum["errors"], _fsum["n"], _fsum["rate"]) == (1, 1, 0)
+                          and (_fsum["tests_n"], _fsum["tests_ok"]) == (1, 0)
+                          and _bi.misses(_ft) == _ft))
+
+        # a ^C after the agent run returned still leaves its spend on the ledger
+        class _Interrupting(_Implementer):
+            def reason(self, prompt, **kw):
+                raise KeyboardInterrupt
+        _k_id, _k_stop = _irun(_Interrupting(), _st, _cases,
+                               [_bi.Variant(model=None, label="sonnet")], _tmp)
+        _kled = [dict(r) for r in _st.conn.execute(
+            "SELECT * FROM events WHERE kind = 'bench' AND detail LIKE ?", (f"#{_k_id} %",))]
+        _i_checks.append(("a ^C during the judge keeps the finished run's spend on the ledger",
+                          _k_stop == "interrupted" and _st.bench_trials(_k_id) == []
+                          and len(_kled) == 1 and _kled[0]["cost_usd"] == 0.5
+                          and _kled[0]["detail"].endswith("implement ok")
+                          and _kled[0]["log"].startswith(f"bench/{_k_id}/")
+                          and not (Path(_tmp) / "w" / "bench" / str(_k_id)).exists()))
 
         # the CLI
         import argparse as _argparse

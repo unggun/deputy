@@ -377,24 +377,34 @@ def pr_diff(main: Path, number: int, env: dict[str, str] | None = None) -> str:
 
 def scratch_checkout(repo: dict[str, Any], sha: str, dest: Path,
                      env: dict[str, str] | None = None) -> Path:
-    """A throwaway clone of `repo` at `sha`, detached, with no remote.
+    """A throwaway repository at `sha`, detached, holding only its history.
 
-    For the implementation benchmark, whose runs must never be pushed. A
-    worktree would share the main clone's `origin`, its credentials and its
-    branch namespace; a `--shared` clone borrows the objects and nothing
-    else, and with its only remote removed a `git push` has nowhere to go.
+    For the implementation benchmark, whose runs must never be pushed and
+    must never see the answer. A worktree would share the main clone's
+    `origin`, its credentials and its branch namespace. A clone, even with
+    `origin` removed, keeps a local branch, the tags and (with `--shared`)
+    every object the main clone has, so `git show main:file` or
+    `git cat-file --batch-all-objects` hands the agent the change that
+    merged. So this fetches `sha` alone into an empty repository: no refs, no
+    tags, no remote, nothing reachable but `sha` and its ancestors. The cost
+    is a copy of that history per checkout.
+
     The main clone is only ever read, plus a fetch of `sha` when it does not
-    have that commit yet -- the same fetch the tick makes.
+    have that commit yet -- the same fetch the tick makes. `sha` is rarely a
+    branch tip, which protocol v0 refuses to serve, hence the upload-pack
+    override; it applies to this one local read and to nothing else.
     """
     main = Path(str(repo["path"])).expanduser()
     if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=main,
            check=False, env=env).returncode != 0:
         run(["git", "fetch", "origin", sha], cwd=main, env=env)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(main), str(dest)],
-        env=env)
-    run(["git", "remote", "remove", "origin"], cwd=dest, env=env)
+    dest.mkdir(parents=True, exist_ok=True)
+    run(["git", "init", "--quiet"], cwd=dest, env=env)
+    run(["git", "fetch", "--quiet", "--no-tags", "--upload-pack",
+         "git -c uploadpack.allowAnySHA1InWant=true upload-pack", str(main.resolve()), sha],
+        cwd=dest, env=env)
     run(["git", "checkout", "--quiet", "--detach", sha], cwd=dest, env=env)
+    (dest / ".git" / "FETCH_HEAD").unlink(missing_ok=True)   # it names the main clone
     return dest
 
 

@@ -911,13 +911,17 @@ judge. It shares `bench_runs` (`suite = 'implement'`) and `bench_trials` (with
 its own columns) with the triage suite. Invariants, each easy to undo by
 accident:
 
-- **A scratch clone with no remote, never a worktree.** `vcs.scratch_checkout`
-  makes a `git clone --shared` of the main clone and removes `origin`. A
-  worktree would share the main clone's remote and branch namespace. With no
-  remote a `git push` has nowhere to go, which is what lets a replay use the
-  production `allowed_tools` (`Bash(git:*)` included) unchanged. The main
-  clone is only read, plus a `git fetch origin <sha>` when it lacks the base
-  commit. Nothing builds a provider: no comment, no AI State, no review.
+- **A scratch repository holding the base commit's history and nothing
+  else, never a worktree or a clone.** `vcs.scratch_checkout` runs `git init`
+  and fetches the base SHA alone from the main clone, with `--no-tags`. A
+  worktree would share the main clone's remote and branch namespace. A clone,
+  even with `origin` removed, keeps a local branch and the tags, and with
+  `--shared` every object, so `git show main:file` would hand the replay the
+  change that merged. With no remote a `git push` has nowhere to go, which is
+  what lets a replay use the production `allowed_tools` (`Bash(git:*)`
+  included) unchanged. The main clone is only read, plus a `git fetch origin
+  <sha>` when it lacks the base commit. Nothing builds a provider: no
+  comment, no AI State, no review.
 - **The tick's own prompt, the first pass only.** The CLI passes
   `pipeline._work_prompt` in as `work_prompt`, so `bench_impl.py` never
   imports `pipeline` and `db.py` can import it. The review loop is not
@@ -943,7 +947,9 @@ accident:
 - **Correct means the judge says correct and the tests did not fail.** A
   failed test outranks the judge. An empty diff is `no changes`, wrong, with
   no judge call. A failed run, a judge error and `insufficient_evidence`
-  leave `correct` NULL (unless a test failed) and never move the rate.
+  leave `correct` NULL and never move the rate, unless a test failed: that is
+  a grade on its own, so `summarize()` counts the test result and the wrong
+  grade whatever the judge did.
 - **Cap against an estimate, limits before every agent run.** A triage case
   costs cents; an implement case costs dollars. `run()` checks the cap before
   each ticket against what is spent plus that ticket's original implement
@@ -955,10 +961,14 @@ accident:
   not give, or credentials `profile_env` cannot build, skips the ticket and
   says so in the run's note.
 - **Spend is on the ledger, not a row.** Kind `bench`, `task_id` NULL, one
-  line per agent run (with its `log`) and one per judge call. A trial's `log`
-  and `diff` are paths under `runner.log_dir`
-  (`bench/{run}/{agent_log_name(task, repo, "vN-rep")}`); the diff is
-  redacted, and the scratch clones are deleted unless `--keep`.
+  line per agent run (with its `log`) and one per judge call. The agent run's
+  line is written the moment `work()` returns (`trial(on_work=)`), before the
+  tests and the judge, so a ^C there cannot lose spend the daily limits must
+  see. A trial's `log` and `diff` are paths under `runner.log_dir`
+  (`bench/{run}/{source}/{agent_log_name(task, repo, "vN-rep")}`); the diff is
+  redacted, and the scratch clones are deleted unless `--keep`. The source is
+  in the path and in the case name (`{task}__{source}__{repo}`) because two
+  sources may share a ticket key and a repo key.
 - **One summary for the terminal and the tab.** `bench_impl.summarize()`,
   taking the run's variant labels, is what `deputy bench show` prints and
   what `Reader.bench()` returns for an implement run.

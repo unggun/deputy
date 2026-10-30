@@ -519,7 +519,8 @@ def _impl_show(run: dict, trials: list[dict]) -> None:
         print("\ngraded wrong:")
     for t in missed:
         tests = {1: "tests passed", 0: "tests failed"}.get(t["tests"], "tests not run")
-        print(f"  {t['task_key'] or t['case_name']:<12} {t['variant']}: {t['decision']}, "
+        print(f"  {t['task_key'] or t['case_name']:<12} {t['variant']}: "
+              f"{t['decision'] or 'no verdict'}, "
               f"{tests}, +{t['additions'] or 0}/-{t['deletions'] or 0}")
         if t["reasoning"]:
             print(f"  {'':<12} {t['reasoning'][:200]}")

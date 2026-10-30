@@ -4,9 +4,9 @@ A case is one routed row whose PR merged: the repo, the commit its branch
 forked from (`meta.base_sha`), the ticket as triage last saw it before the
 work started, and the plan and acceptance criteria the implementer was given.
 A trial is one `work()` run on that case under one model, with the tick's own
-implement prompt and tool allowlist, in a scratch clone at the base commit.
-It is never pushed, commented on or reviewed. The clone has no remote, and
-nothing here builds a provider.
+implement prompt and tool allowlist, in a scratch repository holding the
+base commit's history and nothing later. It is never pushed, commented on or
+reviewed. The repository has no remote, and nothing here builds a provider.
 
 Each trial is graded twice, and neither grade stands in for the other:
 
@@ -66,7 +66,7 @@ JUDGE_SYSTEM = (
 @dataclass
 class Case:
     """One merged ticket in one repo, as the work on it started."""
-    name: str                     # {task_key}__{repo_key}
+    name: str                     # {task_key}__{source}__{repo_key}
     row: dict[str, Any]           # the routed row, now `done`
     repo: dict[str, Any]          # the repo as today's config has it
     task: Task                    # as triage last saw it before the work began
@@ -167,8 +167,10 @@ def load(store: Any, log_root: Path, repos_now: dict[tuple[str, str], dict[str, 
         if snap is None:
             left_out["no ticket snapshot"] += 1
             continue
-        # Sanitised as `agent_log_name` sanitises: the name is also a directory.
-        name = f"{str(row.get('task_key') or '').replace('/', '_')}__{rk.replace('/', '_')}"
+        # Sources may share ticket and repo keys, and the name is also a
+        # directory, so it carries all three, sanitised as `agent_log_name` does.
+        name = "__".join(str(x).replace("/", "_")
+                         for x in (row.get("task_key") or "", src, rk))
         cases.append(Case(name=name, row=row,
                           repo=dict(repo, key=rk), task=bench._task(snap), meta=meta,
                           started=int(runs[0]["ts"]),
@@ -339,11 +341,15 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
           checkout: Path, log_file: Path, log_rel: str, brain_root: Path,
           work_prompt: Callable[[Task, dict[str, Any], dict[str, Any], str], str],
           judge_model: str | None, max_prompt_bytes: int, env: dict[str, str],
-          secrets: list[str], keep: bool) -> tuple[dict[str, Any], Spend, Spend]:
+          secrets: list[str], keep: bool,
+          on_work: Callable[[Spend, bool], None] | None = None
+          ) -> tuple[dict[str, Any], Spend, Spend]:
     """One trial: the variant implements one merged ticket, graded.
 
     Returns the trial's fields and the spend of its agent run and its judge
-    call, apart, since each has its own ledger line.
+    call, apart, since each has its own ledger line. `on_work` gets the agent
+    run's spend the moment it returns, before the tests and the judge: a ^C
+    there must not lose dollars the daily limits have to see.
     """
     fields: dict[str, Any] = {
         "variant": variant.label, "case_name": case.name, "task_id": case.row_id,
@@ -364,6 +370,8 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
         res = agent.work(work_prompt(case.task, case.repo, case.meta, notes), checkout,
                          log_path=log_file, model=variant.model)
         work = Spend.of(res)
+        if on_work:
+            on_work(work, res.ok)
         fields["turns"] = res.num_turns
         if not res.ok:
             fields["error"] = redact(f"agent run failed: {res.error}", secrets)[:1000]
@@ -383,8 +391,8 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
         reasoning = redact(reasoning, secrets)
         if label is None:
             fields["error"] = reasoning[:1000]
-            return fields, work, judged
-        fields.update(decision=label, reasoning=reasoning[:2000])
+        else:
+            fields.update(decision=label, reasoning=reasoning[:2000])
         if label in LABELS:
             fields["correct"] = int(label == CORRECT and fields["tests"] != 0)
         elif fields["tests"] == 0:
@@ -392,6 +400,8 @@ def trial(agent: CodingAgent, case: Case, variant: Variant, ref: Reference, *,
     except Exception as exc:  # noqa: BLE001 -- one bad trial must not end the run
         log.warning("bench trial %s / %s failed", case.name, variant.label, exc_info=True)
         fields["error"] = redact(f"{type(exc).__name__}: {exc}", secrets)[:1000]
+        if fields["tests"] == 0:
+            fields["correct"] = 0
     finally:
         if not keep:
             shutil.rmtree(checkout, ignore_errors=True)
@@ -453,22 +463,28 @@ def run(agent: CodingAgent, store: Any, cases: list[Case], variants_: list[Varia
                         raise _Stop("limits", f"{hit}; stopped partway through ticket "
                                               f"{i + 1} of {len(cases)}, which is left "
                                               f"out of the comparison")
+                    # The source is a directory: two sources may share both keys.
                     name = agent_log_name(case.task_key, case.repo_key, f"v{vi}-{rep}")
-                    log_rel = f"bench/{run_id}/{name}"
+                    log_rel = f"bench/{run_id}/{case.source.replace('/', '_')}/{name}"
+                    head = f"#{run_id} {case.name} {v.label}"
+
+                    def ran(work: Spend, ok: bool, head: str = head,
+                            log_rel: str = log_rel) -> None:
+                        store.record("bench", None,
+                                     f"{head}: implement {'ok' if ok else 'failed'}",
+                                     work.cost_usd, work.tokens, log=log_rel,
+                                     **work.run_fields())
+
                     fields, work, judged = trial(
                         agent, case, v, ref, checkout=root / case.name / f"v{vi}-{rep}",
                         log_file=Path(log_root) / log_rel, log_rel=log_rel,
                         brain_root=brain_root, work_prompt=work_prompt,
                         judge_model=judge_model, max_prompt_bytes=max_prompt_bytes,
-                        env=env, secrets=secrets, keep=keep)
-                    said = fields["decision"] or "failed"
-                    store.record("bench", None, f"#{run_id} {case.name} {v.label}: "
-                                 f"implement {said}", work.cost_usd, work.tokens,
-                                 log=log_rel, **work.run_fields())
+                        env=env, secrets=secrets, keep=keep, on_work=ran)
                     if judged.cost_usd or judged.tokens:
-                        store.record("bench", None, f"#{run_id} {case.name} {v.label}: "
-                                     f"judge {said}", judged.cost_usd, judged.tokens,
-                                     **judged.run_fields())
+                        store.record("bench", None,
+                                     f"{head}: judge {fields['decision'] or 'failed'}",
+                                     judged.cost_usd, judged.tokens, **judged.run_fields())
                     total = work + judged
                     store.record_trial(run_id, rep=rep, cost_usd=total.cost_usd,
                                        tokens=total.tokens, duration_ms=work.duration_ms,
@@ -508,8 +524,9 @@ def summarize(trials: list[dict[str, Any]],
     """Per variant, in the order they ran: correctness, tests, cost.
 
     `labels` are the run's variants (`bench_runs.variants`); without them,
-    the variants that have trials. Correctness is over trials with a verdict;
-    a failed agent run or judge call is counted beside it and never in it.
+    the variants that have trials. Correctness is over trials with a grade;
+    a failed agent run or judge call is counted beside it and never in it,
+    unless the tests failed, which grades the trial wrong without a judge.
     Every rate carries its n and its 95% range.
     """
     labels = labels or list(dict.fromkeys(t["variant"] for t in trials))
@@ -535,8 +552,7 @@ def summarize(trials: list[dict[str, Any]],
         decision = t.get("decision")
         if decision is None:
             v["errors"] += 1
-            continue
-        if decision == NO_CHANGES:
+        elif decision == NO_CHANGES:
             v["no_changes"] += 1
         elif decision == INSUFFICIENT:
             v["insufficient"] += 1
