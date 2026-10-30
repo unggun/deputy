@@ -20,6 +20,11 @@ from runner.models import (AgentResult, AIState, Comment, ReviewResult,
 from runner.pipeline import Pipeline
 from runner.providers.base import TaskProvider
 from runner.state import Store
+from runner import scorers as _scorers_mod
+
+# Scoring is on whenever the default directory holds a scorer file. A
+# developer's own ~/.deputy/scorers must not start judging inside the tests.
+_scorers_mod.DEFAULT_DIR = tempfile.mkdtemp(prefix="deputy-no-scorers-")
 
 
 def rid(task_key: str, repo: str = "pulse-backend") -> str:
@@ -2764,7 +2769,8 @@ _m_real = {n: getattr(_mv, n) for n in (
     "ensure_worktree", "ensure_review_worktree", "commit_all", "push",
     "create_pr", "diff_stat", "remove_worktree", "head_sha", "merge_base",
     "commits_since", "pr_status", "human_feedback", "approving_reactions",
-    "first_human_activity", "failing_check_logs", "pr_commits", "mark_ready")}
+    "first_human_activity", "failing_check_logs", "pr_commits", "mark_ready",
+    "pr_size")}
 try:
     with tempfile.TemporaryDirectory() as _tmp:
         _cfg = Config.load("config.example.yaml")
@@ -2863,14 +2869,18 @@ try:
         _st.update(merged=True, state="MERGED")
         _mv.pr_commits = lambda *a, **k: ["after-base0", "after-impl1",
                                           "after-impl2", "someone-else"]
+        _mv.pr_size = lambda *a, **k: {"additions": 40, "deletions": 12, "files": 3}
         _pipe.tick(_when)
         _merged = _store.conn.execute(
             "SELECT detail FROM events WHERE task_id = ? AND kind = 'pr_merged'",
             (rid("T70"),)).fetchone()
         _m_checks.append(("a merge counts the commits the runner did not make",
                           _merged is not None
-                          and _merged["detail"] == "human_commits=1"
+                          and _merged["detail"].startswith("human_commits=1")
                           and _store.get(rid("T70"))["state"] == AIState.DONE.value))
+        _m_checks.append(("a merge records the PR's size as GitHub counts it",
+                          _merged is not None and _merged["detail"]
+                          == "human_commits=1 additions=40 deletions=12 files=3"))
 
     # A bot's approval alone is not a human review: nothing is latched --
     # neither a review app's APPROVED decision nor its thumbs-up reaction.
@@ -2907,12 +2917,15 @@ try:
         def _boom(*a, **k):
             raise _mv.CommandError("gh pr view 8 -> 1")
         _mv.pr_commits = _boom
+        _mv.pr_size = _boom
         _pipe.tick(dt.datetime(2026, 8, 10, 7, 0))
         _d = _store.conn.execute(
             "SELECT detail FROM events WHERE kind = 'pr_merged'").fetchone()
         _m_checks.append(("a merge whose commits cannot be read is unknown",
                           _d is not None and _d["detail"] == "human_commits=?"
                           and _store.get(rid("T71"))["state"] == AIState.DONE.value))
+        _m_checks.append(("an unreadable PR size is left off, never zero",
+                          _d is not None and "additions" not in _d["detail"]))
 
     # A PR opened before SHA tracking: its first tracked push is a fix, so
     # the original implementation's commits were never recorded as the
@@ -2972,6 +2985,422 @@ _m_checks.append(("Spend adds wall time and turns, and unions models",
                   == (15, 3, ["m1", "m2"], "r")))
 
 for label, ok in _m_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+# --- scorers ----------------------------------------------------------------
+print("\nscorers: rubric files, sampling, transcripts, verdicts")
+import contextlib as _ctx
+from runner import scorers as SC
+from runner.models import agent_log_name as _aln
+
+_s_checks = []
+_GOOD = """---
+name: ran-tests
+stations: [implement, fix]
+labels:
+  ran_and_passed: 1
+  partly: 0.5
+  did_not_run: 0
+---
+Did the agent run the tests after its last edit?
+"""
+_sc = SC.parse(_GOOD)
+_s_checks.append(("a scorer file parses",
+                  (_sc.name, _sc.stations, _sc.labels, _sc.sample_rate, _sc.rubric)
+                  == ("ran-tests", ["implement", "fix"],
+                      {"ran_and_passed": 1.0, "partly": 0.5, "did_not_run": 0.0}, 100,
+                      "Did the agent run the tests after its last edit?")))
+_s_checks.append(("unset pass_score means only the best label passes",
+                  _sc.pass_score == 1.0
+                  and SC.Verdict.of(_sc, "partly", "").passed is False
+                  and SC.Verdict.of(_sc, "ran_and_passed", "").passed is True))
+
+
+def _rejects(text, words):
+    try:
+        SC.parse(text)
+    except ValueError as exc:
+        return words in str(exc)
+    return False
+
+
+_s_checks.append(("triage cannot be scored: it has no transcript",
+                  _rejects(_GOOD.replace("[implement, fix]", "[triage]"), "triage")))
+_s_checks.append(("insufficient_evidence is reserved",
+                  _rejects(_GOOD.replace("partly: 0.5", "insufficient_evidence: 0.5"),
+                           "reserved")))
+_s_checks.append(("a score outside 0..1 is refused",
+                  _rejects(_GOOD.replace("partly: 0.5", "partly: 5"), "outside")))
+_s_checks.append(("a file with no frontmatter is refused",
+                  _rejects("just a rubric", "frontmatter")))
+_s_checks.append(("a pass_score nothing can reach is refused",
+                  _rejects(_GOOD.replace("labels:", "pass_score: 2\nlabels:"),
+                           "nothing could pass")))
+
+with tempfile.TemporaryDirectory() as _tmp:
+    Path(_tmp, "a.md").write_text(_GOOD)
+    Path(_tmp, "b.md").write_text(_GOOD)                  # same name again
+    Path(_tmp, "c.md").write_text("no frontmatter")
+    Path(_tmp, "notes.txt").write_text("ignored")
+    _found, _errs = SC.load(_tmp)
+_s_checks.append(("load keeps the good file and names each bad one",
+                  [x.name for x in _found] == ["ran-tests"] and len(_errs) == 2
+                  and any("b.md" in e and "already" in e for e in _errs)
+                  and any(e.startswith("c.md") for e in _errs)))
+_s_checks.append(("no scorer directory means scoring is off, quietly",
+                  SC.load("/nonexistent/deputy/scorers") == ([], [])
+                  and SC.load(None) == ([], [])))
+
+_sc20 = SC.parse(_GOOD.replace("labels:", "sample_rate: 20\nlabels:"))
+_hits = [SC.sampled(_sc20, i) for i in range(2000)]
+_s_checks.append(("sampling is deterministic and close to its rate",
+                  _hits == [SC.sampled(_sc20, i) for i in range(2000)]
+                  and 300 <= sum(_hits) <= 500))
+_s_checks.append(("a 0% sample judges nothing, 100% everything",
+                  not any(SC.sampled(SC.parse(_GOOD.replace("labels:", "sample_rate: 0\nlabels:")), i)
+                          for i in range(200))
+                  and all(SC.sampled(_sc, i) for i in range(200))))
+_s_checks.append(("failed runs and runs with no log are not judged",
+                  SC.judgeable({"kind": "implement", "detail": "ok", "log": "implement"})
+                  and not SC.judgeable({"kind": "implement", "detail": "agent timed out",
+                                        "log": "implement"})
+                  and not SC.judgeable({"kind": "fix", "detail": "ci: failed: boom",
+                                        "log": "fix-1"})
+                  and SC.judgeable({"kind": "fix", "detail": "ci: ok", "log": "fix-1"})
+                  and not SC.judgeable({"kind": "implement", "detail": "ok", "log": None})))
+
+
+def _stream(obj):
+    return json.dumps({"type": "output", "stream": "stdout", "text": json.dumps(obj)})
+
+
+def _write_log(path, *, long_text="", tool_out="12 passed", extra=()):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "run_started", "argv": ["claude", "-p"]}),
+        _stream({"type": "system", "subtype": "init"}),
+        _stream({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "I'll fix the footer." + long_text},
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "src/footer.tsx", "old": "Copyrigth"}}]}}),
+        _stream({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "edited", "is_error": False}]}}),
+        _stream({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "pnpm test"}}]}}),
+        _stream({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": [{"type": "text", "text": tool_out}],
+             "is_error": True}]}}),
+        *extra,
+        _stream({"type": "result", "subtype": "success", "num_turns": 3,
+                 "result": "Fixed the typo and ran the tests."}),
+        json.dumps({"type": "output", "stream": "stdout", "text": "not json at all"}),
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _lp = Path(_tmp) / "x.log"
+    _write_log(_lp, long_text=" word" * 2000, tool_out="FAIL " * 400, extra=[
+        json.dumps({"type": "timeout", "after_s": 2700}),
+        json.dumps({"type": "log_truncated", "message": "stopped"})])
+    _c0, _c2 = SC.condense(_lp, 0), SC.condense(_lp, 2)
+_s_checks.append(("the transcript keeps what was said, called and returned",
+                  "ASSISTANT: I'll fix the footer." in _c0
+                  and 'TOOL CALL Edit: {"file_path": "src/footer.tsx"' in _c0
+                  and "TOOL CALL Bash" in _c0 and "TOOL RESULT (error): FAIL" in _c0
+                  and "FINAL (success, 3 turns): Fixed the typo" in _c0
+                  and "init" not in _c0))
+_s_checks.append(("a timeout and a truncated log stay visible to the judge",
+                  "RUN TIMED OUT after 2700s" in _c0 and "LOG TRUNCATED" in _c0))
+_s_checks.append(("long messages are clipped and marked, never dropped",
+                  "chars omitted" in _c0 and len(_c0) < 8000
+                  and _c0.count("TOOL CALL") == _c2.count("TOOL CALL") == 2))
+_s_checks.append(("the tightest level keeps a tool result's size, not its text",
+                  "TOOL RESULT (error): [2000 chars]" in _c2 and "FAIL FAIL" not in _c2))
+
+
+class _Judge:
+    """A tool-less judge: records each call and answers with `reply`."""
+    def __init__(self, reply=None, max_prompt_bytes=None, fail=False, boom=False):
+        self.reply = reply or {"label": "ran_and_passed", "reasoning": "pnpm test passed"}
+        self.calls = []
+        self.fail, self.boom = fail, boom
+        if max_prompt_bytes:
+            self.max_prompt_bytes = max_prompt_bytes
+
+    def reason(self, prompt, *, max_turns=1, model=None, system_prompt=None):
+        self.calls.append({"prompt": prompt, "model": model,
+                           "system_prompt": system_prompt})
+        if self.boom:
+            raise RuntimeError("judge exploded")
+        if self.fail:
+            return AgentResult(ok=False, text="", cost_usd=0.01, error="rate limited")
+        text = self.reply if isinstance(self.reply, str) else json.dumps(self.reply)
+        return AgentResult(ok=True, text=f"```json\n{text}\n```", cost_usd=0.02,
+                           usage=TokenUsage(input_tokens=900, output_tokens=60),
+                           raw={"modelUsage": {"claude-haiku-5": {"costUSD": 0.02}}},
+                           requested_model=model)
+
+    def work(self, *a, **k):
+        raise AssertionError("a judge never runs work()")
+
+
+_ev = {"id": 1, "kind": "implement", "detail": "ok", "log": "implement",
+       "task_id": "mycorp:T80#pulse-backend"}
+_row = {"task_key": "T80", "title": "Fix footer typo", "repo_key": "pulse-backend"}
+_repo = {"key": "pulse-backend", "language": "TypeScript", "test": "pnpm test"}
+_meta = {"plan": ["fix the typo"], "acceptance_criteria": ["footer reads Copyright"],
+         "approach": "edit the footer"}
+with tempfile.TemporaryDirectory() as _tmp:
+    _lp = Path(_tmp) / "x.log"
+    _write_log(_lp)
+    _j = _Judge()
+    _v = SC.judge(_j, _sc, _ev, _row, _repo, _meta, _lp, model="haiku")
+    _p = _j.calls[0]["prompt"] if _j.calls else ""
+    _s_checks.append(("the judge sees the rubric, the plan and the transcript",
+                      "Did the agent run the tests" in _p and "- fix the typo" in _p
+                      and "footer reads Copyright" in _p and "Test command: pnpm test" in _p
+                      and "TOOL CALL Bash" in _p and "insufficient_evidence" in _p))
+    _s_checks.append(("the judge runs with its own system prompt and model",
+                      _j.calls[0]["system_prompt"] == SC.JUDGE_SYSTEM_PROMPT
+                      and _j.calls[0]["model"] == "haiku"))
+    _s_checks.append(("a fenced verdict parses and scores",
+                      (_v.label, _v.score, _v.passed, _v.reasoning)
+                      == ("ran_and_passed", 1.0, True, "pnpm test passed")
+                      and _v.spend.tokens == 960))
+
+    _v = SC.judge(_Judge({"label": "insufficient_evidence", "reasoning": "cut off"}),
+                  _sc, _ev, _row, _repo, _meta, _lp)
+    _s_checks.append(("insufficient evidence has no score and no pass",
+                      (_v.label, _v.score, _v.passed) == ("insufficient_evidence", None, None)))
+    _v = SC.judge(_Judge({"label": "mostly_fine", "reasoning": "eh"}),
+                  _sc, _ev, _row, _repo, _meta, _lp)
+    _s_checks.append(("a label the scorer does not have is an error, not a fail",
+                      _v.label == "error" and _v.passed is None and _v.spend is not None))
+    _v = SC.judge(_Judge("I think it passed."), _sc, _ev, _row, _repo, _meta, _lp)
+    _s_checks.append(("an unparseable verdict is an error",
+                      _v.label == "error" and "unparseable" in _v.reasoning))
+    _v = SC.judge(_Judge(fail=True), _sc, _ev, _row, _repo, _meta, _lp)
+    _s_checks.append(("a failed judge run is an error and keeps its spend",
+                      _v.label == "error" and _v.spend.cost_usd == 0.01))
+
+    _big = Path(_tmp) / "big.log"
+    _write_log(_big, extra=[_stream({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": f"f{i}.ts"}}]}})
+        for i in range(3000)])
+    _jb = _Judge(max_prompt_bytes=20_000)
+    _v = SC.judge(_jb, _sc, _ev, _row, _repo, _meta, _big)
+    _s_checks.append(("a transcript too big even clipped is not judged, and costs nothing",
+                      _v.label == "insufficient_evidence" and _jb.calls == []
+                      and _v.spend is None and "cut in half" in _v.reasoning))
+    _jm = _Judge(max_prompt_bytes=20_000)
+    _write_log(_big, long_text=" word" * 3000)
+    _v = SC.judge(_jm, _sc, _ev, _row, _repo, _meta, _big)
+    _s_checks.append(("a transcript that fits once clipped harder is judged",
+                      len(_jm.calls) == 1 and _v.label == "ran_and_passed"
+                      and len(_jm.calls[0]["prompt"].encode()) <= 20_000))
+    _v = SC.judge(_Judge(), _sc, _ev, _row, _repo, _meta, Path(_tmp) / "gone.log")
+    _s_checks.append(("a missing log is insufficient evidence, with no judge run",
+                      _v.label == "insufficient_evidence" and _v.spend is None))
+
+# reason()'s argv: the judge's system prompt replaces triage's, isolation stays.
+_seen = []
+_real_popen = CC.subprocess.Popen
+CC.subprocess.Popen = _stub_popen(_seen)
+try:
+    _ag = CC.ClaudeCodeAgent({"binary": sys.executable, "triage_model": "sonnet"})
+    _ag.reason("grade this", model="haiku", system_prompt=SC.JUDGE_SYSTEM_PROMPT)
+    _ag.reason("classify this")
+    _ag2 = CC.ClaudeCodeAgent({"binary": sys.executable, "isolate_triage": False})
+    _ag2.reason("grade this", system_prompt=SC.JUDGE_SYSTEM_PROMPT)
+finally:
+    CC.subprocess.Popen = _real_popen
+_jc, _tc, _nc = (c for c, _ in _seen)
+_s_checks.append(("the judge's reason() keeps every isolation flag but the prompt",
+                  _flag(_jc, "--system-prompt") == SC.JUDGE_SYSTEM_PROMPT
+                  and _flag(_jc, "--model") == "haiku" and _flag(_jc, "--tools") == ""
+                  and _flag(_jc, "--setting-sources") == ""
+                  and "--strict-mcp-config" in _jc
+                  and _flag(_jc, "--settings") == '{"autoMemoryEnabled": false}'))
+_s_checks.append(("triage still gets the triage system prompt and model",
+                  _flag(_tc, "--system-prompt") == CC.TRIAGE_SYSTEM_PROMPT
+                  and _flag(_tc, "--model") == "sonnet"
+                  and CC.TRIAGE_ISOLATION[CC.TRIAGE_ISOLATION.index("--system-prompt") + 1]
+                  == CC.TRIAGE_SYSTEM_PROMPT))
+_s_checks.append(("a named system prompt is honoured with isolation off",
+                  _flag(_nc, "--system-prompt") == SC.JUDGE_SYSTEM_PROMPT
+                  and "--strict-mcp-config" not in _nc))
+
+# Claims: one verdict per (scorer, run), even across overlapping ticks.
+with tempfile.TemporaryDirectory() as _tmp:
+    _st = Store(f"{_tmp}/s.db")
+    _k = dict(task_id="mycorp:T1#r", station="implement", log="implement")
+    _a = _st.claim_score("s", 5, **_k)
+    _b = _st.claim_score("s", 5, **_k)
+    _st.conn.execute("UPDATE scores SET ts = 0"); _st.conn.commit()
+    _c = _st.claim_score("s", 5, **_k)
+    _st.finish_score("s", 5, label="ok", score=1, passed=True, pass_score=1,
+                     reasoning="r")
+    _st.conn.execute("UPDATE scores SET ts = 0"); _st.conn.commit()
+    _d = _st.claim_score("s", 5, **_k)
+_s_checks.append(("a run is claimed once; a dead judge's claim is retaken; a verdict is final",
+                  (_a, _b, _c, _d) == (True, False, True, False)))
+
+# The tick's scoring phase.
+_SCORER_FILES = {
+    "ran-tests.md": _GOOD,
+    "review-only.md": _GOOD.replace("name: ran-tests", "name: review-only")
+                           .replace("[implement, fix]", "[review]")
+                           .replace("labels:", "sample_rate: 0\nlabels:"),
+}
+
+
+def _scoring_pipe(tmp, judge, *, limits=None):
+    sdir = Path(tmp, "scorers"); sdir.mkdir()
+    for name, text in _SCORER_FILES.items():
+        (sdir / name).write_text(text)
+    cfg = Config.load("config.example.yaml")
+    cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
+                              log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b",
+                              scorers_dir=str(sdir))
+    cfg.data["runner"]["limits"].update(limits or {})
+    src = cfg.sources(only=["mycorp"])[0]
+    store = Store(f"{tmp}/s.db")
+    return Pipeline(cfg, src, FakeProvider([]), judge, store), store
+
+
+def _seed_run(store, tmp, key, *, repo="pulse-backend", kind="implement",
+              detail="ok", log="implement", **log_kw):
+    row = f"mycorp:{key}#{repo}"
+    store.upsert(row, source="mycorp", provider_task_id=key, task_key=key,
+                 title=f"{key} title", repo_key=repo, state=AIState.DONE.value,
+                 meta={"plan": ["p"], "acceptance_criteria": ["a"]})
+    _write_log(Path(tmp, "l", _aln(key, repo, log)), **log_kw)
+    store.record(kind, row, detail, 0.5, 1000, log=log)
+    return row
+
+
+_in_window = dt.datetime(2026, 8, 10, 7, 0)       # Monday, inside triage
+_out_window = dt.datetime(2026, 8, 10, 9, 30)     # Monday, triage shut
+with tempfile.TemporaryDirectory() as _tmp:
+    _j = _Judge()
+    _pipe, _st = _scoring_pipe(_tmp, _j, limits={"max_scores_per_run": 2})
+    _r1 = _seed_run(_st, _tmp, "T81")
+    _r2 = _seed_run(_st, _tmp, "T82")
+    _r3 = _seed_run(_st, _tmp, "T83")
+    _seed_run(_st, _tmp, "T84", detail="agent timed out after 2700s")
+    _seed_run(_st, _tmp, "T85", kind="review", detail="approve", log="review")
+    _pipe.tick(_out_window)
+    _s_checks.append(("nothing is judged outside the window",
+                      _j.calls == []))
+    _pipe.tick(_in_window)
+    _first = len(_j.calls)
+    _pipe.tick(_in_window)
+    _pipe.tick(_in_window)
+    _rows = [dict(r) for r in _st.conn.execute("SELECT * FROM scores ORDER BY id")]
+    _s_checks.append(("judging is capped per tick and resumes on the next",
+                      _first == 2 and len(_j.calls) == 3))
+    _s_checks.append(("each run is judged once, newest first",
+                      [r["task_id"] for r in _rows] == [_r3, _r2, _r1]
+                      and all(r["label"] == "ran_and_passed" and r["passed"] == 1
+                              and r["score"] == 1.0 for r in _rows)))
+    _s_checks.append(("failed runs and an unsampled scorer cost nothing",
+                      not any("T84" in (r["task_id"] or "") or "T85" in (r["task_id"] or "")
+                              for r in _rows)))
+    _s_checks.append(("scoring spend is on the ledger but not on the row",
+                      _st.get(_r1)["cost_usd"] == 0.5
+                      and _st.conn.execute(
+                          "SELECT COUNT(*) c, SUM(cost_usd) s FROM events"
+                          " WHERE kind = 'score' AND task_id IS NULL").fetchone()[0] == 3
+                      and abs(_st.spend_since(0) - (5 * 0.5 + 3 * 0.02)) < 1e-9))
+    _sl = _st.conn.execute("SELECT * FROM events WHERE kind = 'score' LIMIT 1").fetchone()
+    _s_checks.append(("the score ledger line says which scorer, run and verdict",
+                      _sl["detail"] == f"ran-tests {_r3} implement: ran_and_passed"
+                      and _sl["model"] == "claude-haiku-5" and _sl["tokens"] == 960))
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _j = _Judge()
+    # $1.00 of work leaves $0.01 under the cap: the first judge ($0.02) is
+    # allowed and spends past it, so the second must not run.
+    _pipe, _st = _scoring_pipe(_tmp, _j, limits={"daily_budget_usd": 1.01})
+    _seed_run(_st, _tmp, "T86")
+    _seed_run(_st, _tmp, "T86b")
+    _pipe.tick(_in_window)
+    _s_checks.append(("a judge never starts once the daily budget is spent",
+                      len(_j.calls) == 1 and _st.conn.execute(
+                          "SELECT COUNT(*) FROM scores").fetchone()[0] == 1))
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _j = _Judge(boom=True)
+    _pipe, _st = _scoring_pipe(_tmp, _j)
+    _seed_run(_st, _tmp, "T87")
+    _pipe.tick(_in_window)
+    _bad = _st.conn.execute("SELECT * FROM scores").fetchone()
+    _s_checks.append(("a judge that crashes records error and the tick goes on",
+                      _bad is not None and _bad["label"] == "error"
+                      and _bad["passed"] is None and "exploded" in _bad["reasoning"]))
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _SCORER_FILES["ran-tests.md"] = _GOOD.replace("labels:", "repos: [pulse-frontend]\nlabels:")
+    try:
+        _j = _Judge()
+        _pipe, _st = _scoring_pipe(_tmp, _j)
+        _seed_run(_st, _tmp, "T88")
+        _seed_run(_st, _tmp, "T89", repo="pulse-frontend")
+        _pipe.tick(_in_window)
+    finally:
+        _SCORER_FILES["ran-tests.md"] = _GOOD
+    _s_checks.append(("a scorer limited to some repos judges only those",
+                      [r["task_id"] for r in _st.conn.execute("SELECT task_id FROM scores")]
+                      == ["mycorp:T89#pulse-frontend"]))
+
+# `deputy score`: the same verdict, recorded only when asked.
+import runner.cli as _cli
+with tempfile.TemporaryDirectory() as _tmp:
+    _j = _Judge()
+    _pipe, _st = _scoring_pipe(_tmp, _j)
+    _row = _seed_run(_st, _tmp, "T90")
+    _evid = _st.conn.execute("SELECT id FROM events WHERE task_id = ?", (_row,)).fetchone()[0]
+    _real_agent = _cli.ClaudeCodeAgent
+    _cli.ClaudeCodeAgent = lambda cfg: _j
+    try:
+        _out = io.StringIO()
+        with _ctx.redirect_stdout(_out):
+            _rc1 = _cli._score(_pipe.cfg, "ran-tests", [_evid], 3, False)
+        _n_scores = _st.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0]
+        _n_ledger = _st.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = 'score'").fetchone()[0]
+        _s_checks.append(("deputy score prints the verdict and records only its spend",
+                          _rc1 == 0 and "ran_and_passed (1) PASS" in _out.getvalue()
+                          and "pnpm test passed" in _out.getvalue()
+                          and "not recorded" in _out.getvalue()
+                          and _n_scores == 0 and _n_ledger == 1))
+        _out = io.StringIO()
+        with _ctx.redirect_stdout(_out):
+            _cli._score(_pipe.cfg, "ran-tests", [_evid], 3, True)
+            _cli._score(_pipe.cfg, "ran-tests", [_evid], 3, True)
+        _s_checks.append(("--record stores it once and says so the second time",
+                          _st.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 1
+                          and "already judged" in _out.getvalue() and len(_j.calls) == 2))
+        _draft = Path(_tmp, "draft.md")
+        _draft.write_text(_GOOD.replace("name: ran-tests", "name: draft-rubric"))
+        _out = io.StringIO()
+        with _ctx.redirect_stdout(_out):
+            _rc2 = _cli._score(_pipe.cfg, str(_draft), [], 3, False)
+        _s_checks.append(("a draft file can be tried against the latest runs",
+                          _rc2 == 0 and f"run {_evid}" in _out.getvalue()
+                          and len(_j.calls) == 3))
+        _err = io.StringIO()
+        with _ctx.redirect_stderr(_err):
+            _rc3 = _cli._score(_pipe.cfg, "review-only", [_evid], 3, False)
+        _s_checks.append(("a run of the wrong station is refused, not judged",
+                          _rc3 == 1 and "implement run" in _err.getvalue()
+                          and len(_j.calls) == 3))
+    finally:
+        _cli.ClaudeCodeAgent = _real_agent
+
+for label, ok in _s_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 

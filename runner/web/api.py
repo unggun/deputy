@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import graph
+from .. import scorers as scorer_files
 from ..config import Config
 from . import logs as weblogs
 from .db import Reader
@@ -51,6 +52,8 @@ def build_app(cfg: Config) -> FastAPI:
     db_path = cfg.get("runner.db_path", "~/.deputy/state.db")
     log_root = Path(str(cfg.get("runner.log_dir", "~/.deputy/logs"))).expanduser()
     limits = cfg.get("runner.limits", {}) or {}
+    scorers_dir = Path(str(cfg.get("runner.scorers_dir", scorer_files.DEFAULT_DIR))
+                       ).expanduser()
     secrets = _secrets(cfg)
 
     app = FastAPI(title="deputy", docs_url=None, redoc_url=None)
@@ -159,6 +162,25 @@ def build_app(cfg: Config) -> FastAPI:
             return r.flow(days)
         finally:
             r.close()
+
+    @app.get("/api/scores")
+    def scores(days: int = 30) -> dict[str, Any]:
+        r = reader()
+        try:
+            out = r.scores(days)
+        finally:
+            r.close()
+        # What is configured, beside what has been judged, so an empty tab
+        # can say which of "no scorer files" and "nothing judged yet" it is.
+        found, errors = scorer_files.load(scorers_dir)
+        out["configured"] = [
+            {"name": sc.name, "stations": sc.stations, "labels": sc.labels,
+             "pass_score": sc.pass_score, "sample_rate": sc.sample_rate,
+             "repos": sc.repos}
+            for sc in found]
+        out["errors"] = errors
+        out["scorers_dir"] = str(scorers_dir)
+        return out
 
     @app.get("/api/graph")
     def state_graph() -> dict[str, Any]:

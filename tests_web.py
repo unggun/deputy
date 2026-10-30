@@ -672,6 +672,142 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a fix error after its cause is a failed run",
           by_kind["fix"]["failed"] is True)
 
+# --- cost per merged PR, by size ------------------------------------------------
+print("\ncost per PR by size")
+with tempfile.TemporaryDirectory() as tmp:
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    t0 = int(time.time()) - 3600
+
+    def _merged(n, detail, costs):
+        tid = f"acme:{n}#api"
+        st.upsert(tid, source="acme", provider_task_id=str(n), task_key=f"DEV-{n}",
+                  title="sized", state="done", repo_key="api")
+        # Triage is the placeholder's: it must not be charged to the PR.
+        _ev(st, t0, f"acme:{n}", "triage", "execute (s)", cost_usd=5.0, tokens=9999)
+        for i, c in enumerate(costs):
+            _ev(st, t0 + 1 + i, tid, "implement", "ok", cost_usd=c, tokens=int(c * 1000))
+        _ev(st, t0 + 50, tid, "pr_merged", detail)
+        _ev(st, t0 + 51, tid, "state", "pr-open->done")
+        return tid
+
+    a = _merged(21, "human_commits=0 additions=30 deletions=10 files=2", [0.5, 0.25])
+    b = _merged(22, "human_commits=0 additions=12 deletions=7 files=1", [1.0])
+    c = _merged(23, "human_commits=1 additions=400 deletions=150 files=9", [2.0])
+    d = _merged(24, "human_commits=0", [0.1])
+    fl = Reader(path, limits={}).flow(7)
+    by = {r["task_id"]: r for r in fl["rows"]}
+    check("a merged PR's lines are additions plus deletions",
+          by[a]["lines"] == 40 and by[c]["lines"] == 550 and by[d]["lines"] is None)
+    check("cost per PR is the row's own runs, not the ticket's triage",
+          by[a]["cost_usd"] == 0.75 and by[a]["tokens"] == 750)
+    check("sizes land in fixed buckets, unknown kept apart",
+          [(x["size"], x["n"]) for x in fl["summary"]["cost_by_size"]]
+          == [("<50", 2), ("500+", 1), ("unknown", 1)])
+    small = fl["summary"]["cost_by_size"][0]
+    check("a bucket reports the median cost, not the mean",
+          small["median_cost_usd"] == (0.75 + 1.0) / 2
+          and small["total_cost_usd"] == 1.75)
+
+# --- scores -------------------------------------------------------------------
+print("\nscores")
+from runner.web.db import _wilson
+
+lo, hi = _wilson(3, 4)
+check("the Wilson interval for 3 of 4", abs(lo - 0.3006) < 1e-3 and abs(hi - 0.9544) < 1e-3)
+lo0, hi0 = _wilson(0, 5)
+check("0 of n is not certainty: the interval has width", lo0 == 0 and 0 < hi0 < 1)
+check("no scored runs, no interval", _wilson(0, 0) is None)
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = f"{tmp}/s.db"
+    st = Store(path)
+    now = int(time.time())
+    st.upsert("acme:30#api", source="acme", provider_task_id="30", task_key="DEV-30",
+              title="scored", state="done", repo_key="api")
+
+    def _judged(i, label, score, passed, reasoning="because", ts=None, scorer="ran-tests"):
+        st.record("implement", "acme:30#api", "ok", log=f"implement-{i}",
+                  ts=ts or now - 60)
+        eid = st.conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+        st.claim_score(scorer, eid, task_id="acme:30#api", station="implement",
+                       log=f"implement-{i}")
+        if label is not None:
+            st.finish_score(scorer, eid, label=label, score=score, passed=passed,
+                            pass_score=1, reasoning=reasoning, cost_usd=0.02, tokens=900)
+        return eid
+
+    _judged(2, "ran_and_passed", 1.0, True)
+    _judged(3, "ran_and_passed", 1.0, True,
+            reasoning="saw token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA in output")
+    _judged(4, "ran_and_passed", 1.0, True, ts=now - 86400)
+    _judged(5, "did_not_run", 0.0, False)
+    _judged(6, "insufficient_evidence", None, None)
+    _judged(7, "error", None, None)
+    _judged(8, None, None, None)                          # a judge still holds it
+    _judged(9, "ran_and_passed", 1.0, True, ts=now - 86400 * 40)   # outside the window
+    st.record("score", None, "ran-tests acme:30#api implement-2: ran_and_passed",
+              0.02, 900, ts=now)
+    sc = Reader(path, limits={}).scores(7)
+    card = sc["cards"][0] if sc["cards"] else {}
+    check("a card counts passes and fails, and the rest beside them",
+          (card.get("passed"), card.get("failed"), card.get("insufficient"),
+           card.get("errors"), card.get("pending"), card.get("n"))
+          == (3, 1, 1, 1, 1, 4))
+    check("the rate is over scored runs only, with its interval",
+          card.get("rate") == 0.75 and abs(card.get("low") - 0.3006) < 1e-3)
+    check("the trend is bucketed by the day the run ran",
+          [(t["passed"], t["failed"]) for t in card.get("trend", [])] == [(1, 0), (2, 1)])
+    check("judging cost is summed per scorer",
+          abs(card.get("cost_usd") - 6 * 0.02) < 1e-9 and card.get("tokens") == 6 * 900)
+    res = sc["results"]
+    check("verdicts are attributed to the row they judged",
+          res and all(r["task_key"] == "DEV-30" and r["open_id"] == "acme:30#api"
+                      for r in res) and len(res) == 7)
+    check("a verdict's reasoning is redacted on the way out",
+          not any("ghp_AAAA" in (r["reasoning"] or "") for r in res)
+          and any("saw token" in (r["reasoning"] or "") for r in res))
+    kinds = set()
+    for d in Reader(path, limits={}).spend_by_day(7):
+        kinds |= set(d["kinds"])
+    check("judging spend shows in the spend chart as its own kind", "score" in kinds)
+
+    # A database the runner has not opened since scoring shipped.
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TABLE scores")
+    raw.commit()
+    raw.close()
+    check("a database with no scores table is an empty answer, not an error",
+          Reader(path, limits={}).scores(7) == {"cards": [], "results": []})
+
+try:
+    from fastapi.testclient import TestClient as _TC
+except ImportError:
+    _TC = None
+if _TC is None:
+    print("  /api/scores check skipped -- fastapi (the `web` extra) is not installed")
+else:
+    from runner.config import Config as _C
+    from runner.web import api as _api
+    with tempfile.TemporaryDirectory() as tmp:
+        Store(f"{tmp}/s.db")
+        sdir = Path(tmp, "scorers")
+        sdir.mkdir()
+        (sdir / "good.md").write_text(
+            "---\nstations: [plan]\nlabels: {grounded: 1, ungrounded: 0}\n"
+            "sample_rate: 25\n---\nIs the plan grounded?\n", encoding="utf-8")
+        (sdir / "bad.md").write_text("no frontmatter", encoding="utf-8")
+        cfg = _C(data={"runner": {"db_path": f"{tmp}/s.db", "log_dir": f"{tmp}/l",
+                                  "scorers_dir": str(sdir), "limits": {}},
+                       "vcs_profiles": {}, "sources": []},
+                 source_path=Path(tmp) / "config.yaml")
+        body = _TC(_api.build_app(cfg)).get("/api/scores").json()
+        check("/api/scores says what is configured, and what failed to load",
+              [c["name"] for c in body["configured"]] == ["good"]
+              and body["configured"][0]["sample_rate"] == 25
+              and len(body["errors"]) == 1 and body["errors"][0].startswith("bad.md")
+              and body["cards"] == [] and body["scorers_dir"] == str(sdir))
+
 # --- numbered station logs ----------------------------------------------------
 from runner.models import run_station
 with tempfile.TemporaryDirectory() as tmp:

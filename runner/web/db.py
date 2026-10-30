@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 import sqlite3
 from collections import defaultdict
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..models import AIState, model_present
+from ..models import fix_cause as _fix_cause
+from ..models import run_outcome as _outcome
 from ..redact import redact
 
 # States that mean a human has to act before anything else happens.
@@ -34,6 +37,10 @@ _SPEND_ONLY = f"kind NOT IN ({','.join(repr(k) for k in _MARKERS)})"
 # Agent runs, the rows `runs()` lists.
 _RUN_KINDS = ("triage", "plan", "implement", "review", "fix")
 _HUMAN_COMMITS = re.compile(r"human_commits=(\d+|\?)")
+_PR_SIZE = re.compile(r"additions=(\d+) deletions=(\d+)")
+# Lines changed (additions + deletions) on the merged PR. Fixed edges so a
+# bucket means the same thing from one week to the next.
+_SIZE_BUCKETS = ((50, "<50"), (200, "50-199"), (500, "200-499"), (None, "500+"))
 
 
 def _placeholder(task_id: str) -> str:
@@ -46,37 +53,37 @@ def _placeholder(task_id: str) -> str:
     return task_id.split("#", 1)[0]
 
 
-def _outcome(kind: str, detail: str | None) -> tuple[str, bool]:
-    """(one-word outcome, failed?) for an agent run's ledger line.
-
-    Every station writes `failed: ...` when its agent run itself failed.
-    Otherwise implement and fix write `ok` or the error (fix prefixed with
-    its cause, `ci: ok`), and the rest write their verdict.
-    """
-    text = (detail or "").strip()
-    if text.startswith("failed"):
-        return "failed", True
-    if kind in ("implement", "fix"):
-        result = text.split(": ", 1)[1] if kind == "fix" and _fix_cause(text) else text
-        return ("ok", False) if result == "ok" else ("failed", True)
-    if kind == "triage":
-        return text.split(" ", 1)[0] or "?", False
-    return text or "?", False
-
-
-def _fix_cause(detail: str | None) -> set[str] | None:
-    """`{"ci"}`, `{"feedback"}`, both, or None for a line that predates causes."""
-    head, sep, _ = (detail or "").partition(": ")
-    parts = set(head.split("+")) if sep else set()
-    return parts if parts and parts <= {"ci", "feedback"} else None
-
-
-def _median(values: list[int]) -> float | None:
+def _median(values: Sequence[float]) -> float | None:
     xs = sorted(values)
     if not xs:
         return None
     mid = len(xs) // 2
     return float(xs[mid]) if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def _wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    """95% Wilson score interval for k passes out of n.
+
+    Not the normal approximation: at the sample sizes a scorer actually sees
+    (a dozen runs) that one gives intervals past 0 or 1 and a zero-width
+    interval at 0/n and n/n, which reads as certainty nobody has.
+    """
+    if n <= 0:
+        return None
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def _size_bucket(lines: int | None) -> str:
+    if lines is None:
+        return "unknown"
+    for edge, label in _SIZE_BUCKETS:
+        if edge is None or lines < edge:
+            return label
+    return "unknown"
 
 
 def _midnight_epoch(now: dt.datetime) -> int:
@@ -409,7 +416,7 @@ class Reader:
     def _flow_row(self, tid: str, done_at: int, owner: dict[str, Any]) -> dict[str, Any]:
         ids = list(dict.fromkeys([tid, _placeholder(tid)]))
         evs = [dict(r) for r in self.conn.execute(
-            f"SELECT id, ts, task_id, kind, detail FROM events"
+            f"SELECT id, ts, task_id, kind, detail, cost_usd, tokens FROM events"
             f" WHERE task_id IN ({','.join('?' * len(ids))}) AND ts <= ?"
             " ORDER BY ts ASC, id ASC", (*ids, done_at))]
         start = evs[0]["ts"] if evs else done_at
@@ -441,6 +448,12 @@ class Reader:
         merged = [e for e in evs if e["kind"] == "pr_merged" and e["task_id"] == tid]
         m = _HUMAN_COMMITS.search(str(merged[-1]["detail"])) if merged else None
         human_commits = int(m.group(1)) if m and m.group(1).isdigit() else None
+        size = _PR_SIZE.search(str(merged[-1]["detail"])) if merged else None
+        lines = int(size.group(1)) + int(size.group(2)) if size else None
+        # The row's own runs only. Triage is the placeholder's and covered
+        # every repo on the ticket, so charging it to one PR would count it
+        # once per repo.
+        own = [e for e in evs if e["task_id"] == tid]
         fix_feedback = sum(1 for c in causes if c and "feedback" in c)
         known = human_commits is not None and all(c is not None for c in causes)
         transitions = [str(e["detail"]) for e in states]
@@ -470,7 +483,88 @@ class Reader:
             "fix_feedback": fix_feedback,
             "human_commits": human_commits,
             "autonomous": (fix_feedback == 0 and human_commits == 0) if known else None,
+            "lines": lines,
+            "size": _size_bucket(lines),
+            "cost_usd": round(sum(float(e["cost_usd"] or 0) for e in own), 6),
+            "tokens": sum(int(e["tokens"] or 0) for e in own),
         }
+
+    # --- scores --------------------------------------------------------
+    def scores(self, days: int = 30, *, limit: int = 200) -> dict[str, Any]:
+        """Scorer cards and the verdicts behind them, by when the run ran.
+
+        Bucketed by the judged run's time, not the judging time: "are runs
+        getting better" is about the runs. The pass rate is over runs with a
+        score; `insufficient_evidence`, `error` and claims still being judged
+        are counted beside it and never in it. Every rate carries its Wilson
+        interval and its n, because twelve runs do not make a percentage.
+
+        A database the runner has not opened since scoring shipped has no
+        `scores` table, and a read-only reader cannot create one. That is an
+        empty answer, not an error.
+        """
+        has = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scores'"
+        ).fetchone()
+        if not has:
+            return {"cards": [], "results": []}
+        rows = [dict(r) for r in self.conn.execute(
+            "SELECT s.*, COALESCE(e.ts, s.ts) run_ts FROM scores s"
+            " LEFT JOIN events e ON e.id = s.event_id"
+            " WHERE COALESCE(e.ts, s.ts) >= ?"
+            " ORDER BY run_ts DESC, s.id DESC", (self._since(days),))]
+        cards: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            c = cards.setdefault(r["scorer"], {
+                "scorer": r["scorer"], "passed": 0, "failed": 0,
+                "insufficient": 0, "errors": 0, "pending": 0,
+                "cost_usd": 0.0, "tokens": 0, "labels": defaultdict(int),
+                "trend": defaultdict(lambda: {"passed": 0, "failed": 0}),
+                "stations": set()})
+            c["cost_usd"] += float(r["cost_usd"] or 0)
+            c["tokens"] += int(r["tokens"] or 0)
+            c["stations"].add(r["station"])
+            if r["label"] is None:
+                c["pending"] += 1
+                continue
+            c["labels"][r["label"]] += 1
+            if r["passed"] is None:
+                c["errors" if r["label"] == "error" else "insufficient"] += 1
+                continue
+            outcome = "passed" if r["passed"] else "failed"
+            c[outcome] += 1
+            day = dt.datetime.fromtimestamp(int(r["run_ts"])).date().isoformat()
+            c["trend"][day][outcome] += 1
+        out_cards = []
+        for c in sorted(cards.values(), key=lambda c: c["scorer"]):
+            n = c["passed"] + c["failed"]
+            ci = _wilson(c["passed"], n)
+            out_cards.append({
+                **c, "n": n, "rate": (c["passed"] / n) if n else None,
+                "low": ci[0] if ci else None, "high": ci[1] if ci else None,
+                "cost_usd": round(c["cost_usd"], 6),
+                "labels": dict(c["labels"]),
+                "stations": sorted(s for s in c["stations"] if s),
+                "trend": [{"day": d, **v} for d, v in sorted(c["trend"].items())],
+            })
+        by_id, by_ticket = self._task_index()
+        results = []
+        for r in rows[:int(limit)]:
+            tid = r["task_id"] or ""
+            owner = by_id.get(tid) or by_ticket.get(_placeholder(tid)) or {}
+            results.append({
+                "id": r["id"], "event_id": r["event_id"], "run_ts": r["run_ts"],
+                "scorer": r["scorer"], "station": r["station"], "log": r["log"],
+                "label": r["label"], "score": r["score"],
+                "passed": None if r["passed"] is None else bool(r["passed"]),
+                "reasoning": self._clean(r["reasoning"]),
+                "task_id": tid, "open_id": owner.get("task_id"),
+                "task_key": owner.get("task_key"), "repo_key": owner.get("repo_key"),
+                "title": owner.get("title"),
+                "cost_usd": float(r["cost_usd"] or 0), "tokens": int(r["tokens"] or 0),
+                "model": r["model"],
+            })
+        return {"cards": out_cards, "results": results}
 
     def review_cycles(self, days: int = 30) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -538,4 +632,27 @@ def _flow_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
                      "rate": (auto / len(known)) if known else None},
         "touches": {k: sum(r[k] for r in rows) for k in _TOUCHES},
         "human_commits": sum(r["human_commits"] or 0 for r in rows),
+        "cost_by_size": _cost_by_size(rows),
     }
+
+
+def _cost_by_size(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Median cost and tokens per merged PR, per size bucket.
+
+    Medians, because one PR that looped on a flaky test should not set the
+    price of every PR its size. A size GitHub could not report goes in
+    `unknown` rather than being guessed into a bucket.
+    """
+    order = [label for _, label in _SIZE_BUCKETS] + ["unknown"]
+    out = []
+    for label in order:
+        group = [r for r in rows if r["size"] == label]
+        if not group:
+            continue
+        out.append({
+            "size": label, "n": len(group),
+            "median_cost_usd": _median([r["cost_usd"] for r in group]),
+            "median_tokens": _median([r["tokens"] for r in group]),
+            "total_cost_usd": round(sum(r["cost_usd"] for r in group), 6),
+        })
+    return out

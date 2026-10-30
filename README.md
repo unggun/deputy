@@ -120,6 +120,11 @@ hand when that happens.
 | `agent.max_log_bytes` | cap on one run's JSONL event log under `runner.log_dir` |
 | `agent.triage_dir` | the empty directory triage runs in (default `~/.deputy/triage`) |
 | `agent.isolate_triage` | `false` lets triage inherit the launch directory's context again |
+| `runner.scorers_dir` | scorer files (see *Scorers*); default `~/.deputy/scorers`, absent means scoring is off |
+| `runner.windows.score` | when scorers judge runs; defaults to the `triage` window |
+| `limits.max_scores_per_run` | judge runs per tick, across all scorers (default 5) |
+| `limits.score_lookback_days` | how far back unjudged runs are picked up (default 14) |
+| `agent.scorer_model` | the judge's model unless a scorer names its own; falls back to `triage_model` |
 
 ## Two daily limits, because dollars are the wrong unit
 
@@ -304,8 +309,61 @@ deputy run --dry-run --force        # see what it would do, right now
 deputy run                          # one tick, respects time windows
 deputy run --source acme            # limit to one workspace
 deputy status                       # what is in flight, across sources
+deputy score NAME                   # try a scorer on the latest runs (see Scorers)
 python3 tests_smoke.py                      # offline state-machine tests
 ```
+
+## Scorers
+
+A scorer is a rubric that judges finished agent runs, so "is the implementer
+getting better at running the tests" has a number instead of an impression.
+Each one is a markdown file in `runner.scorers_dir` (default
+`~/.deputy/scorers`): YAML frontmatter, then the rubric.
+
+```markdown
+---
+name: implement-ran-tests        # defaults to the file name
+stations: [implement, fix]       # any of plan, implement, review, fix
+labels:                          # label -> score in 0..1, at least two
+  ran_and_passed: 1
+  ran_and_failed: 0
+  did_not_run: 0
+pass_score: 1                    # default: the best label's score
+sample_rate: 100                 # % of runs judged; deterministic per run
+# repos: [pulse-backend]         # default: every repo
+# model: haiku                   # default: agent.scorer_model, then triage_model
+---
+Judge whether the agent ran the repository's tests after its last edit...
+```
+
+No directory, or no files in it, means scoring is off and costs nothing.
+Four starters are in `examples/scorers/`. Try one against real runs before
+you install it — nothing is recorded unless you ask:
+
+```bash
+deputy score examples/scorers/implement-ran-tests.md          # latest 3 runs
+deputy score implement-ran-tests --run 412 --run 418          # ids from the Runs tab
+deputy score implement-ran-tests --run 412 --record           # store it, as the tick would
+```
+
+Once a file is in place, each tick judges up to `limits.max_scores_per_run`
+runs from the last `limits.score_lookback_days`, newest first, after triage
+and inside the `score` window (default: the triage window). The judge is the
+same tool-less, isolated one-turn call triage uses, with its own system
+prompt; it reads a condensed transcript of the run from its log, plus the
+plan and acceptance criteria the run was given, and never the repository.
+Every judge run is budget-checked and on the ledger like any other agent run,
+but it is not charged to the row: a PR's cost is the work, not the measuring.
+
+Two labels are always available and never move a pass rate:
+`insufficient_evidence` (the transcript does not show enough — including a
+run too long to fit even with every message clipped, which is never judged
+from half a transcript) and `error` (the judge failed or answered with a
+label the scorer does not have). Failed runs are not judged; the Runs tab
+already counts them. Triage leaves no transcript, so it cannot be scored yet.
+
+`deputy doctor` lists the scorers it loaded and fails on a file it cannot
+parse, since the tick only skips it with a warning.
 
 ## Dashboard
 
@@ -323,13 +381,14 @@ acting on the runner stays in the task manager and the CLI.
 |---|---|
 | Overview | What needs you, grouped: questions to answer, plans to approve, blocked rows, runs that need a look |
 | Board | Every in-flight row by state |
-| Flow | For merged PRs: median time to PR, PR to first human review, review to merge; the share of cycle time spent waiting on people; human touches; how many merged with no human fix or commit |
-| Runs | Every agent run: station, outcome, wall time, turns, the model that answered (⚠ when it differs from the one requested), tokens, cost; click one to open its log |
-| Spend, Throughput | Tokens and dollars per station per day; outcomes and cycle times |
+| Flow | For merged PRs: median time to PR, PR to first human review, review to merge; the share of cycle time spent waiting on people; human touches; how many merged with no human fix or commit; median cost per PR by size (lines changed, as GitHub counts them at merge) |
+| Runs | Every agent run: station, outcome, wall time, turns, the model that answered (⚠ when it differs from the one requested), tokens, cost; click one to open its log. `#id` is what `deputy score --run` takes |
+| Scorers | Per scorer: pass rate with its 95% range and n, passed/failed, insufficient evidence and judge errors beside it, judging cost; pass rate by day; every verdict with the judge's reasoning, opening the run's log |
+| Spend, Throughput | Tokens and dollars per station per day, with judging as its own grey `scoring` band; outcomes and cycle times |
 | Graph | The live state machine as a table |
 
-The date range (7, 14, 30 or 90 days) applies to Flow, Runs, Spend and
-Throughput. A row's detail sheet shows its history as lanes on one time axis —
+The date range (7, 14, 30 or 90 days) applies to Flow, Runs, Scorers, Spend
+and Throughput. A row's detail sheet shows its history as lanes on one time axis —
 the state it was in, the PR milestones, one bar per agent run — above the same
 history as a list.
 

@@ -9,8 +9,15 @@ from ..models import AgentResult
 
 class CodingAgent(ABC):
     @abstractmethod
-    def reason(self, prompt: str, *, max_turns: int = 1) -> AgentResult:
-        """Pure text/JSON completion with no filesystem or shell access."""
+    def reason(self, prompt: str, *, max_turns: int = 1,
+               model: str | None = None,
+               system_prompt: str | None = None) -> AgentResult:
+        """Pure text/JSON completion with no filesystem or shell access.
+
+        `model` and `system_prompt` override the triage defaults for this one
+        call. The scoring judge is the second caller: same no-tools,
+        no-ambient-context contract as triage, different job.
+        """
 
     @abstractmethod
     def work(self, prompt: str, cwd: Path, *,

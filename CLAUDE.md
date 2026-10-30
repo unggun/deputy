@@ -14,11 +14,12 @@ PR through CI/review until merge.
 ```
 runner/
   __init__.py  cli.py  config.py  graph.py  models.py  pipeline.py  state.py  triage.py  vcs.py
-  analyst.py  review.py  brain.py  jsonio.py  redact.py
+  analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
   providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
   web/       __init__.py  api.py  db.py  logs.py  static/ (committed build output)
 web/           frontend source (Vite + React); `npm run build` writes into runner/web/static/
+examples/scorers/  starter rubric files; copied into `runner.scorers_dir` by hand
 tests_smoke.py  tests_web.py  README.md  config.example.yaml
 ```
 
@@ -48,6 +49,7 @@ deputy run --source acme          # limit to one source (repeatable)
 deputy daemon --interval 900      # loop, for hosts where cron is awkward
 deputy status                     # in-flight rows across all sources
 deputy graph                      # print the live transition table as Mermaid
+deputy score NAME [--run ID] [--record]   # judge real runs with one scorer; records nothing by default
 python3 tests_smoke.py                    # offline state-machine tests (fake provider + fake agent)
 ```
 
@@ -170,12 +172,13 @@ whatever branch and worktree the dropped row already owned.
   `PR_OPEN`. The repo lock exists to stop two agents branching off the same base; a
   ticket already in review or already PR'd is no longer racing anyone for that base.
 
-### Four model seams
+### Five model seams
 
 `CodingAgent` has two methods, `reason` and `work`, but `work()` takes `model` and
 `allowed_tools` overrides — so the analyst and reviewer stations reuse it with their
-own model and tool set instead of adding new methods. That gives four effectively
-independent seams:
+own model and tool set instead of adding new methods — and `reason()` takes `model`
+and `system_prompt`, which is how the scoring judge reuses triage's seam. That gives
+five effectively independent seams:
 
 - `reason(prompt, *, max_turns=1)` — triage. Runs `claude -p` with `--tools ""` and one
   turn, so **triage never reads the repo**; it judges `scope` *and routes the
@@ -196,6 +199,13 @@ independent seams:
 - `work(prompt, cwd, model=agent.reviewer_model, allowed_tools=agent.reviewer_tools)`
   — the review station. `reviewer_model` falls back to `agent.model`; `reviewer_tools`
   is read-only plus the repo's own `test` command, appended at call time.
+- `reason(prompt, model=scorer.model or agent.scorer_model,
+  system_prompt=scorers.JUDGE_SYSTEM_PROMPT)` — the scoring judge. Same contract as
+  triage (no tools, one turn, isolated); `_isolation()` swaps only the system prompt
+  inside `TRIAGE_ISOLATION`, so every other flag stays. Both overrides fall back to
+  triage's (`triage_model`, `TRIAGE_SYSTEM_PROMPT`) when not passed. A named system
+  prompt is applied with `isolate_triage: false` too: the default agent prompt is the
+  wrong one for a judge whatever the isolation setting.
 
 `triage_model` falls back to `model` when unset. `allowed_tools` includes `Agent`, which
 is what permits `work()` to dispatch subagents — the tool is named `Agent`, not `Task`.
@@ -587,7 +597,9 @@ the obvious version measured the wrong thing.
 - **Markers are not spend.** Besides `state`, the poll writes `pr_ready` (the
   draft was marked ready), `pr_review` (first human review or approving
   reaction, at GitHub's own timestamp, login in `detail`) and `pr_merged`
-  (`human_commits=N`, or `=?` when it cannot say). `db.py::_MARKERS` lists them
+  (`human_commits=N`, or `=?` when it cannot say, then ` additions=A
+  deletions=D files=F` when `vcs.pr_size()` could read them — absent, never
+  zero, when it could not). `db.py::_MARKERS` lists them
   and `_SPEND_ONLY` keeps every spend sum off them; a new marker kind goes in
   that tuple or it grows a zero-height station in the spend chart.
 - **Measurement never fails a tick.** Every git/gh call that only feeds the
@@ -637,6 +649,67 @@ known, and the rate is over the rows that can say. Clarifications and plan
 approvals are gates by design: counted as touches, never held against
 autonomy. State durations are only as fine as the tick interval — say so
 wherever they are shown, and never present them to the second.
+
+**Cost per PR by size** (`_cost_by_size`) buckets merged rows by lines changed
+(additions + deletions from the `pr_merged` line) at fixed edges (`<50`,
+`50-199`, `200-499`, `500+`, `unknown`) and reports medians. A row's cost is its
+*own* events only: triage lives on the placeholder and covered every repo on
+the ticket, so adding it to each routed row would count it once per repo, and
+judging spend has no task id at all.
+
+### Scorers
+
+`runner/scorers.py` judges finished runs against rubric files in
+`runner.scorers_dir`. No directory or no files is the off switch — nothing
+runs, nothing is spent — so this ships disabled on every existing install.
+Invariants, each easy to undo by accident:
+
+- **The judge reads the run's log, never the repo.** It is a `reason()` call,
+  not `work()`: a judge with tools would grade the worktree as it is now, not
+  the run as it happened. Its input is `condense()` of the JSONL `_EventLog`
+  wrote (already redacted), plus the row's `meta` plan, approach and acceptance
+  criteria. The provider is never called; the station prompt is not in the log.
+- **Never cut the run in half.** `CLIP_LEVELS` clip every message harder at each
+  level and never drop one; if even the tightest level does not fit
+  `agent.max_prompt_bytes`, the verdict is `insufficient_evidence` with no agent
+  call. Same reasoning as `_run()` refusing rather than truncating: half a
+  transcript buys a confident verdict on the wrong story.
+- **`insufficient_evidence` and `error` never move a pass rate.** Both are
+  reserved labels with `score`/`passed` NULL. A judge that cannot see enough,
+  fails, crashes, or answers with a label the scorer lacks records one of
+  these, never a fail. `Reader.scores()` counts them beside the rate.
+- **Claim before judging.** `Store.claim_score` inserts `(scorer, event_id)`
+  under a UNIQUE constraint first, like `claim_comment`, so overlapping ticks
+  never pay twice; a claim left unlabelled for `SCORE_CLAIM_TTL` (twice
+  `reason()`'s timeout) belongs to a killed tick and is retaken.
+- **Sampling is a hash, not a dice roll** (`sampled()`): a run left out stays
+  out, so a 20% sample is 20% of runs rather than drifting up as runs get
+  re-rolled every tick.
+- **Scoring spend is on the ledger, not the row.** `score_run` records kind
+  `score` with `task_id` NULL: it counts against both daily limits (and every
+  judge call is behind `_budget_available`), shows as its own grey band on the
+  Spend chart, and stays out of a PR's cost and out of `runs_recorded()`. It is
+  not in `_RUN_KINDS`, so judges do not appear on the Runs tab.
+- **One path for the tick and the CLI.** `scorers.score_run()` is what both
+  `Pipeline._score_runs()` and `deputy score` call, so a verdict tried at the
+  terminal is the verdict the tick would record. `--record` claims exactly as
+  the tick does; without it only the spend is written.
+- **Scoring is last in the tick** and inside `windows.score` (default: the
+  triage window). It moves no ticket, so it only ever gets the budget the work
+  left. Scorers take turns per tick so one with a backlog cannot take every
+  `max_scores_per_run` slot. Failed runs (`models.run_outcome`, shared with the
+  Runs tab) and runs with no log are never judged.
+- **The log path is built in `scorers.log_path()`**, not in `pipeline.py`,
+  which keeps the smoke test's count of `agent_log_name(` call sites there at two.
+- **`doctor` fails on a scorer file that will not parse.** The tick skips it
+  with a warning, which nobody reads; `doctor` is where it must be loud.
+- **The dashboard tolerates a missing `scores` table.** A database the runner
+  has not opened since scoring shipped has none, and `mode=ro` cannot create
+  one, so `Reader.scores()` returns empty rather than raising.
+- **`tests_smoke.py` points `scorers.DEFAULT_DIR` at an empty temp dir** at
+  import, so a developer's own `~/.deputy/scorers` cannot start judging with
+  the test fakes. Keep `scorers_dir` commented out in `config.example.yaml` for
+  the same reason.
 
 `runner/web/static/` is committed build output, not source. `web/vite.config.ts`
 points `build.outDir` at it directly rather than the default `web/dist`,

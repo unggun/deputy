@@ -104,6 +104,15 @@ TRIAGE_ISOLATION = [
     "--settings", '{"autoMemoryEnabled": false}',
 ]
 
+
+
+def _isolation(system_prompt: str) -> list[str]:
+    """`TRIAGE_ISOLATION` with its system prompt swapped for `system_prompt`."""
+    out = list(TRIAGE_ISOLATION)
+    out[out.index("--system-prompt") + 1] = system_prompt
+    return out
+
+
 # How long the process group gets to exit on SIGTERM before SIGKILL. The agent
 # may be mid-write in a worktree; a graceful first signal lets it finish the
 # file it is on. Bounded, so a process that ignores SIGTERM cannot stall the
@@ -268,7 +277,9 @@ class ClaudeCodeAgent(CodingAgent):
         if shutil.which(self.binary) is None:
             raise RuntimeError(f"`{self.binary}` not found on PATH")
 
-    def reason(self, prompt: str, *, max_turns: int = 1) -> AgentResult:
+    def reason(self, prompt: str, *, max_turns: int = 1,
+               model: str | None = None,
+               system_prompt: str | None = None) -> AgentResult:
         """Tool-less classification. Judges only what the prompt contains.
 
         `cwd` used to be None, which meant triage inherited whatever directory
@@ -291,6 +302,11 @@ class ClaudeCodeAgent(CodingAgent):
         ended `error_max_turns` with no answer. `--tools ""` is what removes
         them, and applies even with isolation off: no tools is this seam's
         contract, not an isolation setting.
+
+        `system_prompt` replaces `TRIAGE_SYSTEM_PROMPT` for a caller whose job
+        is not classifying tickets (the scoring judge). It is honoured with
+        isolation off too: a caller that names its own system prompt has said
+        what the model is for, and the default agent prompt is the wrong one.
         """
         cmd = [self.binary, "-p", prompt,
                "--output-format", "json",
@@ -298,12 +314,15 @@ class ClaudeCodeAgent(CodingAgent):
                "--tools", "",
                "--allowedTools", "",
                "--permission-mode", "dontAsk"]
-        if self.triage_model:
-            cmd += ["--model", self.triage_model]
+        chosen = model or self.triage_model
+        if chosen:
+            cmd += ["--model", chosen]
         cwd = None
         if self.isolate_triage:
-            cmd += TRIAGE_ISOLATION
+            cmd += _isolation(system_prompt or TRIAGE_SYSTEM_PROMPT)
             cwd = self._triage_cwd()
+        elif system_prompt:
+            cmd += ["--system-prompt", system_prompt]
         return self._run(cmd, cwd=cwd, timeout=300, stream=False)
 
     def _triage_cwd(self) -> Path | None:
