@@ -148,7 +148,12 @@ class JiraProvider(TaskProvider):
         # after this point can count as a human's reset (`_effective_state`).
         prop: dict[str, Any] = {"state": state.value}
         if state in RESETTABLE:
-            history = self._history_length(task_id)
+            # A refresh of the same park keeps its mark: a multi-repo ticket
+            # republishes `blocked` whenever a sibling advances, and moving
+            # the mark past the label's addition would hide a later removal.
+            current, mark = self._read_state(task_id)
+            history = mark if current == state and mark is not None \
+                else self._history_length(task_id)
             if history is not None:
                 prop["history"] = history
         self._req("PUT", f"/rest/api/3/issue/{task_id}/properties/{PROPERTY_KEY}",
@@ -293,6 +298,9 @@ class JiraProvider(TaskProvider):
         entries are read, never the oldest, so a fresh removal on a long-lived
         ticket is still seen.
         """
+        # With no mark the window may start after the label was added, so a
+        # removal (its `fromString` proves the label was there) is enough.
+        legacy = since is None
         if since is None:
             total = self._history_length(key)
             if total is None:
@@ -318,7 +326,7 @@ class JiraProvider(TaskProvider):
             start += len(values)
             if page.get("isLast", True) or not values:
                 break
-        return seen_add and last == "remove"
+        return last == "remove" and (seen_add or legacy)
 
     def _read_state(self, key: str) -> tuple[AIState, int | None]:
         """(state, changelog length when it was written, if recorded)."""
@@ -393,6 +401,8 @@ def _flatten_adf(node: Any) -> str:
             return url + ("\n" if kind != "inlineCard" else "") if url else ""
         # mediaSingle wraps one embedded image; mediaGroup and mediaInline
         # are file cards, which may be any type.
+        if kind == "hardBreak":
+            return "\n"
         if kind == "media":
             return _media_ref(node, "image")
         if kind == "mediaInline":

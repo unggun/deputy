@@ -5345,6 +5345,11 @@ _links = _jira._flatten_adf({"type": "doc", "content": [
         {"type": "text", "text": "the spec", "marks": [{"type": "link", "attrs": {"href": "https://x.test/spec"}}]},
         {"type": "text", "text": "https://x.test/raw", "marks": [{"type": "link", "attrs": {"href": "https://x.test/raw"}}]}]},
     {"type": "blockCard", "attrs": {"url": "https://x.test/card"}}]})
+_hb = _jira._flatten_adf({"type": "paragraph", "content": [
+    {"type": "text", "text": "Expected: success"}, {"type": "hardBreak"},
+    {"type": "text", "text": "Actual: failure"}]})
+_a_checks.append(("a hard break inside a paragraph stays a line break",
+                  _hb == "Expected: success\nActual: failure\n"))
 _a_checks.append(("smart links and link targets survive flattening",
                   "see https://claude.ai/artifact/abc" in _links
                   and "the spec (https://x.test/spec)" in _links
@@ -5542,6 +5547,9 @@ _j = _jira_with(_noise(150) + [_ADD] + _noise(120) + [_DEL, _ADD, _DEL])
 _r_checks.append(("history is read forward from the park across pages; latest wins",
                   _j._effective_state("E-1", _HO, 150, ["ai-ready"]) == AIState.NEW
                   and [c[2]["startAt"] for c in _j.calls] == [150, 250]))
+_j = _jira_with([_ADD] + _noise(1500) + [_DEL])
+_r_checks.append(("a park with no mark accepts a removal whose addition is out of the window",
+                  _j._effective_state("E-1", _HO, None, ["ai-ready"]) == AIState.NEW))
 _j = _jira_with(_noise(1500) + [_ADD, _DEL])
 _r_checks.append(("a park with no mark reads the recent history, not the oldest",
                   _j._effective_state("E-1", _HO, None, ["ai-ready"]) == AIState.NEW
@@ -5567,6 +5575,28 @@ _r_checks.append(("parking records the changelog length; other states do not rea
                   _put[0][3] == {"state": "human-only", "history": 7}
                   and _put2[0][3] == {"state": "needs-input"}
                   and not any(c[1].endswith("/changelog") for c in _j2.calls)))
+# A sibling's progress republishes the same park: the mark must not move.
+_j4 = _jira_with(_noise(9))
+_inner4 = _j4._req
+def _already_parked(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "blocked", "history": 4}}
+    return _inner4(method, path, params=params, json=json)
+_j4._req = _already_parked
+_j4.set_ai_state("E-1", AIState.BLOCKED)
+_j5 = _jira_with(_noise(9))
+_inner5 = _j5._req
+def _was_human_only(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "human-only", "history": 4}}
+    return _inner5(method, path, params=params, json=json)
+_j5._req = _was_human_only
+_j5.set_ai_state("E-1", AIState.BLOCKED)
+_r_checks.append(("refreshing the same park keeps its mark; a new park takes a new one",
+                  [c[3] for c in _j4.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "blocked", "history": 4}]
+                  and [c[3] for c in _j5.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "blocked", "history": 9}]))
 _j3 = _jira_with([])
 _inner3 = _j3._req
 def _changelog_down(method, path, params=None, json=None):

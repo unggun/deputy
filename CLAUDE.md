@@ -416,6 +416,14 @@ other's note while both report success.
   not enough either: a label write that failed would read as a reset and the
   ticket would be re-triaged (and re-commented) every tick. Bot comments name
   the step through `TaskProvider.reset_hint()`, never a hard-coded sentence.
+  "Added" is scoped to the current park: a park stores the changelog length
+  as `history` in the property and only entries from there count, or an
+  earlier reset's removal would reset a later park whose label write failed.
+  Re-publishing the *same* parked state (a multi-repo sibling advancing)
+  keeps the old mark, or the label's addition falls before it. A property
+  with no mark reads the latest 1000 entries and accepts a removal alone,
+  since its addition may predate the window. Changelog errors of any kind,
+  `requests` transport errors included, leave the ticket parked.
 - **Jira JQL**: `labels NOT IN ("no-ai")` silently drops issues with *no labels at all*.
   The `(labels IS EMPTY OR ...)` branch is required, not defensive.
 - **Jira `require_labels`** is the opt-*in* counterpart to `skip_labels`: an AND of
