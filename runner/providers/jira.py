@@ -31,7 +31,10 @@ HUMAN_VISIBLE = {AIState.NEEDS_INPUT, AIState.HUMAN_ONLY,
 # that holds AI State has no editor in Jira's UI, so "set AI State back to
 # `new`" cannot be done by hand; taking the label off is the reset.
 RESETTABLE = {AIState.HUMAN_ONLY, AIState.BLOCKED}
-CHANGELOG_PAGES = 10            # 1000 history entries; a reset older than that is ignored
+CHANGELOG_PAGE = 100
+# How far back to look when a parked property predates the `history` mark:
+# the most recent this many entries, never the oldest.
+CHANGELOG_LEGACY_WINDOW = 1000
 FIELDS = "summary,description,status,labels,assignee,project,updated,issuelinks,attachment"
 
 
@@ -140,9 +143,16 @@ class JiraProvider(TaskProvider):
         if self.dry_run:
             log.info("[dry-run] set state %s -> %s", task_id, state.value)
             return
-        # Authoritative machine state.
+        # Authoritative machine state. A parked state also records how long
+        # the changelog was when it parked, so only a label removal made
+        # after this point can count as a human's reset (`_effective_state`).
+        prop: dict[str, Any] = {"state": state.value}
+        if state in RESETTABLE:
+            history = self._history_length(task_id)
+            if history is not None:
+                prop["history"] = history
         self._req("PUT", f"/rest/api/3/issue/{task_id}/properties/{PROPERTY_KEY}",
-                  json={"state": state.value})
+                  json=prop)
         # Human-visible mirror, one label at most.
         current = self._req("GET", f"/rest/api/3/issue/{task_id}",
                             params={"fields": "labels"})
@@ -224,7 +234,7 @@ class JiraProvider(TaskProvider):
             assignee_ids=[str((f.get("assignee") or {}).get("accountId", ""))],
             updated_at=_epoch_ms(f.get("updated")),
             ai_state=self._effective_state(
-                key, self._read_state(key),
+                key, *self._read_state(key),
                 [str(x).lower() for x in f.get("labels", [])]),
             raw=issue,
             attachments=[_attachment(a) for a in f.get("attachment") or []
@@ -236,34 +246,64 @@ class JiraProvider(TaskProvider):
             return f"remove the `ai:{state.value}` label"
         return super().reset_hint(state)
 
-    def _effective_state(self, key: str, state: AIState, labels: list[str]) -> AIState:
+    def _effective_state(self, key: str, state: AIState, since: int | None,
+                         labels: list[str]) -> AIState:
         """`new` when a human took a parked ticket's `ai:` label off.
 
         Absence alone is not enough: the runner writes the property before
         the label, so a label write that failed also leaves a parked ticket
         unlabelled, and reading that as a reset would re-triage it every
         tick. The changelog decides: the label was added and its latest
-        change is a removal. The runner never removes it while the property
-        is still parked (it moves the property first), so that removal was a
-        person's -- who cannot be told apart by author, since the runner
-        acts as the developer's own account.
+        change is a removal, both after `since` -- the changelog length when
+        this park was written. That bound is what keeps an earlier reset's
+        removal from counting again when a later park's label write fails.
+        The runner never removes a parked label while the property is still
+        parked (it moves the property first), so a removal in that window
+        was a person's -- who cannot be told apart by author, since the
+        runner acts as the developer's own account.
         """
         label = f"ai:{state.value}"
         if state not in RESETTABLE or label in labels:
             return state
         try:
-            return AIState.NEW if self._label_removed(key, label) else state
-        except RuntimeError as exc:
+            return AIState.NEW if self._label_removed(key, label, since) else state
+        except (RuntimeError, requests.RequestException) as exc:
+            # Never raise from here: `fetch_candidates` maps every issue, so
+            # one unreadable history would stop every other ticket's triage.
             log.warning("[%s] could not read the changelog (%s); treating as %s",
                         key, exc, state.value)
             return state
 
-    def _label_removed(self, key: str, label: str) -> bool:
-        last: str | None = None          # "add" | "remove", oldest first
-        start = 0
-        for _ in range(CHANGELOG_PAGES):
+    def _history_length(self, key: str) -> int | None:
+        try:
             page = self._req("GET", f"/rest/api/3/issue/{key}/changelog",
-                             params={"startAt": start, "maxResults": 100})
+                             params={"startAt": 0, "maxResults": 1})
+            return int(page["total"])
+        except (RuntimeError, requests.RequestException, KeyError, TypeError,
+                ValueError) as exc:
+            log.warning("[%s] changelog length unavailable (%s); a reset of this "
+                        "park will be judged on recent history", key, exc)
+            return None
+
+    def _label_removed(self, key: str, label: str, since: int | None) -> bool:
+        """Was `label` added and then last removed, at or after entry `since`?
+
+        Reads forward from `since`. A property written before the mark
+        existed has none: then the most recent `CHANGELOG_LEGACY_WINDOW`
+        entries are read, never the oldest, so a fresh removal on a long-lived
+        ticket is still seen.
+        """
+        if since is None:
+            total = self._history_length(key)
+            if total is None:
+                return False
+            since = max(0, total - CHANGELOG_LEGACY_WINDOW)
+        seen_add = False
+        last: str | None = None
+        start = since
+        while True:
+            page = self._req("GET", f"/rest/api/3/issue/{key}/changelog",
+                             params={"startAt": start, "maxResults": CHANGELOG_PAGE})
             values = page.get("values") or []
             for entry in values:
                 for item in entry.get("items") or []:
@@ -272,23 +312,27 @@ class JiraProvider(TaskProvider):
                     before = str(item.get("fromString") or "").lower().split()
                     after = str(item.get("toString") or "").lower().split()
                     if label in after and label not in before:
-                        last = "add"
+                        last, seen_add = "add", True
                     elif label in before and label not in after:
                         last = "remove"
             start += len(values)
             if page.get("isLast", True) or not values:
                 break
-        return last == "remove"
+        return seen_add and last == "remove"
 
-    def _read_state(self, key: str) -> AIState:
+    def _read_state(self, key: str) -> tuple[AIState, int | None]:
+        """(state, changelog length when it was written, if recorded)."""
         try:
             data = self._req("GET", f"/rest/api/3/issue/{key}/properties/{PROPERTY_KEY}")
         except RuntimeError:
-            return AIState.NEW      # 404 = never triaged
+            return AIState.NEW, None      # 404 = never triaged
+        value = data.get("value") or {}
         try:
-            return AIState(str((data.get("value") or {}).get("state", "new")))
+            state = AIState(str(value.get("state", "new")))
         except ValueError:
-            return AIState.NEW
+            return AIState.NEW, None
+        since = value.get("history")
+        return state, since if isinstance(since, int) and since >= 0 else None
 
 
 def _epoch_ms(value: Any) -> int:
@@ -335,7 +379,18 @@ def _flatten_adf(node: Any) -> str:
     if isinstance(node, dict):
         kind = node.get("type")
         if kind == "text":
-            return str(node.get("text", ""))
+            text = str(node.get("text", ""))
+            # A link's target lives in a mark, not the text; without it
+            # "the artifact" reaches the model with nowhere to point.
+            href = next((str((m.get("attrs") or {}).get("href") or "")
+                         for m in node.get("marks") or []
+                         if isinstance(m, dict) and m.get("type") == "link"), "")
+            return f"{text} ({href})" if href and href != text else text
+        # Smart links carry only a URL attr and no text: dropping them told
+        # the model a pasted link "is not in the ticket".
+        if kind in ("inlineCard", "blockCard", "embedCard"):
+            url = str((node.get("attrs") or {}).get("url") or "")
+            return url + ("\n" if kind != "inlineCard" else "") if url else ""
         # mediaSingle wraps one embedded image; mediaGroup and mediaInline
         # are file cards, which may be any type.
         if kind == "media":
@@ -346,6 +401,12 @@ def _flatten_adf(node: Any) -> str:
             return "\n".join(_media_ref(n, "attachment")
                              for n in node.get("content") or []
                              if isinstance(n, dict)) + "\n"
-        inner = _flatten_adf(node.get("content"))
+        content = node.get("content")
+        # A paragraph's children are inline runs of one line: bold, a link,
+        # a smart link. Joined with newlines they split mid-sentence.
+        if kind in ("paragraph", "heading") and isinstance(content, list):
+            inner = "".join(_flatten_adf(n) for n in content)
+        else:
+            inner = _flatten_adf(content)
         return inner + ("\n" if kind in ("paragraph", "heading", "mediaSingle") else "")
     return ""

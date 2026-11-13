@@ -401,6 +401,10 @@ other's note while both report success.
 - **Jira state** lives in an issue *entity property* (`ai-runner-state`), not a custom
   field — no Jira admin, atomic writes. Only the four human-actionable states are
   mirrored to `ai:*` labels so boards stay readable.
+- **ADF that is not text still has to reach the prompt.** `_flatten_adf` renders
+  smart links (`inlineCard`/`blockCard`/`embedCard`) as their URL and a `link`
+  mark as `text (href)`, as it renders media as markers. Each of these used to
+  vanish, and the model then told the reporter the link or image was missing.
 - **On Jira, removing a parked label is the human reset.** A property has no editor
   in Jira's UI, so "set AI State back to `new`" was an instruction nobody could
   follow and a parked ticket stayed parked forever. `_effective_state()` reports

@@ -5337,6 +5337,19 @@ _a_checks.append(("an embedded image leaves a marker instead of vanishing",
                   and "[image: https://e.x/a.png]" in _flat
                   and _flat.index("(see image)") < _flat.index("dropdown.png") < _flat.index("after")))
 _a_checks.append(("Jira asks for the attachment field", "attachment" in _jira.FIELDS.split(",")))
+_links = _jira._flatten_adf({"type": "doc", "content": [
+    {"type": "paragraph", "content": [
+        {"type": "text", "text": "see "},
+        {"type": "inlineCard", "attrs": {"url": "https://claude.ai/artifact/abc"}},
+        {"type": "text", "text": " and "},
+        {"type": "text", "text": "the spec", "marks": [{"type": "link", "attrs": {"href": "https://x.test/spec"}}]},
+        {"type": "text", "text": "https://x.test/raw", "marks": [{"type": "link", "attrs": {"href": "https://x.test/raw"}}]}]},
+    {"type": "blockCard", "attrs": {"url": "https://x.test/card"}}]})
+_a_checks.append(("smart links and link targets survive flattening",
+                  "see https://claude.ai/artifact/abc" in _links
+                  and "the spec (https://x.test/spec)" in _links
+                  and _links.count("https://x.test/raw") == 1
+                  and "https://x.test/card" in _links))
 _ja = _jira._attachment({"id": "10001", "filename": "dropdown.png",
                          "mimeType": "image/png", "size": "1234"})
 _a_checks.append(("a Jira attachment maps to its metadata",
@@ -5481,15 +5494,23 @@ print("\njira: a removed label hands a parked ticket back")
 from runner.providers import jira as _jr
 from runner import triage as _tr
 
-def _jira_with(changelog_pages, fail=False):
+def _jira_with(entries, fail=None):
+    """A JiraProvider whose changelog is `entries`, served oldest first by
+    `startAt`/`maxResults` as Jira does; `fail` is an exception to raise."""
     prov = _jr.JiraProvider.__new__(_jr.JiraProvider)
+    prov.dry_run = False
     calls = []
-    def _req(method, path, **kw):
-        calls.append(path)
-        if fail:
-            raise RuntimeError("Jira GET changelog -> 500")
-        page = changelog_pages[len([c for c in calls if c.endswith("/changelog")]) - 1]
-        return page
+    def _req(method, path, params=None, json=None):
+        calls.append((method, path, dict(params or {}), json))
+        if fail is not None:
+            raise fail
+        if path.endswith("/changelog"):
+            st, mx = int(params["startAt"]), int(params["maxResults"])
+            return {"total": len(entries), "startAt": st,
+                    "values": entries[st:st + mx], "isLast": st + mx >= len(entries)}
+        if method == "GET":
+            return {"fields": {"labels": []}}
+        return {}
     prov._req = _req
     prov.calls = calls
     return prov
@@ -5497,32 +5518,66 @@ def _jira_with(changelog_pages, fail=False):
 def _lbl(before, after):
     return {"items": [{"field": "labels", "fromString": before, "toString": after}]}
 
+def _noise(n):
+    return [{"items": [{"field": "status"}]} for _ in range(n)]
+
 _HO = AIState.HUMAN_ONLY
+_ADD, _DEL = _lbl("ai-ready", "ai-ready ai:human-only"), _lbl("ai-ready ai:human-only", "ai-ready")
 _r_checks = []
 _j = _jira_with([])
 _r_checks.append(("a parked ticket that still has its label stays parked, no history read",
-                  _j._effective_state("E-1", _HO, ["ai-ready", "ai:human-only"]) == _HO
+                  _j._effective_state("E-1", _HO, 0, ["ai-ready", "ai:human-only"]) == _HO
                   and _j.calls == []))
-_j = _jira_with([{"isLast": True, "values": [_lbl("ai-ready", "ai-ready ai:human-only"),
-                                              _lbl("ai-ready ai:human-only", "ai-ready ai-override")]}])
-_r_checks.append(("label added then removed while parked reads as new",
-                  _j._effective_state("E-1", _HO, ["ai-ready", "ai-override"]) == AIState.NEW))
-_j = _jira_with([{"isLast": True, "values": [{"items": [{"field": "status"}]}]}])
+_j = _jira_with([_ADD, _DEL])
+_r_checks.append(("label added then removed after the park reads as new",
+                  _j._effective_state("E-1", _HO, 0, ["ai-ready"]) == AIState.NEW))
+_j = _jira_with(_noise(3))
 _r_checks.append(("a label the runner never managed to add is not a reset",
-                  _j._effective_state("E-1", _HO, ["ai-ready"]) == _HO))
-_j = _jira_with([{"isLast": False, "values": [_lbl("", "ai:human-only")]},
-                 {"isLast": True, "values": [_lbl("ai:human-only", ""), _lbl("", "ai:human-only"),
-                                              _lbl("ai:human-only", "x")]}])
-_r_checks.append(("history is read across pages; the latest change wins",
-                  _j._effective_state("E-1", _HO, ["x"]) == AIState.NEW
-                  and len(_j.calls) == 2))
+                  _j._effective_state("E-1", _HO, 0, ["ai-ready"]) == _HO))
+# An earlier reset's removal, then a new park whose label write failed.
+_j = _jira_with([_ADD, _DEL] + _noise(2))
+_r_checks.append(("an earlier reset's removal does not reset a later park",
+                  _j._effective_state("E-1", _HO, 2, ["ai-ready"]) == _HO))
+_j = _jira_with(_noise(150) + [_ADD] + _noise(120) + [_DEL, _ADD, _DEL])
+_r_checks.append(("history is read forward from the park across pages; latest wins",
+                  _j._effective_state("E-1", _HO, 150, ["ai-ready"]) == AIState.NEW
+                  and [c[2]["startAt"] for c in _j.calls] == [150, 250]))
+_j = _jira_with(_noise(1500) + [_ADD, _DEL])
+_r_checks.append(("a park with no mark reads the recent history, not the oldest",
+                  _j._effective_state("E-1", _HO, None, ["ai-ready"]) == AIState.NEW
+                  and min(c[2]["startAt"] for c in _j.calls if c[2]["maxResults"] > 1) >= 500))
 _j = _jira_with([])
 _r_checks.append(("an unlabelled needs-input ticket is not treated as a reset",
-                  _j._effective_state("E-1", AIState.NEEDS_INPUT, []) == AIState.NEEDS_INPUT
+                  _j._effective_state("E-1", AIState.NEEDS_INPUT, 0, []) == AIState.NEEDS_INPUT
                   and _j.calls == []))
-_j = _jira_with([], fail=True)
 _r_checks.append(("an unreadable changelog keeps the ticket parked",
-                  _j._effective_state("E-1", AIState.BLOCKED, []) == AIState.BLOCKED))
+                  _jira_with([], RuntimeError("500"))._effective_state(
+                      "E-1", AIState.BLOCKED, 0, []) == AIState.BLOCKED))
+import requests as _requests
+_r_checks.append(("a changelog timeout keeps the ticket parked instead of raising",
+                  _jira_with([], _requests.exceptions.ConnectTimeout("timed out"))._effective_state(
+                      "E-1", AIState.BLOCKED, 0, []) == AIState.BLOCKED))
+_j = _jira_with(_noise(7))
+_j.set_ai_state("E-1", _HO)
+_put = [c for c in _j.calls if c[0] == "PUT" and "properties" in c[1]]
+_j2 = _jira_with(_noise(7))
+_j2.set_ai_state("E-1", AIState.NEEDS_INPUT)
+_put2 = [c for c in _j2.calls if c[0] == "PUT" and "properties" in c[1]]
+_r_checks.append(("parking records the changelog length; other states do not read it",
+                  _put[0][3] == {"state": "human-only", "history": 7}
+                  and _put2[0][3] == {"state": "needs-input"}
+                  and not any(c[1].endswith("/changelog") for c in _j2.calls)))
+_j3 = _jira_with([])
+_inner3 = _j3._req
+def _changelog_down(method, path, params=None, json=None):
+    if path.endswith("/changelog"):
+        raise _requests.exceptions.ReadTimeout("timed out")
+    return _inner3(method, path, params=params, json=json)
+_j3._req = _changelog_down
+_j3.set_ai_state("E-1", _HO)
+_r_checks.append(("a park still writes its state when the changelog length is unavailable",
+                  [c[3] for c in _j3.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "human-only"}]))
 _r_checks.append(("bot comments name an action a person can take in each provider",
                   _jira_with([]).reset_hint(_HO) == "remove the `ai:human-only` label"
                   and FakeProvider([]).reset_hint(_HO) == "set AI State back to `new`"))
