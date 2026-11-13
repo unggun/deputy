@@ -181,12 +181,14 @@ def _match_excerpt(task: Task, pattern: str,
 def triage(agent: CodingAgent, task: Task, comments: list[Comment],
            repos: list[dict[str, Any]] | dict[str, Any] | None,
            policy: dict[str, Any], *, model: str | None = None,
-           system: str | None = None) -> tuple[TriageResult, Spend]:
+           system: str | None = None,
+           reset_hint: str = "set AI State back to `new`") -> tuple[TriageResult, Spend]:
     """Classify and route one ticket.
 
     `model` and `system` are the triage benchmark's variants: another model
     for the `reason()` call, another text in place of `SYSTEM`. The tick
-    passes neither. Everything else -- the denylist, the override tag, the
+    passes neither. `reset_hint` is the provider's wording for handing a
+    parked ticket back; it only changes the comment. Everything else -- the denylist, the override tag, the
     post-conditions below -- is the same for both callers on purpose, so a
     replayed verdict is the verdict the tick would have reached.
     """
@@ -212,7 +214,7 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
                        f"doing anything.\n\nRule: `{hit}`\n"
                        f"Matched text: \"{_match_excerpt(task, hit, comments)}\""),
             hints=["If this is a false positive, add the "
-                   f"`{override_tag}` tag and set AI State back to `new`. "
+                   f"`{override_tag}` tag and {reset_hint}. "
                    "I'll re-triage and always ask you to approve the plan before "
                    "writing code.",
                    "Otherwise a human needs to pick this one up."],

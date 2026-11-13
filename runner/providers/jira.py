@@ -27,6 +27,11 @@ PROPERTY_KEY = "ai-runner-state"
 # Only these get a visible label; the rest are runner-internal.
 HUMAN_VISIBLE = {AIState.NEEDS_INPUT, AIState.HUMAN_ONLY,
                  AIState.AWAITING_PLAN_OK, AIState.BLOCKED}
+# Parked states a human hands back by removing their label. The property
+# that holds AI State has no editor in Jira's UI, so "set AI State back to
+# `new`" cannot be done by hand; taking the label off is the reset.
+RESETTABLE = {AIState.HUMAN_ONLY, AIState.BLOCKED}
+CHANGELOG_PAGES = 10            # 1000 history entries; a reset older than that is ignored
 FIELDS = "summary,description,status,labels,assignee,project,updated,issuelinks,attachment"
 
 
@@ -218,11 +223,62 @@ class JiraProvider(TaskProvider):
             tags=[str(x).lower() for x in f.get("labels", [])],
             assignee_ids=[str((f.get("assignee") or {}).get("accountId", ""))],
             updated_at=_epoch_ms(f.get("updated")),
-            ai_state=self._read_state(key),
+            ai_state=self._effective_state(
+                key, self._read_state(key),
+                [str(x).lower() for x in f.get("labels", [])]),
             raw=issue,
             attachments=[_attachment(a) for a in f.get("attachment") or []
                          if isinstance(a, dict) and a.get("id")],
         )
+
+    def reset_hint(self, state: AIState) -> str:
+        if state in RESETTABLE:
+            return f"remove the `ai:{state.value}` label"
+        return super().reset_hint(state)
+
+    def _effective_state(self, key: str, state: AIState, labels: list[str]) -> AIState:
+        """`new` when a human took a parked ticket's `ai:` label off.
+
+        Absence alone is not enough: the runner writes the property before
+        the label, so a label write that failed also leaves a parked ticket
+        unlabelled, and reading that as a reset would re-triage it every
+        tick. The changelog decides: the label was added and its latest
+        change is a removal. The runner never removes it while the property
+        is still parked (it moves the property first), so that removal was a
+        person's -- who cannot be told apart by author, since the runner
+        acts as the developer's own account.
+        """
+        label = f"ai:{state.value}"
+        if state not in RESETTABLE or label in labels:
+            return state
+        try:
+            return AIState.NEW if self._label_removed(key, label) else state
+        except RuntimeError as exc:
+            log.warning("[%s] could not read the changelog (%s); treating as %s",
+                        key, exc, state.value)
+            return state
+
+    def _label_removed(self, key: str, label: str) -> bool:
+        last: str | None = None          # "add" | "remove", oldest first
+        start = 0
+        for _ in range(CHANGELOG_PAGES):
+            page = self._req("GET", f"/rest/api/3/issue/{key}/changelog",
+                             params={"startAt": start, "maxResults": 100})
+            values = page.get("values") or []
+            for entry in values:
+                for item in entry.get("items") or []:
+                    if item.get("field") != "labels":
+                        continue
+                    before = str(item.get("fromString") or "").lower().split()
+                    after = str(item.get("toString") or "").lower().split()
+                    if label in after and label not in before:
+                        last = "add"
+                    elif label in before and label not in after:
+                        last = "remove"
+            start += len(values)
+            if page.get("isLast", True) or not values:
+                break
+        return last == "remove"
 
     def _read_state(self, key: str) -> AIState:
         try:

@@ -5477,5 +5477,64 @@ for label, ok in _a_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+print("\njira: a removed label hands a parked ticket back")
+from runner.providers import jira as _jr
+from runner import triage as _tr
+
+def _jira_with(changelog_pages, fail=False):
+    prov = _jr.JiraProvider.__new__(_jr.JiraProvider)
+    calls = []
+    def _req(method, path, **kw):
+        calls.append(path)
+        if fail:
+            raise RuntimeError("Jira GET changelog -> 500")
+        page = changelog_pages[len([c for c in calls if c.endswith("/changelog")]) - 1]
+        return page
+    prov._req = _req
+    prov.calls = calls
+    return prov
+
+def _lbl(before, after):
+    return {"items": [{"field": "labels", "fromString": before, "toString": after}]}
+
+_HO = AIState.HUMAN_ONLY
+_r_checks = []
+_j = _jira_with([])
+_r_checks.append(("a parked ticket that still has its label stays parked, no history read",
+                  _j._effective_state("E-1", _HO, ["ai-ready", "ai:human-only"]) == _HO
+                  and _j.calls == []))
+_j = _jira_with([{"isLast": True, "values": [_lbl("ai-ready", "ai-ready ai:human-only"),
+                                              _lbl("ai-ready ai:human-only", "ai-ready ai-override")]}])
+_r_checks.append(("label added then removed while parked reads as new",
+                  _j._effective_state("E-1", _HO, ["ai-ready", "ai-override"]) == AIState.NEW))
+_j = _jira_with([{"isLast": True, "values": [{"items": [{"field": "status"}]}]}])
+_r_checks.append(("a label the runner never managed to add is not a reset",
+                  _j._effective_state("E-1", _HO, ["ai-ready"]) == _HO))
+_j = _jira_with([{"isLast": False, "values": [_lbl("", "ai:human-only")]},
+                 {"isLast": True, "values": [_lbl("ai:human-only", ""), _lbl("", "ai:human-only"),
+                                              _lbl("ai:human-only", "x")]}])
+_r_checks.append(("history is read across pages; the latest change wins",
+                  _j._effective_state("E-1", _HO, ["x"]) == AIState.NEW
+                  and len(_j.calls) == 2))
+_j = _jira_with([])
+_r_checks.append(("an unlabelled needs-input ticket is not treated as a reset",
+                  _j._effective_state("E-1", AIState.NEEDS_INPUT, []) == AIState.NEEDS_INPUT
+                  and _j.calls == []))
+_j = _jira_with([], fail=True)
+_r_checks.append(("an unreadable changelog keeps the ticket parked",
+                  _j._effective_state("E-1", AIState.BLOCKED, []) == AIState.BLOCKED))
+_r_checks.append(("bot comments name an action a person can take in each provider",
+                  _jira_with([]).reset_hint(_HO) == "remove the `ai:human-only` label"
+                  and FakeProvider([]).reset_hint(_HO) == "set AI State back to `new`"))
+_deny, _ = _tr.triage(FakeAgent("execute"), mk("E-2", "Run the migration", "on prod"), [], [],
+                      {}, reset_hint="remove the `ai:human-only` label")
+_r_checks.append(("the denylist verdict tells the human the provider's reset step",
+                  _deny.decision == "human_only"
+                  and any("remove the `ai:human-only` label" in h for h in _deny.hints)))
+
+for label, ok in _r_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

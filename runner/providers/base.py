@@ -71,6 +71,15 @@ class TaskProvider(ABC):
     def blocked_by(self, task_id: str) -> list[dict[str, Any]]:
         return []
 
+    def reset_hint(self, state: AIState) -> str:
+        """How a person hands a ticket parked at `state` back to the runner.
+
+        Finishes the sentence "...and ___; I'll re-triage". Bot comments quote
+        it, so it must name something a person can do in this task manager's
+        own UI.
+        """
+        return "set AI State back to `new`"
+
     def download_attachment(self, task: Task, attachment: Attachment,
                             dest: Path, max_bytes: int) -> None:
         """Write one of `task.attachments` to `dest`, refusing past `max_bytes`.

@@ -401,6 +401,17 @@ other's note while both report success.
 - **Jira state** lives in an issue *entity property* (`ai-runner-state`), not a custom
   field — no Jira admin, atomic writes. Only the four human-actionable states are
   mirrored to `ai:*` labels so boards stay readable.
+- **On Jira, removing a parked label is the human reset.** A property has no editor
+  in Jira's UI, so "set AI State back to `new`" was an instruction nobody could
+  follow and a parked ticket stayed parked forever. `_effective_state()` reports
+  `new` for a `human-only`/`blocked` ticket whose `ai:` label is gone, but only
+  when the changelog shows that label was added and last *removed*. The runner
+  writes the property before the label and only removes a parked label after
+  moving the property away, so such a removal was a person's. Author cannot
+  decide it: the runner acts as the developer's own account. Absence alone is
+  not enough either: a label write that failed would read as a reset and the
+  ticket would be re-triaged (and re-commented) every tick. Bot comments name
+  the step through `TaskProvider.reset_hint()`, never a hard-coded sentence.
 - **Jira JQL**: `labels NOT IN ("no-ai")` silently drops issues with *no labels at all*.
   The `(labels IS EMPTY OR ...)` branch is required, not defensive.
 - **Jira `require_labels`** is the opt-*in* counterpart to `skip_labels`: an AND of
