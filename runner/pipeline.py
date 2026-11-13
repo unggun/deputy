@@ -316,7 +316,8 @@ class Pipeline:
                 f"**I can't start this over yet.**\n\n"
                 f"An earlier attempt still has a branch:\n{steps}\n\n"
                 f"Delete it locally and on GitHub (remove its worktree under "
-                f"`{self.work_root}` first), then set AI State back to `new` again.")
+                f"`{self.work_root}` first), then "
+                f"{self.provider.reset_hint(_parked_state(rows))} again.")
             return False
         for r in rows:
             self.store.forget_comments(r["task_id"])
@@ -355,8 +356,9 @@ class Pipeline:
             rid, f"orphan-{task.ai_state.value}",
             f"This ticket is marked `{task.ai_state.value}` but I have no local record "
             f"of it — it was most likely started on a different machine or reassigned.\n\n"
-            f"To hand it over: clear the AI State field and I'll re-triage from scratch on "
-            f"the next run. Any existing branch or PR will need to be closed manually first.")
+            f"To hand it over: {self.provider.reset_hint(AIState.BLOCKED)} and I'll "
+            f"re-triage from scratch on the next run. Any existing branch or PR will "
+            f"need to be closed manually first.")
         self.provider.set_ai_state(task.id, AIState.BLOCKED)
 
     def _candidate_repos(self, task: Task) -> list[dict[str, Any]]:
@@ -468,7 +470,8 @@ class Pipeline:
         repos = self._candidate_repos(task)
         n = self.store.runs_recorded(rid, "triage") + 1
         try:
-            result, spend = triage(self.agent, task, comments, repos, self.policy)
+            result, spend = triage(self.agent, task, comments, repos, self.policy,
+                                   reset_hint=self.provider.reset_hint(AIState.HUMAN_ONLY))
         except StationError as exc:
             # The agent run itself failed (not just an unparseable reply).
             # Record what it cost before this propagates to the generic
@@ -1487,6 +1490,17 @@ def _fmt_analysis(r: AnalysisResult, shadow: bool) -> str:
             f"{r.problem}\n\n**Approach**\n{r.approach}\n\n"
             f"**Steps**\n{steps}\n\n**Acceptance criteria**\n{ac}\n\n"
             f"**Files I expect to touch**\n{files}\n\n**Risks**\n{risks}{tail}")
+
+
+def _parked_state(rows: list[dict[str, Any]]) -> AIState:
+    """The parked state the ticket shows, ranked as `_remote_state` ranks it.
+
+    A reset hint names this one: a sibling row back at `new` is not what the
+    ticket's field (or, on Jira, its label) says.
+    """
+    states = {r.get("state") for r in rows}
+    return next((s for s in (AIState.BLOCKED, AIState.HUMAN_ONLY) if s.value in states),
+                AIState.HUMAN_ONLY)
 
 
 def _safe_name(text: str, limit: int = 120) -> str:

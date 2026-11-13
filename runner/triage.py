@@ -41,7 +41,17 @@ Choose "execute" ONLY IF ALL of these hold:
 - The desired end state is unambiguous and testable.
 - It is scoped to application code in the repositories listed under REPOS.
 - No production data, credentials, infrastructure, auth model, or payments.
-- A competent engineer new to the ticket could start without asking anything.
+- A competent engineer new to the ticket, with the repositories open, could
+  start without asking anything.
+
+You cannot see the code. The stages after you can: a planning stage reads the
+repositories before any code is written, and it asks its own questions when
+the code is ambiguous. So never ask a question the code answers: which file,
+table, column or migration tool, whether something already exists, how a
+feature is implemented today. A person should not be sent to look that up for
+you. Ask only what a person alone can answer: intended behaviour, scope,
+audience, product or design choices. Facts about the code that you do not know
+are never, on their own, a reason to choose "clarify".
 
 You also route the ticket. "repos" is the list of repositories that need a
 code change for this ticket to be done. Each one gets its OWN branch, PR and
@@ -50,7 +60,8 @@ review, so name a repo only if it genuinely needs changing:
 - Name several only when the work truly spans them - e.g. a new API endpoint
   in the backend AND the screen that calls it in the frontend.
 - Use the exact `key` from the REPOS section. Never invent a key.
-- If you cannot tell which repo it belongs to, choose "clarify" and ask.
+- Route from each repo's notes: they say what it owns. If they still leave
+  the repo undecided, choose "clarify" and ask where the change should live.
 
 Choose "clarify" if requirements, acceptance criteria, affected surface,
 expected behaviour, or reproduction steps are missing or ambiguous.
@@ -181,12 +192,14 @@ def _match_excerpt(task: Task, pattern: str,
 def triage(agent: CodingAgent, task: Task, comments: list[Comment],
            repos: list[dict[str, Any]] | dict[str, Any] | None,
            policy: dict[str, Any], *, model: str | None = None,
-           system: str | None = None) -> tuple[TriageResult, Spend]:
+           system: str | None = None,
+           reset_hint: str = "set AI State back to `new`") -> tuple[TriageResult, Spend]:
     """Classify and route one ticket.
 
     `model` and `system` are the triage benchmark's variants: another model
     for the `reason()` call, another text in place of `SYSTEM`. The tick
-    passes neither. Everything else -- the denylist, the override tag, the
+    passes neither. `reset_hint` is the provider's wording for handing a
+    parked ticket back; it only changes the comment. Everything else -- the denylist, the override tag, the
     post-conditions below -- is the same for both callers on purpose, so a
     replayed verdict is the verdict the tick would have reached.
     """
@@ -212,7 +225,7 @@ def triage(agent: CodingAgent, task: Task, comments: list[Comment],
                        f"doing anything.\n\nRule: `{hit}`\n"
                        f"Matched text: \"{_match_excerpt(task, hit, comments)}\""),
             hints=["If this is a false positive, add the "
-                   f"`{override_tag}` tag and set AI State back to `new`. "
+                   f"`{override_tag}` tag and {reset_hint}. "
                    "I'll re-triage and always ask you to approve the plan before "
                    "writing code.",
                    "Otherwise a human needs to pick this one up."],

@@ -5337,6 +5337,24 @@ _a_checks.append(("an embedded image leaves a marker instead of vanishing",
                   and "[image: https://e.x/a.png]" in _flat
                   and _flat.index("(see image)") < _flat.index("dropdown.png") < _flat.index("after")))
 _a_checks.append(("Jira asks for the attachment field", "attachment" in _jira.FIELDS.split(",")))
+_links = _jira._flatten_adf({"type": "doc", "content": [
+    {"type": "paragraph", "content": [
+        {"type": "text", "text": "see "},
+        {"type": "inlineCard", "attrs": {"url": "https://claude.ai/artifact/abc"}},
+        {"type": "text", "text": " and "},
+        {"type": "text", "text": "the spec", "marks": [{"type": "link", "attrs": {"href": "https://x.test/spec"}}]},
+        {"type": "text", "text": "https://x.test/raw", "marks": [{"type": "link", "attrs": {"href": "https://x.test/raw"}}]}]},
+    {"type": "blockCard", "attrs": {"url": "https://x.test/card"}}]})
+_hb = _jira._flatten_adf({"type": "paragraph", "content": [
+    {"type": "text", "text": "Expected: success"}, {"type": "hardBreak"},
+    {"type": "text", "text": "Actual: failure"}]})
+_a_checks.append(("a hard break inside a paragraph stays a line break",
+                  _hb == "Expected: success\nActual: failure\n"))
+_a_checks.append(("smart links and link targets survive flattening",
+                  "see https://claude.ai/artifact/abc" in _links
+                  and "the spec (https://x.test/spec)" in _links
+                  and _links.count("https://x.test/raw") == 1
+                  and "https://x.test/card" in _links))
 _ja = _jira._attachment({"id": "10001", "filename": "dropdown.png",
                          "mimeType": "image/png", "size": "1234"})
 _a_checks.append(("a Jira attachment maps to its metadata",
@@ -5474,6 +5492,172 @@ with tempfile.TemporaryDirectory() as _atmp:
                       and "Attachments:" not in _bench._task({"task": {}}).as_prompt_block()))
 
 for label, ok in _a_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
+print("\njira: a removed label hands a parked ticket back")
+from runner.providers import jira as _jr
+from runner import triage as _tr
+
+def _jira_with(entries, fail=None):
+    """A JiraProvider whose changelog is `entries`, served oldest first by
+    `startAt`/`maxResults` as Jira does; `fail` is an exception to raise."""
+    prov = _jr.JiraProvider.__new__(_jr.JiraProvider)
+    prov.dry_run = False
+    calls = []
+    def _req(method, path, params=None, json=None):
+        calls.append((method, path, dict(params or {}), json))
+        if fail is not None:
+            raise fail
+        if path.endswith("/changelog"):
+            st, mx = int(params["startAt"]), int(params["maxResults"])
+            return {"total": len(entries), "startAt": st,
+                    "values": entries[st:st + mx], "isLast": st + mx >= len(entries)}
+        if method == "GET":
+            return {"fields": {"labels": []}}
+        return {}
+    prov._req = _req
+    prov.calls = calls
+    return prov
+
+def _lbl(before, after):
+    return {"items": [{"field": "labels", "fromString": before, "toString": after}]}
+
+def _noise(n):
+    return [{"items": [{"field": "status"}]} for _ in range(n)]
+
+_HO = AIState.HUMAN_ONLY
+_ADD, _DEL = _lbl("ai-ready", "ai-ready ai:human-only"), _lbl("ai-ready ai:human-only", "ai-ready")
+_r_checks = []
+_j = _jira_with([])
+_r_checks.append(("a parked ticket that still has its label stays parked, no history read",
+                  _j._effective_state("E-1", _HO, 0, ["ai-ready", "ai:human-only"]) == _HO
+                  and _j.calls == []))
+_j = _jira_with([_ADD, _DEL])
+_r_checks.append(("label added then removed after the park reads as new",
+                  _j._effective_state("E-1", _HO, 0, ["ai-ready"]) == AIState.NEW))
+_j = _jira_with(_noise(3))
+_r_checks.append(("a label the runner never managed to add is not a reset",
+                  _j._effective_state("E-1", _HO, 0, ["ai-ready"]) == _HO))
+# An earlier reset's removal, then a new park whose label write failed.
+_j = _jira_with([_ADD, _DEL] + _noise(2))
+_r_checks.append(("an earlier reset's removal does not reset a later park",
+                  _j._effective_state("E-1", _HO, 2, ["ai-ready"]) == _HO))
+_j = _jira_with(_noise(150) + [_ADD] + _noise(120) + [_DEL, _ADD, _DEL])
+_r_checks.append(("history is read forward from the park across pages; latest wins",
+                  _j._effective_state("E-1", _HO, 150, ["ai-ready"]) == AIState.NEW
+                  and [c[2]["startAt"] for c in _j.calls] == [150, 250]))
+_j = _jira_with([_ADD] + _noise(1500) + [_DEL])
+_r_checks.append(("a park with no mark accepts a removal whose addition is out of the window",
+                  _j._effective_state("E-1", _HO, None, ["ai-ready"]) == AIState.NEW))
+_j = _jira_with(_noise(1500) + [_ADD, _DEL])
+_r_checks.append(("a park with no mark reads the recent history, not the oldest",
+                  _j._effective_state("E-1", _HO, None, ["ai-ready"]) == AIState.NEW
+                  and min(c[2]["startAt"] for c in _j.calls if c[2]["maxResults"] > 1) >= 500))
+_j = _jira_with([])
+_r_checks.append(("an unlabelled needs-input ticket is not treated as a reset",
+                  _j._effective_state("E-1", AIState.NEEDS_INPUT, 0, []) == AIState.NEEDS_INPUT
+                  and _j.calls == []))
+_r_checks.append(("an unreadable changelog keeps the ticket parked",
+                  _jira_with([], RuntimeError("500"))._effective_state(
+                      "E-1", AIState.BLOCKED, 0, []) == AIState.BLOCKED))
+import requests as _requests
+_r_checks.append(("a changelog timeout keeps the ticket parked instead of raising",
+                  _jira_with([], _requests.exceptions.ConnectTimeout("timed out"))._effective_state(
+                      "E-1", AIState.BLOCKED, 0, []) == AIState.BLOCKED))
+_j = _jira_with(_noise(7))
+_j.set_ai_state("E-1", _HO)
+_put = [c for c in _j.calls if c[0] == "PUT" and "properties" in c[1]]
+_j2 = _jira_with(_noise(7))
+_j2.set_ai_state("E-1", AIState.NEEDS_INPUT)
+_put2 = [c for c in _j2.calls if c[0] == "PUT" and "properties" in c[1]]
+_r_checks.append(("parking records the changelog length; other states do not read it",
+                  _put[0][3] == {"state": "human-only", "history": 7}
+                  and _put2[0][3] == {"state": "needs-input"}
+                  and not any(c[1].endswith("/changelog") for c in _j2.calls)))
+# A sibling's progress republishes the same park: the mark must not move.
+_j4 = _jira_with(_noise(9))
+_inner4 = _j4._req
+def _already_parked(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "blocked", "history": 4}}
+    if method == "GET" and path.endswith("/E-1"):
+        return {"fields": {"labels": ["ai-ready", "ai:blocked"]}}
+    return _inner4(method, path, params=params, json=json)
+_j4._req = _already_parked
+_j4.set_ai_state("E-1", AIState.BLOCKED)
+_j5 = _jira_with(_noise(9))
+_inner5 = _j5._req
+def _was_human_only(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "human-only", "history": 4}}
+    return _inner5(method, path, params=params, json=json)
+_j5._req = _was_human_only
+_j5.set_ai_state("E-1", AIState.BLOCKED)
+_j6 = _jira_with(_noise(9))
+_inner6 = _j6._req
+def _legacy_parked(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "blocked"}}
+    if method == "GET" and path.endswith("/E-1"):
+        return {"fields": {"labels": ["ai:blocked"]}}
+    return _inner6(method, path, params=params, json=json)
+_j6._req = _legacy_parked
+_j6.set_ai_state("E-1", AIState.BLOCKED)
+# The reset was consumed and re-triage parks the same state again: the
+# label is gone, so this is a new park, and the old mark must not survive.
+_j7 = _jira_with([_ADD, _DEL] + _noise(3))
+_inner7 = _j7._req
+def _after_reset(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "human-only", "history": 0}}
+    if method == "PUT" and path.endswith("/E-1"):
+        raise RuntimeError("Jira PUT labels -> 500")
+    return _inner7(method, path, params=params, json=json)
+_j7._req = _after_reset
+_raises(lambda: _j7.set_ai_state("E-1", _HO), RuntimeError)
+_new_mark = [c[3] for c in _j7.calls if c[0] == "PUT" and "properties" in c[1]]
+_r_checks.append(("a re-park after a consumed reset takes a fresh mark, so a failed label "
+                  "write cannot reset it again",
+                  _new_mark == [{"state": "human-only", "history": 5}]
+                  and _jira_with([_ADD, _DEL] + _noise(3))._effective_state(
+                      "E-1", _HO, 5, ["ai-ready"]) == _HO))
+_r_checks.append(("refreshing an unmarked park leaves it unmarked",
+                  [c[3] for c in _j6.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "blocked"}]
+                  and not any(c[1].endswith("/changelog") for c in _j6.calls)))
+_r_checks.append(("refreshing the same park keeps its mark; a new park takes a new one",
+                  [c[3] for c in _j4.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "blocked", "history": 4}]
+                  and [c[3] for c in _j5.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "blocked", "history": 9}]))
+_j3 = _jira_with([])
+_inner3 = _j3._req
+def _changelog_down(method, path, params=None, json=None):
+    if path.endswith("/changelog"):
+        raise _requests.exceptions.ReadTimeout("timed out")
+    return _inner3(method, path, params=params, json=json)
+_j3._req = _changelog_down
+_j3.set_ai_state("E-1", _HO)
+_r_checks.append(("a park still writes its state when the changelog length is unavailable",
+                  [c[3] for c in _j3.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "human-only"}]))
+from runner.pipeline import _parked_state
+_r_checks.append(("the reset hint names the ticket's parked state, not a sibling's new",
+                  _parked_state([{"state": "new"}, {"state": "blocked"}]) == AIState.BLOCKED
+                  and _parked_state([{"state": "human-only"}, {"state": "blocked"}])
+                  == AIState.BLOCKED
+                  and _parked_state([{"state": "new"}, {"state": "human-only"}]) == _HO))
+_r_checks.append(("bot comments name an action a person can take in each provider",
+                  _jira_with([]).reset_hint(_HO) == "remove the `ai:human-only` label"
+                  and FakeProvider([]).reset_hint(_HO) == "set AI State back to `new`"))
+_deny, _ = _tr.triage(FakeAgent("execute"), mk("E-2", "Run the migration", "on prod"), [], [],
+                      {}, reset_hint="remove the `ai:human-only` label")
+_r_checks.append(("the denylist verdict tells the human the provider's reset step",
+                  _deny.decision == "human_only"
+                  and any("remove the `ai:human-only` label" in h for h in _deny.hints)))
+
+for label, ok in _r_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 

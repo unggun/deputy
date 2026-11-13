@@ -70,7 +70,9 @@ stateDiagram-v2
 | `done` | PR merged |
 
 **Starting over.** Setting AI State back to `new` on a `human-only` or
-`blocked` ticket makes the runner re-triage it from scratch on the next run. It
+`blocked` ticket makes the runner re-triage it from scratch on the next run.
+On Jira, where AI State lives in an issue property that has no editor, the
+same reset is removing the `ai:human-only` or `ai:blocked` label. It
 refuses (and says so, once) while a branch from the earlier attempt still
 exists locally or on GitHub — delete it first. A ticket that is mid-flight on
 this machine is never restarted by a remote `new`.
@@ -943,6 +945,7 @@ picked up will not strand it — add `no-ai` or unassign it to stop one mid-flig
 - The denylist in `runner/triage.py` overrides the model. Nothing touching prod
   data, migrations, auth, payments, secrets or infra reaches the agent.
   The only way past it is a human: add the `policy.override_tag` tag
-  (default `ai-override`; a label on Jira) and set AI State back to `new`. The
+  (default `ai-override`; a label on Jira) and set AI State back to `new`
+  (on Jira: remove the `ai:human-only` label). The
   denylist is then skipped for that ticket only, the model still judges it, and
   the plan always waits for approval whatever its scope.
