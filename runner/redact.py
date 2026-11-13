@@ -47,6 +47,8 @@ KNOWN: tuple[tuple[Pattern[str], str], ...] = (
     # Atlassian API tokens (Jira) and ClickUp personal tokens.
     (re.compile(r"\bATATT[A-Za-z0-9_\-=]{20,}"), PLACEHOLDER),
     (re.compile(r"\bpk_\d+_[A-Za-z0-9]{20,}"), PLACEHOLDER),
+    # Pulse MCP credentials: access, refresh and personal access tokens.
+    (re.compile(r"\bpls_(?:at|rt|pat)_[A-Za-z0-9_\-]{20,}"), PLACEHOLDER),
     # Authorization: Bearer xxx / token xxx, as echoed by curl -v and by the
     # `gh` CLI in debug mode.
     (re.compile(r"(?i)\b((?:authorization\s*:\s*)?(?:bearer|token)\s+)"

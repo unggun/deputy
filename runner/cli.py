@@ -15,6 +15,8 @@ from .agents.claude_code import ClaudeCodeAgent
 from .config import Config
 from .models import AgentResult, AIState
 from .pipeline import Pipeline, _work_prompt, limits_exceeded
+from .providers.base import ProviderAuthError
+from .redact import redact
 from .state import Store
 
 BOT_MARKER_DEFAULT = "<!-- ai-runner -->"
@@ -150,8 +152,9 @@ def _doctor(cfg: Config) -> int:
     for src in cfg.sources():
         try:
             p = providers.build(src.provider, marker)
+            me = p.whoami()
             log.info("source %-16s %-8s OK, acting as %s",
-                     src.key, src.provider_type, p.whoami())
+                     src.key, src.provider_type, getattr(p, "identity", None) or me)
         except Exception as exc:  # noqa: BLE001
             problems.append(f"source {src.key}: {exc}")
         for repo in src.repos:
@@ -895,6 +898,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "status":
         store = Store(cfg.get("runner.db_path", "~/.deputy/state.db"))
+        for h in store.source_auth_errors():
+            since = dt.datetime.fromtimestamp(h["since"]).strftime("%d %b %H:%M")
+            print(f"{h['source']:<16} SOURCE DOWN since {since}: {h['last_error']}")
         rows = store.in_flight()
         if not rows:
             print("nothing in flight")
@@ -930,9 +936,21 @@ def main(argv: list[str] | None = None) -> int:
         for pipe in pipes:
             try:
                 pipe.tick(dt.datetime.now())
+            except ProviderAuthError as exc:
+                # The credential was refused: nothing in this source can work
+                # until a human replaces it, so no retry and no traceback.
+                # `deputy status` shows it until the next clean tick.
+                log.error("source %s: %s", pipe.source.key, redact(str(exc)))
+                pipe.store.set_source_auth_error(pipe.source.key, redact(str(exc)))
+                continue
             except Exception:  # noqa: BLE001
                 # One broken workspace must never stop the others.
                 log.exception("source %s failed", pipe.source.key)
+                continue
+            # Clear only once the credential was actually accepted: a tick
+            # outside the working window calls nothing and proves nothing.
+            if getattr(pipe.provider, "authenticated", False):
+                pipe.store.set_source_auth_error(pipe.source.key, None)
 
     if args.cmd == "run":
         _tick_all()

@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS posted_comments (
     task_id TEXT,
     ts INTEGER
 );
+-- A source whose credential the task manager refused (ProviderAuthError).
+-- One row per failing source, deleted on its next clean tick. Not the
+-- `events` ledger: that is per-ticket history, and a refused token is a fact
+-- about the source that should disappear once it is fixed.
+CREATE TABLE IF NOT EXISTS source_health (
+    source     TEXT PRIMARY KEY,
+    last_error TEXT NOT NULL,
+    since      INTEGER NOT NULL,
+    ts         INTEGER NOT NULL
+);
 """
 
 
@@ -299,6 +309,28 @@ class Store:
             (task_id,),
         )
         self.conn.commit()
+
+    # --- source health ------------------------------------------------
+    def set_source_auth_error(self, source: str, error: str | None) -> None:
+        """Record (or, with None, clear) a refused credential for `source`.
+
+        `since` keeps the first failure's time across ticks, so status can say
+        how long a source has been dark rather than when it last tried.
+        """
+        if error is None:
+            self.conn.execute("DELETE FROM source_health WHERE source = ?", (source,))
+        else:
+            now = _now()
+            self.conn.execute(
+                "INSERT INTO source_health (source, last_error, since, ts)"
+                " VALUES (?,?,?,?) ON CONFLICT(source) DO UPDATE SET"
+                " last_error = excluded.last_error, ts = excluded.ts",
+                (source, error[:1000], now, now))
+        self.conn.commit()
+
+    def source_auth_errors(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM source_health ORDER BY source")]
 
     # --- accounting ---------------------------------------------------
     def record(self, kind: str, task_id: str | None = None,

@@ -7,6 +7,15 @@ from typing import Any
 from ..models import AIState, Comment, Task
 
 
+class ProviderAuthError(RuntimeError):
+    """The task manager refused our credential (revoked, expired, deactivated).
+
+    Raised instead of a plain RuntimeError so the tick can fail the whole
+    source at once, record it for `deputy status`, and never retry: every
+    other call this tick would be refused the same way.
+    """
+
+
 class TaskProvider(ABC):
     @abstractmethod
     def whoami(self) -> str:

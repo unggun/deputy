@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`deputy` — a resumable bridge between a task manager (ClickUp / Jira) and a
+`deputy` — a resumable bridge between a task manager (ClickUp / Jira / Pulse) and a
 coding agent (Claude Code). It picks up tickets assigned to the developer, triages
 them, plans, writes code in an isolated worktree, opens a draft PR, and follows the
 PR through CI/review until merge.
@@ -17,7 +17,8 @@ runner/
   analyst.py  review.py  brain.py  jsonio.py  redact.py  scorers.py  improve.py  bench.py
   bench_impl.py
   agents/    __init__.py  base.py (CodingAgent)   claude_code.py
-  providers/ __init__.py  base.py (TaskProvider)  clickup.py  jira.py
+  providers/ __init__.py  base.py (TaskProvider, ProviderAuthError)  clickup.py  jira.py
+             pulse.py (Pulse Task Spaces over Pulse's MCP server; plain JSON-RPC, no LLM)
   web/       __init__.py  api.py  db.py  logs.py  static/ (committed build output)
 web/           frontend source (Vite + React); `npm run build` writes into runner/web/static/
 examples/scorers/  starter rubric files; copied into `runner.scorers_dir` by hand

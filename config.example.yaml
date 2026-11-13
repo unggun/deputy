@@ -239,6 +239,46 @@ sources:
         base_branch: main
         test: "npm test"
 
+  # Pulse Task Spaces, over Pulse's MCP server (plain JSON-RPC, no LLM).
+  # Token: Pulse → User Settings → AI Clients → Personal access tokens, with
+  # "Read and write" access. State: create a GLOBAL dropdown custom field
+  # (Settings → Spaces), e.g. "AI State", with one option per state below, then
+  # paste the field id and option ids. The container is the Pulse SPACE.
+  - key: pulse
+    enabled: false
+    provider:
+      type: pulse
+      base_url: https://api.pulse.example.com   # API origin; /mcp is appended
+      web_url: https://pulse.example.com         # task links, until Pulse returns `url`
+      token: ${PULSE_TOKEN}
+      # user_id: "<your Pulse user uuid>"        # only until Pulse ships `get_me`
+      # spaces: ["<space-uuid>"]                 # omit to search every Space you can see
+      ready_status: "To Do"                      # + assigned-to-me, applied automatically
+      in_progress_status: "In Progress"
+      review_status: "Code Review"
+      done_status: "Done"
+      skip_tags: ["no-ai"]
+      state_field_id: "<custom-field-uuid>"
+      state_field_options:                       # REQUIRED for every state
+        new:         "<option-id>"
+        needs-input: "<option-id>"
+        human-only:  "<option-id>"
+        plan-review: "<option-id>"
+        planning:    "<option-id>"
+        queued:      "<option-id>"
+        in-progress: "<option-id>"
+        review:      "<option-id>"
+        pr-open:     "<option-id>"
+        blocked:     "<option-id>"
+        done:        "<option-id>"
+    repos:
+      - key: virtual-office
+        containers: ["<space-uuid>"]             # Pulse Space ids; or container_names: ["Pulse"]
+        vcs_profile: work
+        path: ~/code/Virtual-Office
+        remote: git@github.com:Digital-Envision/Virtual-Office.git
+        base_branch: main
+
   # A Jira client. State lives in an issue entity property (no Jira admin
   # required); only needs-input / human-only / plan-review / blocked get a label.
   - key: acme
