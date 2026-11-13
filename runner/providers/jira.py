@@ -148,12 +148,13 @@ class JiraProvider(TaskProvider):
         # after this point can count as a human's reset (`_effective_state`).
         prop: dict[str, Any] = {"state": state.value}
         if state in RESETTABLE:
-            # A refresh of the same park keeps its mark: a multi-repo ticket
-            # republishes `blocked` whenever a sibling advances, and moving
-            # the mark past the label's addition would hide a later removal.
+            # A refresh of the same park keeps its mark -- or its lack of
+            # one: a multi-repo ticket republishes `blocked` whenever a
+            # sibling advances, and a mark placed after the label's addition
+            # would hide a later removal. An unmarked park stays unmarked and
+            # keeps the legacy rule (a removal alone counts).
             current, mark = self._read_state(task_id)
-            history = mark if current == state and mark is not None \
-                else self._history_length(task_id)
+            history = mark if current == state else self._history_length(task_id)
             if history is not None:
                 prop["history"] = history
         self._req("PUT", f"/rest/api/3/issue/{task_id}/properties/{PROPERTY_KEY}",

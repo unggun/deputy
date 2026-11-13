@@ -5592,6 +5592,18 @@ def _was_human_only(method, path, params=None, json=None):
     return _inner5(method, path, params=params, json=json)
 _j5._req = _was_human_only
 _j5.set_ai_state("E-1", AIState.BLOCKED)
+_j6 = _jira_with(_noise(9))
+_inner6 = _j6._req
+def _legacy_parked(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "blocked"}}
+    return _inner6(method, path, params=params, json=json)
+_j6._req = _legacy_parked
+_j6.set_ai_state("E-1", AIState.BLOCKED)
+_r_checks.append(("refreshing an unmarked park leaves it unmarked",
+                  [c[3] for c in _j6.calls if c[0] == "PUT" and "properties" in c[1]]
+                  == [{"state": "blocked"}]
+                  and not any(c[1].endswith("/changelog") for c in _j6.calls)))
 _r_checks.append(("refreshing the same park keeps its mark; a new park takes a new one",
                   [c[3] for c in _j4.calls if c[0] == "PUT" and "properties" in c[1]]
                   == [{"state": "blocked", "history": 4}]
