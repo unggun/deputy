@@ -2,9 +2,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Iterable
 
 from ..models import AIState, Comment, Task
+
+
+class ProviderAuthError(RuntimeError):
+    """The task manager refused our credential (revoked, expired, deactivated).
+
+    Raised instead of a plain RuntimeError so the tick can fail the whole
+    source at once, record it for `deputy status`, and never retry: every
+    other call this tick would be refused the same way.
+    """
 
 
 class TaskProvider(ABC):
@@ -13,8 +22,13 @@ class TaskProvider(ABC):
         """Return the provider user id the runner acts as."""
 
     @abstractmethod
-    def fetch_candidates(self) -> list[Task]:
-        """Tasks assigned to me, in the configured 'ready' status."""
+    def fetch_candidates(self) -> Iterable[Task]:
+        """Tasks assigned to me, in the configured 'ready' status.
+
+        May be a generator: the pipeline stops iterating at its per-run cap,
+        so a provider that must read each candidate separately reads only
+        the ones triage reaches.
+        """
 
     @abstractmethod
     def get_task(self, task_id: str) -> Task:
@@ -35,6 +49,13 @@ class TaskProvider(ABC):
     @abstractmethod
     def set_status(self, task_id: str, status: str) -> None:
         ...
+
+    # Optional. Called once at the start of every tick, before any row is
+    # touched. Raise ProviderAuthError if the credential is refused, so the
+    # tick fails before it spends a retry, claims a comment or commits a state
+    # it cannot push. Providers without a cheap check leave this a no-op.
+    def check_auth(self) -> None:
+        return None
 
     # Optional. The ticket identifier that goes into the branch name. Override
     # when the provider's integration only recognises the id in a decorated

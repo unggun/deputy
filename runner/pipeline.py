@@ -15,7 +15,7 @@ from .config import Config, Source
 from .jsonio import StationError
 from .models import (AIState, AnalysisResult, ReviewResult, Spend, Task, TriageResult,
                      agent_log_name, run_station)
-from .providers.base import TaskProvider
+from .providers.base import ProviderAuthError, TaskProvider
 from .redact import redact
 from .state import Store
 from .triage import triage
@@ -165,10 +165,17 @@ class Pipeline:
             log.warning("%s; nothing to do", reason)
             return
 
+        # 0. A refused credential fails the source HERE, before step 1 can
+        #    consume a station's pending marker (and count a crash), claim a
+        #    comment, or save a state the provider then refuses to push.
+        self.provider.check_auth()
+
         # 1. Advance work already in flight (cheap first).
         for row in self.store.in_flight(source=self.source.key):
             try:
                 self._advance(row, now, windows)
+            except ProviderAuthError:
+                raise   # the whole source is dark; leave every row as it is
             except Exception as exc:  # noqa: BLE001
                 log.exception("advance failed for %s", row["task_id"])
                 self.store.upsert(row["task_id"],
@@ -224,6 +231,8 @@ class Pipeline:
                               provider_updated_at=task.updated_at)
             try:
                 self._do_triage(task)
+            except ProviderAuthError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("triage failed for %s", task.key)
                 self.store.upsert(row_id, last_error=self._clean(str(exc))[:1000])
@@ -534,6 +543,8 @@ class Pipeline:
             try:
                 clear = graph.blockers_clear(
                     self.provider.blocked_by(row["provider_task_id"]))
+            except ProviderAuthError:
+                raise   # not "no dependencies": nothing else will work either
             except Exception:  # noqa: BLE001
                 clear = graph.Gate(True)   # never let a dependency read stop work
             if not clear.ok:
@@ -1318,10 +1329,19 @@ class Pipeline:
         carry agent output, `git` stderr and `gh` stderr verbatim, and a
         ticket comment is permanent and visible to the whole workspace.
         """
-        if not self.store.claim_comment(f"{rid}:{key}", rid):
+        claim = f"{rid}:{key}"
+        if not self.store.claim_comment(claim, rid):
             return
         body = self._clean(markdown)
-        self.provider.add_comment(self._pid(rid), f"{self._repo_tag(rid)}{body}")
+        try:
+            self.provider.add_comment(self._pid(rid), f"{self._repo_tag(rid)}{body}")
+        except ProviderAuthError:
+            # The provider refused the credential, so the comment certainly
+            # was not posted. Release the claim so it goes out once the token
+            # is replaced. Any other failure keeps the claim: the comment may
+            # have landed, and at-most-once wins over at-least-once.
+            self.store.release_comment(claim)
+            raise
 
     def _escalate(self, rid: str, reason: str) -> None:
         reason = self._clean(reason)

@@ -41,6 +41,26 @@ def _expand(value: Any, *, require_env: bool = True) -> Any:
     return value
 
 
+def _expand_config(raw: Any, *, require_env: bool = True) -> Any:
+    """`_expand` the whole file, but never demand env vars for a disabled source.
+
+    A source switched off with `enabled: false` is never built, so requiring
+    its token would make every command fail for a provider nobody uses -- the
+    example config ships disabled Pulse and second-ClickUp sources. Their
+    unset references stay as the literal `${VAR}`, as under `serve`.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("sources"), list):
+        return _expand(raw, require_env=require_env)
+    out = _expand({k: v for k, v in raw.items() if k != "sources"},
+                  require_env=require_env)
+    out["sources"] = [
+        _expand(src, require_env=require_env and not (
+            isinstance(src, dict) and src.get("enabled") is False))
+        for src in raw["sources"]
+    ]
+    return out
+
+
 @dataclass
 class Source:
     """One task-manager workspace and the repos that belong to it."""
@@ -92,7 +112,7 @@ class Config:
         p = Path(path).expanduser()
         with p.open("r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
-        cfg = cls(_expand(raw, require_env=require_env), p)
+        cfg = cls(_expand_config(raw, require_env=require_env), p)
         cfg.validate()
         return cfg
 
