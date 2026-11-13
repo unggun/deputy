@@ -59,6 +59,11 @@ runner:
     daily_tokens: 0
     brain_max_bytes: 8000    # per-repo note file cap; at the cap appends are
                              # refused and logged, never silently evicted
+    # Ticket images (png/jpeg/gif/webp) are downloaded to {log_dir}/attachments/
+    # for the analyst and implementer to open with Read. Triage cannot see
+    # them; it is told they exist. 0 turns downloads off.
+    max_attachments: 10
+    attachment_max_bytes: 5000000
     # Judge runs per tick, across all scorers, and how far back to look for
     # runs not yet judged. Each judge is one tool-less turn on the scorer's
     # model, counted against both daily limits like any other agent run.
@@ -159,6 +164,10 @@ policy:
   min_execute_confidence: 0.75
   block_large_scope: true
   require_plan_approval_from_scope: m   # xs/s go straight through; m/l need a human OK
+  # A ticket with an image attachment is planned and approved at any scope:
+  # the denylist cannot read an image, and triage's plan was written blind
+  # to it. Planning is the first station that sees it.
+  plan_tickets_with_images: true
   approval_keywords: ["approved", "go ahead", "lgtm", "proceed"]
   rejection_keywords: ["no", "stop", "hold", "wait", "don't"]
   # denylist_patterns: [...]  # omit to use the built-in defaults in triage.py

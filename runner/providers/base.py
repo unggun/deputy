@@ -1,10 +1,13 @@
 """Task-manager abstraction. Implement this to add Jira / Linear / Asana."""
 from __future__ import annotations
 
+import os
+import tempfile
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Iterable
 
-from ..models import AIState, Comment, Task
+from ..models import AIState, Attachment, Comment, Task
 
 
 class ProviderAuthError(RuntimeError):
@@ -67,3 +70,38 @@ class TaskProvider(ABC):
     # Return [{"key": str, "closed": bool}, ...] for tickets this one waits on.
     def blocked_by(self, task_id: str) -> list[dict[str, Any]]:
         return []
+
+    def download_attachment(self, task: Task, attachment: Attachment,
+                            dest: Path, max_bytes: int) -> None:
+        """Write one of `task.attachments` to `dest`, refusing past `max_bytes`.
+
+        Raise on any failure; the caller logs it and goes on without that
+        file. Only called for attachments the provider itself put on the
+        Task, so a provider that lists none never needs to implement it.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot download attachments")
+
+
+def write_capped(chunks: Iterable[bytes], dest: Path, max_bytes: int) -> None:
+    """Stream `chunks` into `dest`, all or nothing.
+
+    Written to a temporary sibling and renamed, so an interrupted or
+    oversized download never leaves a truncated image that the next run
+    would mistake for the real one and hand to the agent. The temporary
+    file is unique per call: two repos' rows on one ticket share the
+    attachment folder and may download the same image at once.
+    """
+    fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".part",
+                                dir=dest.parent)
+    tmp = Path(name)
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            for chunk in chunks:
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValueError(f"over the {max_bytes} byte attachment cap")
+                fh.write(chunk)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)

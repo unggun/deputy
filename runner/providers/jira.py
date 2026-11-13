@@ -12,13 +12,14 @@ Design notes:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import requests
 from requests.auth import HTTPBasicAuth
 
-from ..models import AIState, Comment, Task
-from .base import TaskProvider
+from ..models import AIState, Attachment, Comment, Task
+from .base import TaskProvider, write_capped
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ PROPERTY_KEY = "ai-runner-state"
 # Only these get a visible label; the rest are runner-internal.
 HUMAN_VISIBLE = {AIState.NEEDS_INPUT, AIState.HUMAN_ONLY,
                  AIState.AWAITING_PLAN_OK, AIState.BLOCKED}
-FIELDS = "summary,description,status,labels,assignee,project,updated,issuelinks"
+FIELDS = "summary,description,status,labels,assignee,project,updated,issuelinks,attachment"
 
 
 class JiraProvider(TaskProvider):
@@ -183,6 +184,23 @@ class JiraProvider(TaskProvider):
                         "closed": category == "done"})
         return out
 
+    # --- attachments --------------------------------------------------
+    def download_attachment(self, task: Task, attachment: Attachment,
+                            dest: Path, max_bytes: int) -> None:
+        # The URL is built from the configured site, never taken from the
+        # payload's `content` field, so the Basic-auth credential only ever
+        # goes to `self.base`. Jira answers with a redirect to its media host;
+        # requests drops Authorization on a cross-host redirect, and the
+        # redirect carries its own short-lived token.
+        if not attachment.id.isdigit():
+            raise ValueError(f"unexpected Jira attachment id {attachment.id!r}")
+        url = f"{self.base}/rest/api/3/attachment/content/{attachment.id}"
+        with self.s.get(url, stream=True, timeout=30,
+                        headers={"Accept": "*/*"}) as r:
+            if r.status_code >= 400:
+                raise RuntimeError(f"Jira GET attachment {attachment.id} -> {r.status_code}")
+            write_capped(r.iter_content(64 * 1024), dest, max_bytes)
+
     # --- mapping ------------------------------------------------------
     def _to_task(self, issue: dict[str, Any]) -> Task:
         f = issue.get("fields") or {}
@@ -202,6 +220,8 @@ class JiraProvider(TaskProvider):
             updated_at=_epoch_ms(f.get("updated")),
             ai_state=self._read_state(key),
             raw=issue,
+            attachments=[_attachment(a) for a in f.get("attachment") or []
+                         if isinstance(a, dict) and a.get("id")],
         )
 
     def _read_state(self, key: str) -> AIState:
@@ -225,6 +245,29 @@ def _epoch_ms(value: Any) -> int:
         return 0
 
 
+def _attachment(a: dict[str, Any]) -> Attachment:
+    try:
+        size = int(a.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return Attachment(id=str(a["id"]), filename=str(a.get("filename") or a["id"]),
+                      mime=str(a.get("mimeType") or ""), size=size)
+
+
+def _media_ref(node: dict[str, Any], kind: str) -> str:
+    """A marker where an embedded file was, so its absence is not invisible.
+
+    ADF media nodes carry no text, only attrs. Dropping them made a pasted
+    screenshot vanish without trace, and the model then told the reporter
+    that the image they had attached was missing.
+    """
+    attrs = node.get("attrs") or {}
+    if attrs.get("type") == "external" and attrs.get("url"):
+        return f"[{kind}: {attrs['url']}]"
+    name = str(attrs.get("alt") or "").strip()
+    return f"[{kind}: {name}]" if name else f"[{kind} attached]"
+
+
 def _flatten_adf(node: Any) -> str:
     """Atlassian Document Format -> plain text, good enough for a prompt."""
     if node is None:
@@ -234,8 +277,19 @@ def _flatten_adf(node: Any) -> str:
     if isinstance(node, list):
         return "\n".join(_flatten_adf(n) for n in node)
     if isinstance(node, dict):
-        if node.get("type") == "text":
+        kind = node.get("type")
+        if kind == "text":
             return str(node.get("text", ""))
+        # mediaSingle wraps one embedded image; mediaGroup and mediaInline
+        # are file cards, which may be any type.
+        if kind == "media":
+            return _media_ref(node, "image")
+        if kind == "mediaInline":
+            return _media_ref(node, "attachment")
+        if kind == "mediaGroup":
+            return "\n".join(_media_ref(n, "attachment")
+                             for n in node.get("content") or []
+                             if isinstance(n, dict)) + "\n"
         inner = _flatten_adf(node.get("content"))
-        return inner + ("\n" if node.get("type") in ("paragraph", "heading") else "")
+        return inner + ("\n" if kind in ("paragraph", "heading", "mediaSingle") else "")
     return ""

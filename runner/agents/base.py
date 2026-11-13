@@ -23,8 +23,14 @@ class CodingAgent(ABC):
     def work(self, prompt: str, cwd: Path, *,
              log_path: Path | None = None,
              model: str | None = None,
-             allowed_tools: list[str] | None = None) -> AgentResult:
+             allowed_tools: list[str] | None = None,
+             add_dirs: list[Path] | None = None) -> AgentResult:
         """Full agentic run inside `cwd`. May edit files and run commands.
+
+        `add_dirs` are extra directories the run may read outside `cwd` --
+        the ticket's downloaded images, kept out of the worktree so they
+        cannot be committed. Stations pass it only when there is one, so an
+        adapter that predates it keeps working on tickets without images.
 
         `model` and `allowed_tools` override the configured defaults for this
         one call. That is what lets a single agent serve the implementer, the
