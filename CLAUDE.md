@@ -419,8 +419,11 @@ other's note while both report success.
   "Added" is scoped to the current park: a park stores the changelog length
   as `history` in the property and only entries from there count, or an
   earlier reset's removal would reset a later park whose label write failed.
-  Re-publishing the *same* parked state (a multi-repo sibling advancing)
-  keeps the old mark (or its absence), or the label's addition falls before it. A property
+  Re-publishing the *same* parked state with its label still on the ticket
+  (a multi-repo sibling advancing) keeps the old mark (or its absence), or
+  the label's addition falls before it. With the label gone it is a new park
+  after a reset already acted on, and it takes a fresh mark: reusing the old
+  one would let that consumed removal reset it again if the label write fails. A property
   with no mark reads the latest 1000 entries and accepts a removal alone,
   since its addition may predate the window. Changelog errors of any kind,
   `requests` transport errors included, leave the ticket parked.

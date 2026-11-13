@@ -146,23 +146,26 @@ class JiraProvider(TaskProvider):
         # Authoritative machine state. A parked state also records how long
         # the changelog was when it parked, so only a label removal made
         # after this point can count as a human's reset (`_effective_state`).
+        current = self._req("GET", f"/rest/api/3/issue/{task_id}",
+                            params={"fields": "labels"})
+        existing = (current.get("fields") or {}).get("labels", [])
         prop: dict[str, Any] = {"state": state.value}
         if state in RESETTABLE:
-            # A refresh of the same park keeps its mark -- or its lack of
-            # one: a multi-repo ticket republishes `blocked` whenever a
-            # sibling advances, and a mark placed after the label's addition
-            # would hide a later removal. An unmarked park stays unmarked and
-            # keeps the legacy rule (a removal alone counts).
-            current, mark = self._read_state(task_id)
-            history = mark if current == state else self._history_length(task_id)
+            # Only a refresh keeps the old mark -- or its lack of one: the
+            # same parked state with its label still on the ticket, as when
+            # a multi-repo sibling advances and `blocked` is republished. A
+            # mark placed after the label's addition would hide a later
+            # removal. With the label gone this is a new park after a reset
+            # the runner already acted on; reusing that mark would let the
+            # consumed removal reset it again if this label write fails.
+            was, mark = self._read_state(task_id)
+            refresh = was == state and f"ai:{state.value}" in existing
+            history = mark if refresh else self._history_length(task_id)
             if history is not None:
                 prop["history"] = history
         self._req("PUT", f"/rest/api/3/issue/{task_id}/properties/{PROPERTY_KEY}",
                   json=prop)
         # Human-visible mirror, one label at most.
-        current = self._req("GET", f"/rest/api/3/issue/{task_id}",
-                            params={"fields": "labels"})
-        existing = (current.get("fields") or {}).get("labels", [])
         updates = [{"remove": lb} for lb in existing if lb.startswith("ai:")]
         if state in HUMAN_VISIBLE:
             want = f"ai:{state.value}"

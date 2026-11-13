@@ -5581,6 +5581,8 @@ _inner4 = _j4._req
 def _already_parked(method, path, params=None, json=None):
     if method == "GET" and "properties" in path:
         return {"value": {"state": "blocked", "history": 4}}
+    if method == "GET" and path.endswith("/E-1"):
+        return {"fields": {"labels": ["ai-ready", "ai:blocked"]}}
     return _inner4(method, path, params=params, json=json)
 _j4._req = _already_parked
 _j4.set_ai_state("E-1", AIState.BLOCKED)
@@ -5597,9 +5599,29 @@ _inner6 = _j6._req
 def _legacy_parked(method, path, params=None, json=None):
     if method == "GET" and "properties" in path:
         return {"value": {"state": "blocked"}}
+    if method == "GET" and path.endswith("/E-1"):
+        return {"fields": {"labels": ["ai:blocked"]}}
     return _inner6(method, path, params=params, json=json)
 _j6._req = _legacy_parked
 _j6.set_ai_state("E-1", AIState.BLOCKED)
+# The reset was consumed and re-triage parks the same state again: the
+# label is gone, so this is a new park, and the old mark must not survive.
+_j7 = _jira_with([_ADD, _DEL] + _noise(3))
+_inner7 = _j7._req
+def _after_reset(method, path, params=None, json=None):
+    if method == "GET" and "properties" in path:
+        return {"value": {"state": "human-only", "history": 0}}
+    if method == "PUT" and path.endswith("/E-1"):
+        raise RuntimeError("Jira PUT labels -> 500")
+    return _inner7(method, path, params=params, json=json)
+_j7._req = _after_reset
+_raises(lambda: _j7.set_ai_state("E-1", _HO), RuntimeError)
+_new_mark = [c[3] for c in _j7.calls if c[0] == "PUT" and "properties" in c[1]]
+_r_checks.append(("a re-park after a consumed reset takes a fresh mark, so a failed label "
+                  "write cannot reset it again",
+                  _new_mark == [{"state": "human-only", "history": 5}]
+                  and _jira_with([_ADD, _DEL] + _noise(3))._effective_state(
+                      "E-1", _HO, 5, ["ai-ready"]) == _HO))
 _r_checks.append(("refreshing an unmarked park leaves it unmarked",
                   [c[3] for c in _j6.calls if c[0] == "PUT" and "properties" in c[1]]
                   == [{"state": "blocked"}]
@@ -5620,6 +5642,12 @@ _j3.set_ai_state("E-1", _HO)
 _r_checks.append(("a park still writes its state when the changelog length is unavailable",
                   [c[3] for c in _j3.calls if c[0] == "PUT" and "properties" in c[1]]
                   == [{"state": "human-only"}]))
+from runner.pipeline import _parked_state
+_r_checks.append(("the reset hint names the ticket's parked state, not a sibling's new",
+                  _parked_state([{"state": "new"}, {"state": "blocked"}]) == AIState.BLOCKED
+                  and _parked_state([{"state": "human-only"}, {"state": "blocked"}])
+                  == AIState.BLOCKED
+                  and _parked_state([{"state": "new"}, {"state": "human-only"}]) == _HO))
 _r_checks.append(("bot comments name an action a person can take in each provider",
                   _jira_with([]).reset_hint(_HO) == "remove the `ai:human-only` label"
                   and FakeProvider([]).reset_hint(_HO) == "set AI State back to `new`"))

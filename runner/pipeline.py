@@ -317,7 +317,7 @@ class Pipeline:
                 f"An earlier attempt still has a branch:\n{steps}\n\n"
                 f"Delete it locally and on GitHub (remove its worktree under "
                 f"`{self.work_root}` first), then "
-                f"{self.provider.reset_hint(AIState(owned[0][0]['state']))} again.")
+                f"{self.provider.reset_hint(_parked_state(rows))} again.")
             return False
         for r in rows:
             self.store.forget_comments(r["task_id"])
@@ -1490,6 +1490,17 @@ def _fmt_analysis(r: AnalysisResult, shadow: bool) -> str:
             f"{r.problem}\n\n**Approach**\n{r.approach}\n\n"
             f"**Steps**\n{steps}\n\n**Acceptance criteria**\n{ac}\n\n"
             f"**Files I expect to touch**\n{files}\n\n**Risks**\n{risks}{tail}")
+
+
+def _parked_state(rows: list[dict[str, Any]]) -> AIState:
+    """The parked state the ticket shows, ranked as `_remote_state` ranks it.
+
+    A reset hint names this one: a sibling row back at `new` is not what the
+    ticket's field (or, on Jira, its label) says.
+    """
+    states = {r.get("state") for r in rows}
+    return next((s for s in (AIState.BLOCKED, AIState.HUMAN_ONLY) if s.value in states),
+                AIState.HUMAN_ONLY)
 
 
 def _safe_name(text: str, limit: int = 120) -> str:
