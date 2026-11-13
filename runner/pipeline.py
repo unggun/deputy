@@ -165,8 +165,12 @@ class Pipeline:
                       and (not a.size or a.size <= max_bytes)][:max_files]
             if not wanted or max_bytes <= 0:
                 return []
+            # Absolute: `Config.path()` keeps a relative `log_dir` relative to
+            # where the runner was launched, but the agent runs in the
+            # worktree, so a relative path in its prompt and `--add-dir`
+            # would name a directory that is not there.
             folder = (self.log_root / "attachments"
-                      / _safe_name(f"{task.key}__{self.source.key}"))
+                      / _safe_name(f"{task.key}__{self.source.key}")).absolute()
             folder.mkdir(parents=True, exist_ok=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s: attachments skipped: %s", task.key, exc)
@@ -175,7 +179,11 @@ class Pipeline:
         for att in wanted:
             dest = folder / _attachment_file(att)
             try:
-                if not (dest.is_file() and (not att.size or dest.stat().st_size == att.size)):
+                # Reuse only a file that is still within today's cap and, when
+                # the provider says, the listed size: lowering
+                # `attachment_max_bytes` must not keep serving a larger file.
+                have = dest.stat().st_size if dest.is_file() else -1
+                if not (0 <= have <= max_bytes and (not att.size or have == att.size)):
                     self.provider.download_attachment(task, att, dest, max_bytes)
                 out.append(dest)
             except Exception as exc:  # noqa: BLE001
@@ -497,7 +505,12 @@ class Pipeline:
                      len(result.repo_keys), ", ".join(result.repo_keys))
         # An override waived the denylist, the one check the model cannot
         # talk its way past; a human reads the plan before any code instead.
-        if (self.mode == "shadow" or result.policy_override
+        # Images get the same treatment: the denylist scans text only, and
+        # triage, which wrote the plan, could not see them. Planning is the
+        # first station that does, and a human reads its plan.
+        images_gate = (bool(self.policy.get("plan_tickets_with_images", True))
+                       and any(a.is_image for a in task.attachments))
+        if (self.mode == "shadow" or result.policy_override or images_gate
                 or order.get(result.scope, 2) >= order.get(gate, 2)):
             # Mark this as a fresh entry into PLANNING so the arm below does
             # not mistake a healthy first run for a crash recovery. Each repo

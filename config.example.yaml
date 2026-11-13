@@ -164,6 +164,10 @@ policy:
   min_execute_confidence: 0.75
   block_large_scope: true
   require_plan_approval_from_scope: m   # xs/s go straight through; m/l need a human OK
+  # A ticket with an image attachment is planned and approved at any scope:
+  # the denylist cannot read an image, and triage's plan was written blind
+  # to it. Planning is the first station that sees it.
+  plan_tickets_with_images: true
   approval_keywords: ["approved", "go ahead", "lgtm", "proceed"]
   rejection_keywords: ["no", "stop", "hold", "wait", "don't"]
   # denylist_patterns: [...]  # omit to use the built-in defaults in triage.py

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Iterable
@@ -84,14 +85,18 @@ class TaskProvider(ABC):
 def write_capped(chunks: Iterable[bytes], dest: Path, max_bytes: int) -> None:
     """Stream `chunks` into `dest`, all or nothing.
 
-    Written to a sibling `.part` file and renamed, so an interrupted or
+    Written to a temporary sibling and renamed, so an interrupted or
     oversized download never leaves a truncated image that the next run
-    would mistake for the real one and hand to the agent.
+    would mistake for the real one and hand to the agent. The temporary
+    file is unique per call: two repos' rows on one ticket share the
+    attachment folder and may download the same image at once.
     """
-    tmp = dest.with_name(dest.name + ".part")
+    fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".part",
+                                dir=dest.parent)
+    tmp = Path(name)
     written = 0
     try:
-        with open(tmp, "wb") as fh:
+        with os.fdopen(fd, "wb") as fh:
             for chunk in chunks:
                 written += len(chunk)
                 if written > max_bytes:

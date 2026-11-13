@@ -449,12 +449,23 @@ the image they had attached was missing. Three layers now, each easy to undo:
   outside the cwd under `dontAsk`. `add_dirs` is passed only when there are
   images, so an agent adapter or test fake that predates it keeps working.
   The reviewer and fix passes get no images: neither is shown the ticket text.
+  The folder is made **absolute**: `Config.path()` keeps a relative `log_dir`
+  relative to the launch directory, and the agent runs in the worktree.
+- **An image ticket is planned and approved at any scope**
+  (`policy.plan_tickets_with_images`, default on). The denylist scans text
+  only, so an auth change shown only in a screenshot would pass it, and on
+  the direct `queued` route the only plan is triage's, written without seeing
+  the image. Routing to `planning` puts the first station that can see it,
+  and a human, before any code.
 - **Never fails a step.** Like `_measure()`, any download error is logged and
   costs that image. `limits.max_attachments` (default 10, `0` = off) and
   `limits.attachment_max_bytes` (default 5 MB) bound it; `write_capped()`
-  writes via `.part` + rename so an aborted or oversized download never leaves
-  a truncated file that the next run would reuse as if it were whole. A file
-  already present at its listed size is reused.
+  writes to a per-call `mkstemp` file + rename so an aborted or oversized
+  download never leaves a truncated file that the next run would reuse as if
+  it were whole. The temp name is unique because two repos' rows on one ticket
+  share the folder and may fetch the same image at once; a fixed `.part` name
+  let one truncate the other. A cached file is reused only within today's
+  byte cap and, when listed, at its listed size.
 
 `JiraProvider.download_attachment` builds the URL from the configured site and
 a numeric id, never from the payload's `content` link, so the Basic-auth header

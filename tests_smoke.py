@@ -778,14 +778,16 @@ for label, ok in [("reviewer returns an approve verdict", v1),
 # --- planning station -------------------------------------------------------
 print("\nplanning station")
 
-def _plan_case(name, scope, mode, expect_state):
+def _plan_case(name, scope, mode, expect_state, attachments=(), policy=None):
     with tempfile.TemporaryDirectory() as tmp:
         cfg = Config.load("config.example.yaml")
         cfg.data["runner"].update(db_path=f"{tmp}/s.db", work_dir=f"{tmp}/w",
                                   log_dir=f"{tmp}/l", brain_dir=f"{tmp}/b",
                                   mode=mode)
+        cfg.data.setdefault("policy", {}).update(policy or {})
         src = cfg.sources(only=["mycorp"])[0]
         task = mk("T40", "Add CSV export to reports", "button downloads a CSV")
+        task.attachments = list(attachments)
         prov = FakeProvider([task])
         store = Store(f"{tmp}/s.db")
         agent = FakeAgent({"decision": "execute", "confidence": 0.9,
@@ -805,6 +807,15 @@ _plan_case("xs skips planning", "xs", "execute", AIState.QUEUED)
 _row_m = _plan_case("m enters planning", "m", "execute", AIState.PLANNING)
 # shadow always gates, and planning is read-only so it still runs.
 _plan_case("shadow enters planning", "xs", "shadow", AIState.PLANNING)
+# The denylist cannot read an image and triage's plan never saw it.
+from runner.models import Attachment as _PAtt
+_plan_case("xs with an image enters planning", "xs", "execute", AIState.PLANNING,
+           [_PAtt("1", "mock.png", "image/png", 4)])
+_plan_case("xs with only a pdf skips planning", "xs", "execute", AIState.QUEUED,
+           [_PAtt("2", "spec.pdf", "application/pdf", 4)])
+_plan_case("plan_tickets_with_images: false skips planning", "xs", "execute",
+           AIState.QUEUED, [_PAtt("1", "mock.png", "image/png", 4)],
+           {"plan_tickets_with_images": False})
 
 # Triage criteria are persisted, not just commented.
 _meta_ok = "csv downloads" in (_row_m["meta"] or "")
@@ -5375,7 +5386,13 @@ with tempfile.TemporaryDirectory() as _atmp:
     _apipe._ticket_images(_t)
     _a_checks.append(("an image already downloaded at its size is reused",
                       _aprov.fetched == ["10004"]))
-    _apipe.limits = {**_apipe.limits, "max_attachments": 0}
+    _aprov.fetched.clear()
+    _apipe.limits = {**_apipe.limits, "attachment_max_bytes": 3}
+    _apipe._ticket_images(_t)
+    _a_checks.append(("a cached image over a lowered cap is fetched again, not reused",
+                      "10005" in _aprov.fetched))
+    _apipe.limits = {**_apipe.limits, "attachment_max_bytes": 5_000_000,
+                     "max_attachments": 0}
     _a_checks.append(("max_attachments: 0 fetches nothing", _apipe._ticket_images(_t) == []))
 
     class _NoAttProvider(FakeProvider):
@@ -5392,7 +5409,32 @@ with tempfile.TemporaryDirectory() as _atmp:
     _over = _raises(lambda: _write_capped([b"x" * 6, b"x" * 6], _cap, 10), ValueError)
     _a_checks.append(("an oversized download leaves no file behind",
                       bool(_over) and not _cap.exists()
-                      and not _cap.with_name("cap.png.part").exists()))
+                      and not list(Path(_atmp).glob("*.part"))))
+
+    # Two writers on one destination never share a temporary file: the
+    # second opening must not truncate or delete the first one's bytes.
+    _race = Path(_atmp) / "race.png"
+    def _interleaved():
+        yield b"AAAA"
+        _write_capped([b"BBBBBB"], _race, 100)
+        yield b"AAAA"
+    _write_capped(_interleaved(), _race, 100)
+    _a_checks.append(("concurrent downloads of one image each write a whole file",
+                      _race.read_bytes() == b"AAAAAAAA"
+                      and not list(Path(_atmp).glob("*.part"))))
+
+    _rel_cwd = os.getcwd()
+    os.chdir(_atmp)
+    try:
+        _rcfg = Config.load(os.path.join(_rel_cwd, "config.example.yaml"))
+        _rcfg.data["runner"]["log_dir"] = "rel-logs"
+        _rpipe = Pipeline(_rcfg, _rcfg.sources(only=["mycorp"])[0], _AttProvider([_t]),
+                          FakeAgent("execute"), Store(f"{_atmp}/s3.db"))
+        _rimgs = _rpipe._ticket_images(_t)
+    finally:
+        os.chdir(_rel_cwd)
+    _a_checks.append(("a relative log_dir still hands the agent absolute image paths",
+                      bool(_rimgs) and all(p.is_absolute() and p.is_file() for p in _rimgs)))
 
     _wp_txt = _wp(_t, {"test": "t"}, {}, "", _imgs)
     _rp_txt = _rp(_t, {"test": "t"}, {}, {"findings": []}, "", _imgs)
