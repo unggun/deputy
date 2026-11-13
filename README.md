@@ -116,6 +116,8 @@ from what keeps failing in the repo, written only when you run
 |---|---|
 | `runner.brain_dir` | where per-repo brain files live (see above) |
 | `limits.brain_max_bytes` | per-repo brain file size cap |
+| `limits.max_attachments` | ticket images downloaded for the analyst and implementer (default 10; `0` turns downloads off). Jira only for now |
+| `limits.attachment_max_bytes` | per-image cap; larger images are listed but not fetched (default 5000000) |
 | `limits.max_review_cycles` | implementer ↔ reviewer round trips before giving up and asking a human; separate from `max_fix_attempts`, which covers crashes and CI |
 | `agent.reviewer_model` | model for the independent review pass; falls back to `agent.model` |
 | `agent.planner_tools` | tools available to the analyst station; read-only by construction, which is what makes planning safe in `mode: shadow` |

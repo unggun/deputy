@@ -31,6 +31,42 @@ class AIState(str, Enum):
         return self in (AIState.HUMAN_ONLY, AIState.BLOCKED, AIState.DONE)
 
 
+# What the agent's Read tool can show the model. Anything else (a PDF, a
+# BMP, an SVG) would cost a turn on an error, so it is listed but not fetched.
+IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+
+@dataclass
+class Attachment:
+    """A file on the ticket. Metadata only: the bytes are fetched on demand by
+    `TaskProvider.download_attachment`, and only for a station that can look
+    at them (the analyst and the implementer, never tool-less triage)."""
+    id: str
+    filename: str
+    mime: str = ""
+    size: int = 0           # bytes; 0 when the provider does not say
+
+    @property
+    def is_image(self) -> bool:
+        return self.mime.lower() in IMAGE_TYPES
+
+
+def images_prompt_block(paths: list[Any]) -> str:
+    """The prompt section that hands a work() station the downloaded images.
+
+    Empty when there are none, so a ticket without images renders exactly as
+    it did before attachments were fetched at all.
+    """
+    if not paths:
+        return ""
+    lines = "\n".join(f"- {p}" for p in paths)
+    return ("=== TICKET IMAGES ===\n"
+            "These images are attached to the ticket and were downloaded for "
+            "you. The description's [image: ...] markers refer to them. Open "
+            "each one with the Read tool before you plan or change anything.\n"
+            f"{lines}\n")
+
+
 @dataclass
 class Task:
     id: str                 # provider-internal id
@@ -46,8 +82,11 @@ class Task:
     updated_at: int         # epoch ms
     ai_state: AIState = AIState.NEW
     raw: dict[str, Any] = field(default_factory=dict)
+    attachments: list[Attachment] = field(default_factory=list)
 
     def as_prompt_block(self) -> str:
+        files = "".join(f"- {a.filename} ({a.mime or 'unknown type'})\n"
+                        for a in self.attachments)
         return (
             f"Ticket: {self.key} — {self.title}\n"
             f"List: {self.list_name}\n"
@@ -55,6 +94,7 @@ class Task:
             f"Tags: {', '.join(self.tags) or 'none'}\n"
             f"URL: {self.url}\n\n"
             f"Description:\n{self.description.strip() or '(empty)'}\n"
+            + (f"\nAttachments:\n{files}" if files else "")
         )
 
 

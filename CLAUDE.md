@@ -26,7 +26,7 @@ tests_smoke.py  tests_web.py  README.md  config.example.yaml
 ```
 
 Note the two unrelated `base.py` files: `providers/base.py` defines `TaskProvider`
-(7 methods + optional `blocked_by`), `agents/base.py` defines `CodingAgent`
+(7 methods + optional `blocked_by` and `download_attachment`), `agents/base.py` defines `CodingAgent`
 (`reason` for tool-less classification, `work` for agentic runs). Confusing one for
 the other imports cleanly and only fails at the consumer, so check which you have open.
 
@@ -428,6 +428,40 @@ other's note while both report success.
   *before* they ship, not after; see the "Upgrading" section in `README.md`.
 - `blocked_by()` failures must never stop work — `_advance` catches and treats the read
   as clear.
+
+### Ticket images
+
+A screenshot pasted into a Jira description is an ADF `media` node with no text.
+`_flatten_adf` used to drop it without trace, and triage then told the reporter
+the image they had attached was missing. Three layers now, each easy to undo:
+
+- **Markers, not silence.** `_flatten_adf` renders `media` as `[image: alt]`
+  (`[image attached]` with no alt), `mediaGroup`/`mediaInline` as
+  `[attachment: ...]`, and `FIELDS` asks for `attachment` so `Task.attachments`
+  lists every file. `Task.as_prompt_block()` prints that list, and
+  `triage.SYSTEM` says such files *are* attached and that triage cannot see
+  them. Triage stays tool-less and text-only: no image ever reaches `reason()`.
+- **The analyst and implementer can look.** `Pipeline._ticket_images()` downloads
+  png/jpeg/gif/webp (`models.IMAGE_TYPES`, what Read can show) to
+  `{log_dir}/attachments/{key}__{source}/`, **outside the worktree** so they
+  cannot be committed, and the station passes that directory as `add_dirs` →
+  `--add-dir`. That flag, not the allowlist, is what lets `Read` open a path
+  outside the cwd under `dontAsk`. `add_dirs` is passed only when there are
+  images, so an agent adapter or test fake that predates it keeps working.
+  The reviewer and fix passes get no images: neither is shown the ticket text.
+- **Never fails a step.** Like `_measure()`, any download error is logged and
+  costs that image. `limits.max_attachments` (default 10, `0` = off) and
+  `limits.attachment_max_bytes` (default 5 MB) bound it; `write_capped()`
+  writes via `.part` + rename so an aborted or oversized download never leaves
+  a truncated file that the next run would reuse as if it were whole. A file
+  already present at its listed size is reused.
+
+`JiraProvider.download_attachment` builds the URL from the configured site and
+a numeric id, never from the payload's `content` link, so the Basic-auth header
+only goes to `self.base`; Jira's redirect to its media host carries its own token.
+ClickUp and Pulse list no attachments yet, so for them nothing changes. Triage
+snapshots record attachment metadata so a bench replay renders the same prompt;
+`bench implement` replays never download images (it builds no provider).
 
 ## Security posture
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import mimetypes
 import re
 import time
 from pathlib import Path
@@ -13,8 +14,8 @@ from . import analyst, brain, graph, improve, review, scorers, vcs
 from .agents.base import CodingAgent
 from .config import Config, Source
 from .jsonio import StationError
-from .models import (AIState, AnalysisResult, ReviewResult, Spend, Task, TriageResult,
-                     agent_log_name, run_station)
+from .models import (AIState, AnalysisResult, Attachment, ReviewResult, Spend, Task,
+                     TriageResult, agent_log_name, images_prompt_block, run_station)
 from .providers.base import ProviderAuthError, TaskProvider
 from .redact import redact
 from .state import Store
@@ -146,6 +147,41 @@ class Pipeline:
         except Exception as exc:  # noqa: BLE001
             log.debug("measurement %s skipped: %s", what, exc)
             return None
+
+    def _ticket_images(self, task: Task) -> list[Path]:
+        """Download the ticket's images for a station that can look at them.
+
+        Kept under `{log_dir}/attachments/`, outside the worktree, so the
+        implementer cannot commit them; the station adds that directory to
+        the run with `--add-dir`. A file already there at the listed size is
+        reused, so a re-plan or a second implement pass does not fetch it
+        again. Never raises: like `_measure()`, a failed download costs that
+        image, never the step -- the ticket text still stands on its own.
+        """
+        try:
+            max_files = int(self.limits.get("max_attachments", 10) or 0)
+            max_bytes = int(self.limits.get("attachment_max_bytes", 5_000_000) or 0)
+            wanted = [a for a in task.attachments if a.is_image
+                      and (not a.size or a.size <= max_bytes)][:max_files]
+            if not wanted or max_bytes <= 0:
+                return []
+            folder = (self.log_root / "attachments"
+                      / _safe_name(f"{task.key}__{self.source.key}"))
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s: attachments skipped: %s", task.key, exc)
+            return []
+        out: list[Path] = []
+        for att in wanted:
+            dest = folder / _attachment_file(att)
+            try:
+                if not (dest.is_file() and (not att.size or dest.stat().st_size == att.size)):
+                    self.provider.download_attachment(task, att, dest, max_bytes)
+                out.append(dest)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: attachment %s not downloaded: %s",
+                            task.key, att.filename, redact(str(exc), self._known_secrets()))
+        return out
 
     # ==================================================================
     def tick(self, now: dt.datetime | None = None) -> None:
@@ -389,7 +425,10 @@ class Pipeline:
                 "task": {"id": task.id, "key": task.key, "title": task.title,
                          "description": task.description, "status": task.status,
                          "url": task.url, "list_id": task.list_id,
-                         "list_name": task.list_name, "tags": task.tags},
+                         "list_name": task.list_name, "tags": task.tags,
+                         "attachments": [{"id": a.id, "filename": a.filename,
+                                          "mime": a.mime, "size": a.size}
+                                         for a in task.attachments]},
                 "comments": [{"author": c.author, "is_bot": c.is_bot,
                               "created_at": c.created_at, "text": c.text}
                              for c in comments],
@@ -641,6 +680,7 @@ class Pipeline:
         # idempotency claim in `_comment` still suppresses the duplicate.
         round_key = len(comments)
         run_log, log_path = self._run_log(rid, task.key, repo["key"], "plan")
+        images = self._ticket_images(task)
         try:
             result, spend = analyst.analyse(
                 self.agent, task, comments, repo,
@@ -649,6 +689,7 @@ class Pipeline:
                 model=self.acfg.get("model"),
                 tools=self.acfg.get("planner_tools") or analyst.PLANNER_TOOLS,
                 log_path=log_path,
+                images=images,
             )
         except StationError as exc:
             self.store.record("plan", rid, f"failed: {exc}", exc.cost_usd,
@@ -708,10 +749,11 @@ class Pipeline:
             vcs.run(["bash", "-lc", repo["setup"]], cwd=wt, check=False, env=env)
 
         brain_block = self._brain_block(repo["key"])
+        images = self._ticket_images(task)
         if revision:
-            prompt = _revision_prompt(task, repo, meta, revision, brain_block)
+            prompt = _revision_prompt(task, repo, meta, revision, brain_block, images)
         else:
-            prompt = _work_prompt(task, repo, meta, brain_block)
+            prompt = _work_prompt(task, repo, meta, brain_block, images)
         # Measured before the agent touches the worktree: what this run adds
         # on top of `before` is this runner's work, and anything else that
         # later shows up on the PR was pushed by a person.
@@ -719,7 +761,9 @@ class Pipeline:
         forked_at = (None if meta.get("base_sha") else self._measure(
             "merge-base", vcs.merge_base, wt, repo.get("base_branch", "main"), env=env))
         run_log, log_path = self._run_log(rid, task.key, repo["key"], "implement")
-        res = self.agent.work(prompt, wt, log_path=log_path)
+        extra: dict[str, Any] = ({"add_dirs": analyst.image_dirs(images)}
+                                 if images else {})
+        res = self.agent.work(prompt, wt, log_path=log_path, **extra)
         self.store.record("implement", rid, res.error or "ok", res.cost_usd,
                           res.usage.total, log=run_log, **Spend.of(res).run_fields())
 
@@ -1432,14 +1476,35 @@ def _fmt_analysis(r: AnalysisResult, shadow: bool) -> str:
             f"**Files I expect to touch**\n{files}\n\n**Risks**\n{risks}{tail}")
 
 
+def _safe_name(text: str, limit: int = 120) -> str:
+    """A filename-safe rendering of provider-supplied text: no separators,
+    no `..`, so a hostile attachment name cannot leave its directory."""
+    out = re.sub(r"(?:[^A-Za-z0-9._-]|\.{2,})+", "_", text)
+    return out.strip("._")[:limit] or "x"
+
+
+def _attachment_file(att: Attachment) -> str:
+    """`{id}-{filename}`, sanitised, always ending in an image extension.
+
+    The id keeps two uploads both named `image.png` apart. The extension is
+    what tells the agent's Read tool to treat the bytes as an image.
+    """
+    name = _safe_name(f"{att.id}-{att.filename}")
+    ext = mimetypes.guess_extension(att.mime) or ""
+    if ext and not name.lower().endswith(ext) and not (
+            ext == ".jpg" and name.lower().endswith(".jpeg")):
+        name += ext
+    return name
+
+
 def _work_prompt(task: Task, repo: dict[str, Any], meta: dict[str, Any],
-                 brain_block: str) -> str:
+                 brain_block: str, images: list[Path] | None = None) -> str:
     steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(meta.get("plan", [])))
     criteria = "\n".join(f"- {c}" for c in meta.get("acceptance_criteria", []))
     return f"""You are on a fresh branch in an isolated worktree. Work only within this directory.
 
 {task.as_prompt_block()}
-{brain_block}
+{images_prompt_block(images or [])}{brain_block}
 === AGREED PLAN ===
 {meta.get('approach', '')}
 
@@ -1511,13 +1576,14 @@ def _fmt_review(r: ReviewResult) -> str:
 
 
 def _revision_prompt(task: Task, repo: dict[str, Any], meta: dict[str, Any],
-                     revision: dict[str, Any], brain_block: str) -> str:
+                     revision: dict[str, Any], brain_block: str,
+                     images: list[Path] | None = None) -> str:
     findings = "\n".join(f"- {f}" for f in revision.get("findings", [])) or "(none)"
     criteria = "\n".join(f"- {c}" for c in meta.get("acceptance_criteria", [])) or "(none)"
     return (
         f"A reviewer looked at your branch and asked for changes. You are in the "
         f"same worktree, on the same branch.\n\n"
-        f"{task.as_prompt_block()}\n{brain_block}\n"
+        f"{task.as_prompt_block()}\n{images_prompt_block(images or [])}{brain_block}\n"
         f"=== ACCEPTANCE CRITERIA ===\n{criteria}\n\n"
         f"=== REVIEWER SUMMARY ===\n{revision.get('summary', '')}\n\n"
         f"=== BLOCKING FINDINGS ===\n{findings}\n\n"

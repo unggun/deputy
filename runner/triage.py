@@ -55,6 +55,12 @@ review, so name a repo only if it genuinely needs changing:
 Choose "clarify" if requirements, acceptance criteria, affected surface,
 expected behaviour, or reproduction steps are missing or ambiguous.
 
+Images and files show up in the description as [image: ...] or
+[attachment: ...] and are listed under Attachments. They ARE attached: you
+cannot see them, but the planning stage after you can. Never ask for an
+attachment as if it were missing. Ask about its content only when the text
+cannot be understood without it.
+
 Choose "human_only" if the work needs human judgement, environment access,
 a live production check, a third-party console, a design decision, or any
 verification that cannot be done from the repository.

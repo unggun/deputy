@@ -5301,5 +5301,139 @@ for label, ok in _p_checks:
     print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
     results.append(ok)
 
+print("\nticket attachments")
+from runner.models import Attachment as _Att
+from runner.providers import jira as _jira
+from runner.providers.base import write_capped as _write_capped
+from runner import analyst as _analyst, bench as _bench, triage as _triage_mod
+from runner.pipeline import _work_prompt as _wp, _revision_prompt as _rp
+
+_a_checks = []
+_adf = {"type": "doc", "content": [
+    {"type": "paragraph", "content": [{"type": "text", "text": "the dropdown (see image)"}]},
+    {"type": "mediaSingle", "content": [
+        {"type": "media", "attrs": {"type": "file", "id": "u1", "alt": "dropdown.png"}}]},
+    {"type": "mediaSingle", "content": [{"type": "media", "attrs": {"type": "file", "id": "u2"}}]},
+    {"type": "mediaGroup", "content": [
+        {"type": "media", "attrs": {"type": "file", "id": "u3", "alt": "spec.pdf"}}]},
+    {"type": "mediaSingle", "content": [
+        {"type": "media", "attrs": {"type": "external", "url": "https://e.x/a.png"}}]},
+    {"type": "paragraph", "content": [{"type": "text", "text": "after"}]}]}
+_flat = _jira._flatten_adf(_adf)
+_a_checks.append(("an embedded image leaves a marker instead of vanishing",
+                  "[image: dropdown.png]" in _flat and "[image attached]" in _flat
+                  and "[attachment: spec.pdf]" in _flat
+                  and "[image: https://e.x/a.png]" in _flat
+                  and _flat.index("(see image)") < _flat.index("dropdown.png") < _flat.index("after")))
+_a_checks.append(("Jira asks for the attachment field", "attachment" in _jira.FIELDS.split(",")))
+_ja = _jira._attachment({"id": "10001", "filename": "dropdown.png",
+                         "mimeType": "image/png", "size": "1234"})
+_a_checks.append(("a Jira attachment maps to its metadata",
+                  (_ja.id, _ja.filename, _ja.mime, _ja.size, _ja.is_image)
+                  == ("10001", "dropdown.png", "image/png", 1234, True)))
+
+_t = mk("A1", "Department dropdown", "see [image: dropdown.png]")
+_t.attachments = [_Att("10001", "dropdown.png", "image/png", 4),
+                  _Att("10002", "spec.pdf", "application/pdf", 4),
+                  _Att("10003", "huge.png", "image/png", 10_000_000),
+                  _Att("10004", "broken.png", "image/png", 4),
+                  _Att("10005", "../../evil name", "image/jpeg", 0)]
+_a_checks.append(("the prompt block lists attachments; triage is told they exist",
+                  "Attachments:\n- dropdown.png (image/png)" in _t.as_prompt_block()
+                  and "spec.pdf" in _t.as_prompt_block()
+                  and "[image: ...]" in _triage_mod.SYSTEM
+                  and "Attachments:" not in mk("A0", "t", "d").as_prompt_block()))
+
+class _AttProvider(FakeProvider):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.fetched = []
+    def download_attachment(self, task, att, dest, max_bytes):
+        self.fetched.append(att.id)
+        if att.id == "10004":
+            raise RuntimeError("Jira GET attachment 10004 -> 500")
+        _write_capped([b"\x89PNG"], dest, max_bytes)
+
+with tempfile.TemporaryDirectory() as _atmp:
+    _acfg = Config.load("config.example.yaml")
+    _acfg.data["runner"]["db_path"] = f"{_atmp}/s.db"
+    _acfg.data["runner"]["work_dir"] = f"{_atmp}/w"
+    _acfg.data["runner"]["log_dir"] = f"{_atmp}/l"
+    _asrc = _acfg.sources(only=["mycorp"])[0]
+    _aprov = _AttProvider([_t])
+    _apipe = Pipeline(_acfg, _asrc, _aprov, FakeAgent("execute"), Store(f"{_atmp}/s.db"))
+    _imgs = _apipe._ticket_images(_t)
+    _names = [p.name for p in _imgs]
+    _a_checks.append(("only fetchable images are downloaded, a failure is skipped",
+                      _names == ["10001-dropdown.png", "10005-_evil_name.jpg"]
+                      and _aprov.fetched == ["10001", "10004", "10005"]))
+    _a_checks.append(("images live under log_dir, never in the worktree",
+                      all(p.parent == Path(_atmp) / "l" / "attachments" / "A1__mycorp"
+                          and p.is_file() for p in _imgs)
+                      and not list((Path(_atmp) / "l" / "attachments").rglob("*.part"))))
+    _aprov.fetched.clear()
+    _apipe._ticket_images(_t)
+    _a_checks.append(("an image already downloaded at its size is reused",
+                      _aprov.fetched == ["10004"]))
+    _apipe.limits = {**_apipe.limits, "max_attachments": 0}
+    _a_checks.append(("max_attachments: 0 fetches nothing", _apipe._ticket_images(_t) == []))
+
+    class _NoAttProvider(FakeProvider):
+        pass
+    _ncfg = Config.load("config.example.yaml")
+    _ncfg.data["runner"]["log_dir"] = f"{_atmp}/l2"
+    _npipe = Pipeline(_ncfg, _ncfg.sources(only=["mycorp"])[0], _NoAttProvider([_t]),
+                      FakeAgent("execute"), Store(f"{_atmp}/s2.db"))
+    _apipe.limits = {**_apipe.limits, "max_attachments": 10}
+    _a_checks.append(("a provider that cannot download costs the images, not the step",
+                      _npipe._ticket_images(_t) == []))
+
+    _cap = Path(_atmp) / "cap.png"
+    _over = _raises(lambda: _write_capped([b"x" * 6, b"x" * 6], _cap, 10), ValueError)
+    _a_checks.append(("an oversized download leaves no file behind",
+                      bool(_over) and not _cap.exists()
+                      and not _cap.with_name("cap.png.part").exists()))
+
+    _wp_txt = _wp(_t, {"test": "t"}, {}, "", _imgs)
+    _rp_txt = _rp(_t, {"test": "t"}, {}, {"findings": []}, "", _imgs)
+    _a_checks.append(("implement and revision prompts name the image paths",
+                      all(f"- {p}" in _wp_txt and f"- {p}" in _rp_txt for p in _imgs)
+                      and "=== TICKET IMAGES ===" not in _wp(_t, {}, {}, "")))
+
+    class _KwAgent:
+        def __init__(self):
+            self.calls = []
+        def work(self, prompt, cwd, **kw):
+            self.calls.append((prompt, kw))
+            return AgentResult(ok=True, cost_usd=0.0, text=json.dumps(
+                {"verdict": "ready", "plan": ["x"]}))
+    _ka = _KwAgent()
+    _analyst.analyse(_ka, _t, [], {"key": "r"}, "", [], cwd=Path(_atmp), images=_imgs)
+    _analyst.analyse(_ka, _t, [], {"key": "r"}, "", [], cwd=Path(_atmp))
+    _a_checks.append(("the analyst gets the images and their directory, and no add_dirs without them",
+                      _ka.calls[0][1].get("add_dirs") == [_imgs[0].parent]
+                      and str(_imgs[0]) in _ka.calls[0][0]
+                      and "add_dirs" not in _ka.calls[1][1]))
+
+    _seen_cmd = []
+    _cca = CC.ClaudeCodeAgent({"binary": sys.executable})
+    _real_run = _cca._run
+    _cca._run = lambda cmd, **kw: (_seen_cmd.append(cmd), AgentResult(ok=True, text=""))[1]
+    _cca.work("p", Path(_atmp), add_dirs=[Path("/x/imgs")])
+    _cca.work("p", Path(_atmp))
+    _a_checks.append(("work() passes each extra directory as --add-dir",
+                      _seen_cmd[0][_seen_cmd[0].index("--add-dir") + 1] == "/x/imgs"
+                      and "--add-dir" not in _seen_cmd[1]))
+
+    _snap_task = _bench._task({"task": {"id": "A1", "key": "A1", "attachments": [
+        {"id": "10001", "filename": "dropdown.png", "mime": "image/png", "size": 4}]}})
+    _a_checks.append(("a triage snapshot's attachments survive the bench replay",
+                      "dropdown.png (image/png)" in _snap_task.as_prompt_block()
+                      and "Attachments:" not in _bench._task({"task": {}}).as_prompt_block()))
+
+for label, ok in _a_checks:
+    print(f"  {'PASS' if ok else 'FAIL':<5} {label}")
+    results.append(ok)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

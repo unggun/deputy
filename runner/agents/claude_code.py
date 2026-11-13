@@ -344,7 +344,8 @@ class ClaudeCodeAgent(CodingAgent):
     def work(self, prompt: str, cwd: Path, *,
              log_path: Path | None = None,
              model: str | None = None,
-             allowed_tools: list[str] | None = None) -> AgentResult:
+             allowed_tools: list[str] | None = None,
+             add_dirs: list[Path] | None = None) -> AgentResult:
         tools = self.allowed_tools if allowed_tools is None else allowed_tools
         chosen = model or self.model
         cmd = [self.binary, "-p", prompt,
@@ -352,6 +353,10 @@ class ClaudeCodeAgent(CodingAgent):
                "--max-turns", str(self.max_turns),
                "--permission-mode", self.permission_mode,
                "--allowedTools", ",".join(tools)]
+        # A working directory, not an allowlist entry: under `dontAsk` a Read
+        # outside the cwd is refused even with `Read` allowed.
+        for d in add_dirs or []:
+            cmd += ["--add-dir", str(d)]
         if chosen:
             cmd += ["--model", chosen]
         if self.max_budget_usd:

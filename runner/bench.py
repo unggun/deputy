@@ -39,7 +39,7 @@ from typing import Any
 from . import triage
 from .agents.base import CodingAgent
 from .jsonio import StationError
-from .models import Comment, Spend, Task, wilson
+from .models import Attachment, Comment, Spend, Task, wilson
 from .redact import redact
 
 log = logging.getLogger(__name__)
@@ -182,7 +182,13 @@ def _task(snap: dict[str, Any]) -> Task:
                 list_id=str(t.get("list_id") or ""),
                 list_name=str(t.get("list_name") or ""),
                 tags=[str(x) for x in t.get("tags") or []],
-                assignee_ids=[], updated_at=0)
+                assignee_ids=[], updated_at=0,
+                attachments=[Attachment(id=str(a.get("id") or ""),
+                                        filename=str(a.get("filename") or ""),
+                                        mime=str(a.get("mime") or ""),
+                                        size=int(a.get("size") or 0))
+                             for a in t.get("attachments") or []
+                             if isinstance(a, dict)])
 
 
 def _comments(snap: dict[str, Any]) -> list[Comment]:

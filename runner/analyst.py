@@ -16,7 +16,7 @@ from typing import Any
 
 from .agents.base import CodingAgent
 from .jsonio import StationError, parse_json_object, str_list
-from .models import AnalysisResult, Comment, Spend, Task
+from .models import AnalysisResult, Comment, Spend, Task, images_prompt_block
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +59,14 @@ _RETRY_SUFFIX = (
 )
 
 
+def image_dirs(images: list[Path]) -> list[Path]:
+    """The distinct directories holding `images`, in first-seen order."""
+    return list(dict.fromkeys(p.parent for p in images))
+
+
 def build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any],
-                 brain_block: str, criteria: list[str]) -> str:
+                 brain_block: str, criteria: list[str],
+                 images: list[Path] | None = None) -> str:
     thread = "\n".join(
         f"[{'AI' if c.is_bot else c.author}] {c.text.strip()}" for c in comments[-20:]
     ) or "(no comments)"
@@ -68,6 +74,7 @@ def build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any],
     return (
         f"{SYSTEM}\n\n"
         f"=== TICKET ===\n{task.as_prompt_block()}\n"
+        f"{images_prompt_block(images or [])}"
         f"=== REPO ===\n{repo.get('key')} ({repo.get('language', 'unknown stack')})\n"
         f"Test command: {repo.get('test', '(none configured)')}\n"
         f"Notes: {repo.get('notes', '-')}\n\n"
@@ -82,17 +89,23 @@ def build_prompt(task: Task, comments: list[Comment], repo: dict[str, Any],
 def analyse(agent: CodingAgent, task: Task, comments: list[Comment],
             repo: dict[str, Any], brain_block: str, criteria: list[str], *,
             cwd: Path, model: str | None = None, tools: list[str] | None = None,
-            log_path: Path | None = None) -> tuple[AnalysisResult, Spend]:
-    """Run the analyst in `cwd`. Retries once on unparseable output."""
-    prompt = build_prompt(task, comments, repo, brain_block, criteria)
+            log_path: Path | None = None,
+            images: list[Path] | None = None) -> tuple[AnalysisResult, Spend]:
+    """Run the analyst in `cwd`. Retries once on unparseable output.
+
+    `images` are the ticket's downloaded image files; their directory is
+    added to the run so the read-only Read tool can open them.
+    """
+    prompt = build_prompt(task, comments, repo, brain_block, criteria, images)
     allowed = PLANNER_TOOLS if tools is None else tools
+    extra: dict[str, Any] = {"add_dirs": image_dirs(images)} if images else {}
 
     spend = Spend()
     data: dict[str, Any] | None = None
     for attempt in (1, 2):
         res = agent.work(prompt if attempt == 1 else prompt + _RETRY_SUFFIX,
                          cwd, log_path=log_path, model=model,
-                         allowed_tools=allowed)
+                         allowed_tools=allowed, **extra)
         spend += Spend.of(res)
         if not res.ok:
             raise StationError(f"analyst agent failed: {res.error}", spend)
