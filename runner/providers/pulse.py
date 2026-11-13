@@ -16,11 +16,13 @@ Design notes (plan: docs/superpowers/plans/2026-11-12-pulse-provider.md):
     is not HTML with its markdown renderer; an `<!-- -->` marker would push the
     body onto the HTML path, so it is stripped before posting. `via: "mcp"` is
     NOT a bot marker: the owner's own AI assistant sets it too.
-  * `fetch_candidates` costs 1 + N calls. `search_tasks` rows carry neither the
-    custom fields (so no AI state) nor the description, and the pipeline reads
-    both from candidates (`_triage_new` branches on `ai_state`, triage reads the
-    description), so each candidate is re-read with `get_task`. Pulse allows
-    100 MCP calls/min per user (D9); a ready queue of a few dozen is fine.
+  * `fetch_candidates` re-reads each candidate with `get_task`: `search_tasks`
+    rows carry neither the custom fields (so no AI state) nor the description,
+    and the pipeline reads both. It is a GENERATOR, so a task is read only when
+    triage asks for the next one, and triage's per-run cap also caps the reads.
+  * Pulse allows 100 MCP calls/min per user (D9), shared with the user's own
+    assistant. `_call` paces itself in a sliding 60-second window
+    (`max_calls_per_minute`, default 80) and sleeps rather than hitting 429.
   * A 401 raises ProviderAuthError and is never caught here (D8): the tick
     fails this source as a whole and `deputy status` shows why.
   * `branch_key` is the default `task.key` = the short id (`PLS-1234`), which
@@ -28,13 +30,15 @@ Design notes (plan: docs/superpowers/plans/2026-11-12-pulse-provider.md):
 """
 from __future__ import annotations
 
+import collections
 import datetime as dt
 import html
 import json
 import logging
 import re
+import time
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -46,6 +50,8 @@ log = logging.getLogger(__name__)
 
 MAX_PAGE = 100                 # search_tasks / list_comments `limit` ceiling
 MAX_PAGES = 50                 # 5,000 rows: a safety stop, not a real limit
+DEFAULT_CALLS_PER_MINUTE = 80  # under Pulse's 100/min, leaving room for the user's assistant
+RATE_WINDOW_SECONDS = 60.0
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
@@ -63,7 +69,12 @@ class PulseProvider(TaskProvider):
         if missing:
             # Name the keys, never their values: this message reaches logs.
             raise RuntimeError(f"pulse provider: missing {', '.join(missing)}")
-        options = {str(k): str(v) for k, v in (cfg.get("state_field_options") or {}).items()}
+        # `done:` with no value is YAML null; str(None) would be "None" and pass
+        # the check, then fail on the first write. Drop blanks so they are
+        # reported as missing.
+        options = {str(k): str(v).strip()
+                   for k, v in (cfg.get("state_field_options") or {}).items()
+                   if v is not None and str(v).strip()}
         unmapped = [s.value for s in AIState if not options.get(s.value)]
         if unmapped:
             raise RuntimeError(
@@ -89,6 +100,11 @@ class PulseProvider(TaskProvider):
             "Accept": "application/json, text/event-stream",
         })
         self._rpc_id = 0
+        self.max_calls_per_minute = max(1, int(cfg.get("max_calls_per_minute",
+                                                       DEFAULT_CALLS_PER_MINUTE)))
+        self._call_times: collections.deque[float] = collections.deque()
+        self._clock = time.monotonic   # injectable for tests
+        self._sleep = time.sleep
         # True after Pulse accepted the token, False after it refused it.
         # `_tick_all` clears a recorded auth failure only on True.
         self.authenticated = False
@@ -100,7 +116,29 @@ class PulseProvider(TaskProvider):
         return f"PulseProvider(endpoint={self.endpoint!r})"
 
     # --- transport ----------------------------------------------------
+    def _pace(self) -> None:
+        """Wait, if needed, so no 60-second window holds more than the budget.
+
+        A daemon's provider lives across ticks, so this counts real calls over
+        real time rather than per tick. It cannot see the user's other MCP
+        clients, which is why the default leaves 20 calls a minute for them.
+        """
+        now = self._clock()
+        while self._call_times and now - self._call_times[0] >= RATE_WINDOW_SECONDS:
+            self._call_times.popleft()
+        if len(self._call_times) >= self.max_calls_per_minute:
+            wait = RATE_WINDOW_SECONDS - (now - self._call_times[0])
+            if wait > 0:
+                log.info("pulse: %d calls in the last minute; waiting %.1fs",
+                         len(self._call_times), wait)
+                self._sleep(wait)
+            now = self._clock()
+            while self._call_times and now - self._call_times[0] >= RATE_WINDOW_SECONDS:
+                self._call_times.popleft()
+        self._call_times.append(now)
+
     def _call(self, tool: str, **arguments: Any) -> Any:
+        self._pace()
         self._rpc_id += 1
         body = {
             "jsonrpc": "2.0",
@@ -140,6 +178,21 @@ class PulseProvider(TaskProvider):
         return rows
 
     # --- identity -----------------------------------------------------
+    def check_auth(self) -> None:
+        """One cheap call at the start of a tick, before any row is touched.
+
+        A refused token then fails the source before the pipeline consumes a
+        retry marker, claims a comment or commits a state it cannot push.
+        Raises PulseAuthError on 401. A Pulse without `get_me` yet answers
+        isError, which still proves the token was accepted.
+        """
+        try:
+            me = self._call("get_me")
+        except PulseToolError:
+            return
+        self._me = str(me["id"])
+        self.identity = f"{me.get('name') or '?'} <{me.get('email') or '?'}>"
+
     def whoami(self) -> str:
         if self._me is None:
             try:
@@ -164,15 +217,16 @@ class PulseProvider(TaskProvider):
         return self._space_name_cache
 
     # --- reads --------------------------------------------------------
-    def fetch_candidates(self) -> list[Task]:
-        # One provider instance per tick, so a fresh Space list per tick.
+    def fetch_candidates(self) -> Iterator[Task]:  # type: ignore[override]
+        # A generator: each task is read only when triage asks for it, so the
+        # pipeline's per-run cap also caps the `get_task` calls.
+        # Fresh Space names each tick (a daemon keeps one provider).
         self._space_name_cache = None
         me = self.whoami()
         rows: list[dict[str, Any]] = []
         for space in self.spaces or [None]:
             rows.extend(self._paged("search_tasks", "tasks", assigneeId=me,
                                     status=self.ready_status, spaceId=space))
-        out: list[Task] = []
         seen: set[str] = set()
         for row in rows:
             tid = str(row["id"])
@@ -182,8 +236,7 @@ class PulseProvider(TaskProvider):
             if self.skip_tags.intersection(_tag_names(row)):
                 continue
             # The summary lacks custom fields and the description; see docstring.
-            out.append(self.get_task(tid))
-        return out
+            yield self.get_task(tid)
 
     def get_task(self, task_id: str) -> Task:
         return self._to_task(self._call("get_task", id=task_id))
@@ -346,15 +399,27 @@ class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        # Open <a> tags: (href, index into parts where its text starts).
+        self._links: list[tuple[str, int]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "li":
             self.parts.append("\n- ")
         elif tag == "br":
             self.parts.append("\n")
+        elif tag == "a":
+            href = (dict(attrs).get("href") or "").strip()
+            self._links.append((href, len(self.parts)))
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in self._BREAKS and tag != "br":
+        if tag == "a" and self._links:
+            # Keep the target: "this specification" alone tells the agent
+            # nothing. Only real URLs, and not when the text already is one.
+            href, start = self._links.pop()
+            label = "".join(self.parts[start:]).strip()
+            if re.match(r"(?i)^(https?:|mailto:)", href) and label != href:
+                self.parts.append(f" ({href})")
+        elif tag in self._BREAKS and tag != "br":
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:

@@ -240,10 +240,13 @@ sources:
         test: "npm test"
 
   # Pulse Task Spaces, over Pulse's MCP server (plain JSON-RPC, no LLM).
-  # Token: Pulse → User Settings → AI Clients → Personal access tokens, with
-  # "Read and write" access. State: create a GLOBAL dropdown custom field
-  # (Settings → Spaces), e.g. "AI State", with one option per state below, then
-  # paste the field id and option ids. The container is the Pulse SPACE.
+  # Token, today: copy a one-hour MCP access token (pls_at_…) from a connected
+  # AI client, AND set user_id below -- Pulse does not have `get_me` yet.
+  # Once Pulse ships personal access tokens: Settings → AI Clients → Create
+  # token, "Read and write", and drop user_id.
+  # State: create a GLOBAL dropdown custom field (Settings → Spaces), e.g.
+  # "AI State", with one option per state below, then paste the field id and
+  # option ids. The container is the Pulse SPACE.
   - key: pulse
     enabled: false
     provider:
@@ -251,7 +254,7 @@ sources:
       base_url: https://api.pulse.example.com   # API origin; /mcp is appended
       web_url: https://pulse.example.com         # task links, until Pulse returns `url`
       token: ${PULSE_TOKEN}
-      # user_id: "<your Pulse user uuid>"        # only until Pulse ships `get_me`
+      # user_id: "<your Pulse user uuid>"        # REQUIRED until Pulse ships `get_me`
       # spaces: ["<space-uuid>"]                 # omit to search every Space you can see
       ready_status: "To Do"                      # + assigned-to-me, applied automatically
       in_progress_status: "In Progress"

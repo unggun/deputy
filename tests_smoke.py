@@ -4973,9 +4973,13 @@ _p_checks.append(("a 401 is a PulseAuthError carrying Pulse's reason, never the 
                   bool(_msg) and "expired on 9 February 2027" in _msg and _P_TOKEN not in _msg
                   and issubclass(PulseAuthError, _PAuth) and _pp.authenticated is False))
 _pp.s.post = _post_seq(_PResp(429, None, text="slow down"))
+try:
+    _pp._call("get_me")
+    _e429 = None
+except Exception as _e:  # noqa: BLE001
+    _e429 = _e
 _p_checks.append(("a 429 is a plain RuntimeError, not an auth failure",
-                  _raises(lambda: _pp._call("get_me"), RuntimeError) is not None
-                  and _raises(lambda: _pp._call("get_me"), PulseAuthError) is None))
+                  isinstance(_e429, RuntimeError) and not isinstance(_e429, _PAuth)))
 _pp.s.post = _post_seq(_PResp(200, {"jsonrpc": "2.0", "id": 1, "result": {
     "isError": True, "content": [{"type": "text", "text": "Task not found."}]}}))
 _m = _raises(lambda: _pp._call("get_task", id="PLS-9"), PulseToolError)
@@ -5027,7 +5031,14 @@ def _fake_call(tool, **a):
 
 _pp = _pprov()
 _pp._call = _fake_call
-_cands = _pp.fetch_candidates()
+_gen = _pp.fetch_candidates()
+_p_checks.append(("fetch_candidates is lazy: nothing is read until triage asks",
+                  not _pcalls))
+_first = next(_gen)
+_reads_after_one = sum(1 for t, _ in _pcalls if t == "get_task")
+_cands = [_first, *_gen]
+_p_checks.append(("only the task triage asked for has been read so far",
+                  _reads_after_one == 1))
 _search = [a for t, a in _pcalls if t == "search_tasks"]
 _p_checks.append(("candidates page until total, as me, in the ready status",
                   len(_search) == 2 and all(a["assigneeId"] == "u1"
@@ -5127,6 +5138,82 @@ _p_checks.append(("html_to_text keeps lists and line breaks",
                   html_to_text("<p>One<br>Two</p><ul><li>a</li><li>b &lt;c&gt;</li></ul>")
                   == "One\nTwo\n\n- a\n- b <c>"))
 
+# A disabled source never demands its env vars; an enabled one still does.
+_saved_env = {k: os.environ.pop(k, None) for k in ("PULSE_TOKEN", "CLICKUP_TOKEN_SIDE")}
+try:
+    _cfg_off = _raises(lambda: Config.load("config.example.yaml"), Exception)
+    _loaded = Config.load("config.example.yaml")
+    _p_checks.append(("disabled sources load without their tokens set",
+                      _cfg_off is None and _loaded is not None))
+    _p_checks.append(("an unset var in a disabled source stays a literal",
+                      any(isinstance(src, dict) and src.get("key") == "pulse"
+                          and src["provider"]["token"] == "${PULSE_TOKEN}"
+                          for src in _loaded.data["sources"])))
+    _saved_main = os.environ.pop("CLICKUP_TOKEN", None)
+    try:
+        _strict = _raises(lambda: Config.load("config.example.yaml"), RuntimeError)
+        _p_checks.append(("an enabled source still requires its env vars",
+                          bool(_strict) and "CLICKUP_TOKEN" in _strict))
+    finally:
+        if _saved_main is not None:
+            os.environ["CLICKUP_TOKEN"] = _saved_main
+finally:
+    for _k, _v in _saved_env.items():
+        if _v is not None:
+            os.environ[_k] = _v
+
+# Pacing: never more than max_calls_per_minute in any 60-second window.
+_pace = _pprov(max_calls_per_minute=3)
+_pace_now = [100.0]
+_pace_slept = []
+_pace._clock = lambda: _pace_now[0]
+def _pace_sleep(sec):
+    _pace_slept.append(sec)
+    _pace_now[0] += sec
+_pace._sleep = _pace_sleep
+_pace.s.post = lambda url, json=None, timeout=None: _ok({"id": "u1"})
+for _ in range(3):
+    _pace._call("get_me")
+    _pace_now[0] += 1.0
+_p_checks.append(("calls under the budget never wait", _pace_slept == []))
+_pace._call("get_me")   # 4th call at t=103: must wait until t=160
+_p_checks.append(("the next call waits until the oldest leaves the 60s window",
+                  len(_pace_slept) == 1 and abs(_pace_slept[0] - 57.0) < 1e-6))
+_pace_now[0] += 61.0
+_pace._call("get_me")
+_p_checks.append(("after a quiet minute the budget is free again", len(_pace_slept) == 1))
+_p_checks.append(("the default budget leaves room for the user's assistant",
+                  _pprov().max_calls_per_minute == 80))
+
+# check_auth: one get_me per tick; a Pulse without get_me still counts as OK.
+_ca = _pprov()
+_ca.s.post = _post_seq(_ok({"id": "u9", "name": "Sam", "email": "s@x.test"}))
+_ca.check_auth()
+_p_checks.append(("check_auth caches who we act as",
+                  _ca.whoami() == "u9" and _ca.identity == "Sam <s@x.test>"))
+_ca.s.post = _post_seq(_PResp(200, {"jsonrpc": "2.0", "id": 1, "result": {
+    "isError": True, "content": [{"type": "text", "text": "No Pulse tool is called \"get_me\"."}]}}))
+_p_checks.append(("check_auth accepts a Pulse without get_me (token was accepted)",
+                  _raises(lambda: _ca.check_auth(), Exception) is None))
+_ca.s.post = _post_seq(_PResp(401, {"error_description": "revoked"}))
+_p_checks.append(("check_auth raises on a refused token",
+                  _raises(lambda: _ca.check_auth(), PulseAuthError) is not None))
+
+# Blank state options are refused, not stringified to "None".
+_blank = _raises(lambda: PulseProvider(
+    {**_P_CFG, "state_field_options": {**_P_OPTS, "done": None, "blocked": "  "}}, "m"),
+    RuntimeError)
+_p_checks.append(("a blank or null state option is reported as missing",
+                  bool(_blank) and "done" in _blank and "blocked" in _blank))
+
+_p_checks.append(("html_to_text keeps a link's target",
+                  html_to_text('<p>Implement <a href="https://ex.test/spec">this spec</a>.</p>')
+                  == "Implement this spec (https://ex.test/spec)."))
+_p_checks.append(("html_to_text does not repeat a bare URL or keep javascript: links",
+                  html_to_text('<a href="https://ex.test">https://ex.test</a> '
+                               '<a href="javascript:x()">click</a>')
+                  == "https://ex.test click"))
+
 # A refused token fails the source and leaves every row untouched (D8).
 class _DarkProvider(FakeProvider):
     def get_task(self, tid):
@@ -5156,6 +5243,51 @@ with tempfile.TemporaryDirectory() as _ptmp:
                       bool(_err) and _after.get("last_error") == _before.get("last_error")
                       and _after["state"] == _before["state"]
                       and _after["attempts"] == _before["attempts"]))
+
+    # check_auth runs before any row is advanced, so nothing is consumed.
+    class _RefusedAtStart(FakeProvider):
+        reads = 0
+        def check_auth(self):
+            raise PulseAuthError("Pulse token rejected: expired")
+        def get_task(self, tid):
+            _RefusedAtStart.reads += 1
+            return super().get_task(tid)
+    _pstore.upsert("mycorp:T8#pulse-backend", source="mycorp", provider_task_id="T8",
+                   task_key="T8", title="t", state=AIState.PLANNING.value,
+                   meta=_pjson.dumps({"plan_pending": True}))
+    _b8 = dict(_pstore.get("mycorp:T8#pulse-backend"))
+    _ppipe2 = Pipeline(_pcfg, _psrc, _RefusedAtStart([mk("T8", "t", "d")]),
+                       FakeAgent("execute"), _pstore)
+    _e2 = _raises(lambda: _ppipe2.tick(dt.datetime(2026, 8, 10, 7, 0)), PulseAuthError)
+    _a8 = dict(_pstore.get("mycorp:T8#pulse-backend"))
+    _p_checks.append(("a token refused at tick start consumes no retry marker or attempt",
+                      bool(_e2) and _RefusedAtStart.reads == 0
+                      and _a8["meta"] == _b8["meta"] and _a8["attempts"] == _b8["attempts"]))
+
+    # A comment refused for the token is un-claimed, so it posts after a fix.
+    class _RefusedComment(FakeProvider):
+        def add_comment(self, tid, md):
+            raise PulseAuthError("Pulse token rejected: expired")
+    _ppipe3 = Pipeline(_pcfg, _psrc, _RefusedComment([mk("T7", "t", "d")]),
+                       FakeAgent("execute"), _pstore)
+    _pstore.upsert("mycorp:T7#pulse-backend", source="mycorp", provider_task_id="T7",
+                   task_key="T7", title="t", state=AIState.QUEUED.value)
+    _e3 = _raises(lambda: _ppipe3._comment("mycorp:T7#pulse-backend", "plan-r1", "plan"),
+                  PulseAuthError)
+    _p_checks.append(("a refused comment releases its claim",
+                      bool(_e3) and _pstore.claim_comment("mycorp:T7#pulse-backend:plan-r1",
+                                                          "mycorp:T7#pulse-backend")))
+    class _BrokenComment(FakeProvider):
+        def add_comment(self, tid, md):
+            raise RuntimeError("timeout")
+    _ppipe4 = Pipeline(_pcfg, _psrc, _BrokenComment([mk("T6", "t", "d")]),
+                       FakeAgent("execute"), _pstore)
+    _raises(lambda: _ppipe4._comment("mycorp:T7#pulse-backend", "plan-r2", "plan"),
+            RuntimeError)
+    _p_checks.append(("any other comment failure keeps the claim (at most once)",
+                      not _pstore.claim_comment("mycorp:T7#pulse-backend:plan-r2",
+                                                "mycorp:T7#pulse-backend")))
+
     _pstore.set_source_auth_error("pulse", "Pulse token rejected: revoked")
     _pstore.set_source_auth_error("pulse", "Pulse token rejected: expired")
     _h = _pstore.source_auth_errors()

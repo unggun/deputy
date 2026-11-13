@@ -701,6 +701,12 @@ class Store:
         return [dict(r) for r in rows]
 
     # --- comment idempotency -------------------------------------------
+    def release_comment(self, key: str) -> None:
+        """Undo a claim whose comment certainly was not posted."""
+        self.conn.execute(
+            "DELETE FROM posted_comments WHERE idempotency_key = ?", (key,))
+        self.conn.commit()
+
     def claim_comment(self, key: str, task_id: str) -> bool:
         """Returns True if this comment has not been posted before."""
         try:

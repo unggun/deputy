@@ -272,6 +272,12 @@ Run with `python tests_smoke.py`. The suite counts call sites against `Pipeline`
 ## Open items to settle while building
 
 - **Task 2, resolved (12 Nov):** yes. `_triage_new` branches on `task.ai_state` and triage reads `task.description`, so `fetch_candidates` costs 1 + N (`search_tasks`, then `get_task` per candidate).
+- **PR review, 13 Nov:**
+  - `fetch_candidates` is a generator, so triage's per-run cap also caps the `get_task` reads.
+  - `_call` paces itself to `max_calls_per_minute` (default 80) in a sliding 60-second window. It sleeps rather than hitting Pulse's 100/min limit.
+  - A `check_auth()` at the start of each tick fails a refused token before any row is touched.
+  - A comment refused for its token releases its claim.
+  - Still open: a state saved locally and then refused remotely for any other reason is not retried. That is a separate change to the pipeline, which every provider shares.
 - **Task 5, resolved (12 Nov):** `events.task_id` has no FK, but a refused token is a fact about the source that should disappear once fixed, not ticket history. So it went into a new `source_health` table, cleared only after Pulse accepts the token again (`provider.authenticated`). A tick outside the working window makes no calls, so it does not clear it. Also: `pipeline.py`'s three per-row `except Exception` handlers (advance, triage, the `blocked_by` gate) now re-raise `ProviderAuthError`; otherwise a 401 would be written onto every row as `last_error`.
 - **Task 4, simplified:** the Pulse constructor refuses a config missing any `AIState` option, and `doctor` already reports constructor errors per source. `_clickup_state_gaps` was not generalised.
 - **Reassignment:** Pulse has multiple assignees per task, as ClickUp does. Check that README "Reassignment and multiple laptops" holds unchanged: a candidate is "assigned to me" if I am *among* the assignees.

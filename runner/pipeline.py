@@ -165,6 +165,11 @@ class Pipeline:
             log.warning("%s; nothing to do", reason)
             return
 
+        # 0. A refused credential fails the source HERE, before step 1 can
+        #    consume a station's pending marker (and count a crash), claim a
+        #    comment, or save a state the provider then refuses to push.
+        self.provider.check_auth()
+
         # 1. Advance work already in flight (cheap first).
         for row in self.store.in_flight(source=self.source.key):
             try:
@@ -1324,10 +1329,19 @@ class Pipeline:
         carry agent output, `git` stderr and `gh` stderr verbatim, and a
         ticket comment is permanent and visible to the whole workspace.
         """
-        if not self.store.claim_comment(f"{rid}:{key}", rid):
+        claim = f"{rid}:{key}"
+        if not self.store.claim_comment(claim, rid):
             return
         body = self._clean(markdown)
-        self.provider.add_comment(self._pid(rid), f"{self._repo_tag(rid)}{body}")
+        try:
+            self.provider.add_comment(self._pid(rid), f"{self._repo_tag(rid)}{body}")
+        except ProviderAuthError:
+            # The provider refused the credential, so the comment certainly
+            # was not posted. Release the claim so it goes out once the token
+            # is replaced. Any other failure keeps the claim: the comment may
+            # have landed, and at-most-once wins over at-least-once.
+            self.store.release_comment(claim)
+            raise
 
     def _escalate(self, rid: str, reason: str) -> None:
         reason = self._clean(reason)
